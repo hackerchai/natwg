@@ -1,6 +1,7 @@
-use natwg::config::{CloudflareConfig, StunConfig};
+use natwg::config::{CloudflareConfig, ServerConfig, StunConfig};
 use natwg::server::cloudflare::{self, Publish, Publisher, Record};
 use natwg::server::keepalive::{self, Health, Mapping, Targets};
+use natwg::server::upnp::{self, Upnp};
 use natwg::wire::transport::{BoundInterface, StunPort};
 use serde_json::{Value, json};
 use std::{
@@ -507,4 +508,46 @@ async fn a_zone_the_token_cannot_see_is_an_error() {
         never = publisher.run(mapping_rx, state_tx) => match never {},
         () = check => {}
     }
+}
+
+#[test]
+fn the_upnp_request_is_the_one_natwg_py_sends_with_the_instance_as_description() {
+    let body = upnp::add_port_mapping(
+        51831,
+        "10.73.0.2".parse().unwrap(),
+        &"natwg_next".parse().unwrap(),
+        3600,
+    );
+    let python = concat!(
+        r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:AddPortMapping xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">"#,
+        "<NewRemoteHost></NewRemoteHost><NewExternalPort>51831</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>51831</NewInternalPort><NewInternalClient>10.73.0.2</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>natwg</NewPortMappingDescription><NewLeaseDuration>3600</NewLeaseDuration>",
+        "</u:AddPortMapping></s:Body></s:Envelope>",
+    );
+    let python = python.replace(
+        "<NewPortMappingDescription>natwg<",
+        "<NewPortMappingDescription>natwg_next<",
+    );
+    assert_eq!(body, python);
+}
+
+fn server_config(upnp: Option<Value>) -> ServerConfig {
+    let mut server = json!({
+        "instance": "natwg_next",
+        "iface": LOOPBACK,
+        "listen_port": 51831,
+        "lan": "10.73.0.0/24",
+        "stun": {"servers": [], "fallback": [], "dns_server": "127.0.0.1"},
+        "cloudflare": {"zone": "example.com", "record": "_wg.example.com", "token": TOKEN},
+    });
+    if let Some(upnp) = upnp {
+        server["upnp"] = upnp;
+    }
+    serde_json::from_value(server).unwrap()
+}
+
+#[test]
+fn upnp_stays_off_without_a_upnp_section() {
+    assert!(Upnp::new(&server_config(None)).unwrap().is_none());
+    let upnp = json!({"control_url": "http://10.73.0.1:1900/ipc", "lease_secs": 3600, "refresh_secs": 300});
+    assert!(Upnp::new(&server_config(Some(upnp))).unwrap().is_some());
 }
