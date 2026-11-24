@@ -1,6 +1,6 @@
 use ipnetwork::Ipv4Network;
 use natwg::config::Instance;
-use natwg::nat::{nft, pf};
+use natwg::nat::{Rule, nft, pf};
 use natwg::netcfg::{self, Step};
 use std::fs;
 
@@ -18,6 +18,18 @@ fn instance(name: &str) -> Instance {
 
 fn commands(plan: &[Step]) -> Vec<String> {
     plan.iter().map(|step| step.argv.join(" ")).collect()
+}
+
+fn rule(instance_name: &str, iface: &str, tunnel: &str, lan: &str) -> Rule {
+    Rule::new(&instance(instance_name), iface, net(tunnel), net(lan))
+}
+
+fn mac_rule() -> Rule {
+    rule("natwg_next", "en6", "10.66.67.0/24", "10.73.0.0/24")
+}
+
+fn linux_rule() -> Rule {
+    rule("natwg_next", "eth0", "10.66.67.0/24", "192.168.139.0/24")
 }
 
 #[test]
@@ -197,14 +209,8 @@ fn commands_run_with_the_system_path_and_without_the_callers_environment() {
 
 #[test]
 fn pf_loads_one_nat_rule_into_the_instance_anchor_and_turns_forwarding_on() {
-    let plan = pf::up(
-        &instance("natwg_next"),
-        "en6",
-        net("10.66.67.0/24"),
-        net("10.73.0.0/24"),
-    );
     assert_eq!(
-        plan,
+        pf::up(&mac_rule()),
         [
             Step::new(&["pfctl", "-a", "com.apple/natwg_next", "-f", "-"])
                 .stdin("nat on en6 inet from 10.66.67.0/24 to 10.73.0.0/24 -> (en6)\n"),
@@ -216,12 +222,8 @@ fn pf_loads_one_nat_rule_into_the_instance_anchor_and_turns_forwarding_on() {
 
 #[test]
 fn the_default_instance_loads_the_rule_and_anchor_of_the_python_daemon() {
-    let plan = pf::up(
-        &Instance::default(),
-        "en6",
-        net("10.66.66.0/24"),
-        net("10.73.0.0/24"),
-    );
+    let plan = pf::up(&rule("natwg", "en6", "10.66.66.0/24", "10.73.0.0/24"));
+    assert_eq!(instance("natwg"), Instance::default());
     assert_eq!(plan[0].argv, argv("pfctl -a com.apple/natwg -f -"));
     assert_eq!(
         plan[0].stdin.as_deref(),
@@ -255,12 +257,6 @@ fn the_pf_enable_token_is_read_from_the_output_of_pfctl() {
 
 #[test]
 fn nft_replaces_the_instance_table_with_one_masquerade_rule() {
-    let plan = nft::up(
-        &instance("natwg_next"),
-        "eth0",
-        net("10.66.67.0/24"),
-        net("192.168.139.0/24"),
-    );
     let table = "table inet natwg_next
 delete table inet natwg_next
 table inet natwg_next {
@@ -271,7 +267,7 @@ table inet natwg_next {
 }
 ";
     assert_eq!(
-        plan,
+        nft::up(&linux_rule()),
         [
             Step::new(&["nft", "-f", "-"]).stdin(table),
             Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"]),
@@ -286,4 +282,118 @@ fn nft_stop_deletes_the_instance_table_even_when_it_is_already_gone() {
         [Step::new(&["nft", "-f", "-"])
             .stdin("table inet natwg_next\ndelete table inet natwg_next\n")]
     );
+}
+
+// What `pfctl -a com.apple/natwg -s nat` printed on the home server while the
+// Python daemon ran.
+const PYTHON_RULE: &str =
+    "nat on en6 inet from 10.66.66.0/24 to 10.73.0.0/24 -> (en6) round-robin\n";
+
+#[test]
+fn an_anchor_that_is_empty_or_holds_only_the_rule_of_this_config_is_free() {
+    let own = mac_rule();
+    let printed = "nat on en6 inet from 10.66.67.0/24 to 10.73.0.0/24 -> (en6) round-robin\n";
+    for listing in [
+        "",
+        "\n",
+        printed,
+        "nat on en6 from 10.66.67.0/24 to 10.73.0.0/24 -> (en6)\n",
+        &printed.repeat(2),
+    ] {
+        assert_eq!(pf::foreign(listing, &own), None, "{listing:?}");
+    }
+    let python = rule("natwg", "en6", "10.66.66.0/24", "10.73.0.0/24");
+    assert_eq!(pf::foreign(PYTHON_RULE, &python), None);
+}
+
+#[test]
+fn an_anchor_with_any_other_rule_is_in_use_and_the_rule_is_named() {
+    let own = mac_rule();
+    for other in [
+        PYTHON_RULE.trim(),
+        "nat on en0 inet from 10.66.67.0/24 to 10.73.0.0/24 -> (en0) round-robin",
+        "nat on en6 inet from 10.66.67.0/24 to 10.73.1.0/24 -> (en6) round-robin",
+        "nat on en6 inet from 10.66.67.0/24 to any -> (en6) round-robin",
+        "nat on en6 inet6 from 10.66.67.0/24 to 10.73.0.0/24 -> (en6) round-robin",
+        "rdr on en6 inet proto tcp from 10.66.67.0/24 to any port = 8080 -> 127.0.0.1 port 80",
+        "pass in quick on en6 inet from 10.66.67.0/24 to any flags S/SA keep state",
+    ] {
+        assert_eq!(pf::foreign(other, &own), Some(other), "{other}");
+        let after_the_own_rule = format!(
+            "nat on en6 inet from 10.66.67.0/24 to 10.73.0.0/24 -> (en6) round-robin\n{other}\n"
+        );
+        assert_eq!(pf::foreign(&after_the_own_rule, &own), Some(other));
+    }
+}
+
+#[test]
+fn rules_are_written_the_way_pfctl_and_nft_print_a_host_and_a_network() {
+    let host_bits = rule("natwg_next", "en6", "10.66.67.1/24", "10.73.0.7/24");
+    assert_eq!(pf::up(&host_bits), pf::up(&mac_rule()));
+
+    let hosts = rule("natwg_next", "en6", "10.66.67.1/32", "10.73.0.7/32");
+    let printed = "nat on en6 inet from 10.66.67.1 to 10.73.0.7 -> (en6) round-robin\n";
+    assert_eq!(pf::foreign(printed, &hosts), None);
+    let printed = "table inet natwg_next {
+\tchain postrouting {
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t\toifname \"en6\" ip saddr 10.66.67.1 ip daddr 10.73.0.7 masquerade
+\t}
+}
+";
+    assert_eq!(nft::foreign(printed, &hosts), None);
+}
+
+// What `nft list table inet natwg_next` printed in the VM while natwg ran.
+const OWN_TABLE: &str = "table inet natwg_next {
+\tchain postrouting {
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t\toifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 192.168.139.0/24 masquerade
+\t}
+}
+";
+
+#[test]
+fn a_table_that_is_empty_or_holds_only_the_rule_of_this_config_is_free() {
+    for listing in ["", "table inet natwg_next {\n}\n", OWN_TABLE] {
+        assert_eq!(nft::foreign(listing, &linux_rule()), None, "{listing:?}");
+    }
+}
+
+#[test]
+fn a_table_with_any_other_line_is_in_use_and_the_line_is_named() {
+    let marker = "counter comment \"someone else\"";
+    let with_marker = OWN_TABLE.replace("\t\toifname", &format!("\t\t{marker}\n\t\toifname"));
+    assert_eq!(nft::foreign(&with_marker, &linux_rule()), Some(marker));
+
+    let other_subnet = rule("natwg_next", "eth0", "10.66.68.0/24", "192.168.139.0/24");
+    assert_eq!(
+        nft::foreign(OWN_TABLE, &other_subnet),
+        Some("oifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 192.168.139.0/24 masquerade")
+    );
+
+    let firewall = "table inet natwg_next {
+\tchain input {
+\t\ttype filter hook input priority filter; policy drop;
+\t}
+}
+";
+    assert_eq!(nft::foreign(firewall, &linux_rule()), Some("chain input {"));
+}
+
+#[test]
+fn only_an_inet_table_with_the_exact_instance_name_is_listed() {
+    let next = instance("natwg_next");
+    assert!(nft::listed(
+        "table ip filter\ntable inet natwg_next\n",
+        &next
+    ));
+    for tables in [
+        "",
+        "table ip natwg_next\n",
+        "table inet natwg_next2\n",
+        "table inet natwg\n",
+    ] {
+        assert!(!nft::listed(tables, &next), "{tables:?}");
+    }
 }

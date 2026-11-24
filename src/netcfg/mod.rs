@@ -139,6 +139,11 @@ pub fn run(argv: &[String], stdin: Option<&str>) -> Result<Output> {
     Ok(Output { stdout, stderr })
 }
 
+/// What a command that only reads state printed on standard output.
+pub fn read(argv: &[&str]) -> Result<String> {
+    Ok(run(&owned(argv), None)?.stdout)
+}
+
 fn owned(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|&arg| arg.to_owned()).collect()
 }

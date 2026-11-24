@@ -5,7 +5,7 @@ mod channel;
 
 use crate::config::{Config, DoctorConfig, Instance, PeerConfig, ServerConfig};
 use crate::keys::{Key, PublicKey};
-use crate::nat::Nat;
+use crate::nat::{Nat, Rule};
 use crate::netcfg;
 use crate::wire::transport::{BoundInterface, BoundUdp, StunPort};
 use crate::{Error, Result};
@@ -31,10 +31,13 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    /// Start the server that `config` describes. A start that fails leaves no
-    /// TUN, no route and no NAT rule behind.
+    /// Start the server that `config` describes. The checks that can refuse
+    /// the start run before anything on the host changes. A start that fails
+    /// later removes the TUN, the route and the NAT rule that it made.
     pub async fn start(config: &Config) -> Result<Self> {
         let server = config.server()?;
+        let subnet = subnet(config.interface.address);
+        let nat = Rule::new(&server.instance, &server.iface, subnet, server.lan).check()?;
         let iface = BoundInterface::lookup(&server.iface)?;
         let unavailable =
             |e: gotatun::tun::tun_async_device::Error| Error::new("TUN_UNAVAILABLE", e.to_string());
@@ -49,15 +52,13 @@ impl Tunnel {
             tun,
         )
         .await?;
-        let subnet = subnet(config.interface.address);
         let plan = netcfg::plan(
             &tun_name,
             config.interface.address,
             config.interface.mtu,
             &[subnet],
         );
-        let nat = netcfg::apply(&plan)
-            .and_then(|()| Nat::start(&server.instance, &server.iface, subnet, server.lan));
+        let nat = netcfg::apply(&plan).and_then(|()| nat.load());
         match nat {
             Ok(nat) => Ok(Self {
                 device,
