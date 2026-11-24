@@ -1,6 +1,11 @@
 pub mod config;
+pub mod doctor;
 pub mod keys;
 pub mod legacy;
+pub mod nat;
+pub mod netcfg;
+pub mod tunnel;
+pub mod wire;
 
 #[derive(Debug)]
 pub struct Error {

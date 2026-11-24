@@ -1,6 +1,6 @@
 use natwg::config::{
-    CloudflareConfig, Config, DoctorConfig, Interface, PeerConfig, Role, ServerConfig, StunConfig,
-    UpnpConfig, Version1,
+    CloudflareConfig, Config, DoctorConfig, Instance, Interface, PeerConfig, Role, ServerConfig,
+    StunConfig, UpnpConfig, Version1,
 };
 use natwg::keys::Key;
 use serde_json::{Value, json};
@@ -122,6 +122,179 @@ fn saved_configs_load_back_unchanged() {
     assert_eq!(client.interface.mtu, 1380, "mtu defaults to 1380");
 }
 
+fn instance_of(config: &Config) -> &str {
+    let Role::Server(server) = &config.role else {
+        panic!("expected a server config")
+    };
+    server.instance.as_str()
+}
+
+#[test]
+fn the_instance_defaults_to_natwg_and_a_chosen_name_survives_a_save() {
+    let mut value = server_json();
+    assert_eq!(instance_of(&load_value(&value).unwrap()), "natwg");
+
+    value["role"]["server"]["instance"] = json!("natwg_next");
+    let config = load_value(&value).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("saved.json");
+    config.save(&path).unwrap();
+    let saved = Config::load(&path).unwrap();
+    assert_eq!(saved, config);
+    assert_eq!(instance_of(&saved), "natwg_next");
+}
+
+#[test]
+fn an_instance_name_must_be_1_to_15_characters_from_a_z_0_9_and_underscore() {
+    for name in ["a", "natwg_next", "wg0", "a23456789012345"] {
+        let mut value = server_json();
+        value["role"]["server"]["instance"] = json!(name);
+        assert_eq!(instance_of(&load_value(&value).unwrap()), name);
+    }
+    for name in [
+        "",
+        "Natwg",
+        "natwg-next",
+        "natwg next",
+        "natwg/next",
+        "natwg\"",
+        "a234567890123456",
+    ] {
+        let mut value = server_json();
+        value["role"]["server"]["instance"] = json!(name);
+        let error = load_value(&value).unwrap_err();
+        assert_eq!(error.code, "CONFIG_INVALID", "{name:?}");
+    }
+}
+
+/// What `Config::validate` says about `server_json` after `change`.
+fn validated(change: impl FnOnce(&mut Value)) -> Result<(), String> {
+    let mut value = server_json();
+    change(&mut value);
+    serde_json::from_value::<Config>(value).unwrap().validate()
+}
+
+fn refused(field: &str, change: impl FnOnce(&mut Value)) {
+    let error = validated(change).unwrap_err();
+    assert!(error.starts_with(field), "expected {field}, got {error}");
+}
+
+#[test]
+fn the_uplink_interface_must_be_a_plain_interface_name() {
+    for name in ["en6", "eth0", "bridge101", "wlan-0.1_X", "a23456789012345"] {
+        validated(|config| config["role"]["server"]["iface"] = json!(name)).unwrap();
+    }
+    for name in [
+        "",
+        "a234567890123456",
+        "en 6",
+        "en6\n",
+        "en6) pass all",
+        "eth0\"",
+        "en6;",
+        "en6/",
+        "\u{e9}n6",
+    ] {
+        refused("role.server.iface", |config| {
+            config["role"]["server"]["iface"] = json!(name)
+        });
+    }
+}
+
+fn with_address(address: &str, lan: &str) -> impl FnOnce(&mut Value) {
+    let (address, lan) = (json!(address), json!(lan));
+    move |config| {
+        config["interface"]["address"] = address;
+        config["role"]["server"]["lan"] = lan;
+        config["role"]["server"]["doctor"] = Value::Null;
+        config["peers"] = json!([]);
+    }
+}
+
+#[test]
+fn the_tunnel_address_needs_a_prefix_of_16_bits_or_more() {
+    for address in ["10.66.0.1/16", "10.66.66.1/24", "10.66.66.1/32"] {
+        validated(with_address(address, "10.73.0.0/24")).unwrap();
+    }
+    for address in ["10.66.0.1/15", "10.0.0.1/8", "0.0.0.1/0"] {
+        refused("interface.address", with_address(address, "192.168.0.0/24"));
+    }
+}
+
+#[test]
+fn the_tunnel_subnet_and_the_lan_must_not_overlap() {
+    validated(with_address("10.73.1.1/24", "10.73.0.0/24")).unwrap();
+    for (address, lan) in [
+        ("10.73.0.200/24", "10.73.0.0/24"),
+        ("10.73.1.1/24", "10.73.0.0/16"),
+        ("10.73.0.1/16", "10.73.5.0/24"),
+        ("10.73.0.9/32", "10.73.0.0/24"),
+    ] {
+        refused("interface.address", with_address(address, lan));
+    }
+}
+
+#[test]
+fn the_mtu_must_be_between_576_and_9000() {
+    for mtu in [576, 1380, 9000] {
+        validated(|config| config["interface"]["mtu"] = json!(mtu)).unwrap();
+    }
+    for mtu in [0, 575, 9001, 65535] {
+        refused("interface.mtu", |config| {
+            config["interface"]["mtu"] = json!(mtu)
+        });
+    }
+}
+
+#[test]
+fn the_doctor_needs_a_tunnel_address_that_nobody_else_has() {
+    let doctor_at = |address: &'static str| {
+        move |config: &mut Value| config["role"]["server"]["doctor"]["address"] = json!(address)
+    };
+    validated(doctor_at("10.66.66.254")).unwrap();
+    for (address, why) in [
+        ("10.66.67.3", "outside the tunnel subnet"),
+        ("10.73.0.9", "outside the tunnel subnet"),
+        ("10.66.66.1", "the tunnel address of the server"),
+        ("10.66.66.2", "allowed_ips 10.66.66.2/32 of peer \"laptop\""),
+    ] {
+        let error = validated(doctor_at(address)).unwrap_err();
+        assert!(
+            error.starts_with("role.server.doctor.address") && error.contains(why),
+            "{address}: {error}"
+        );
+    }
+    refused("role.server.doctor.address", |config| {
+        config["peers"][0]["allowed_ips"] = json!(["192.168.9.0/24", "10.66.66.0/24"])
+    });
+}
+
+#[test]
+fn a_client_config_needs_a_valid_address_and_mtu_too() {
+    let client = |change: fn(&mut Value)| {
+        let mut value = client_json();
+        change(&mut value);
+        serde_json::from_value::<Config>(value).unwrap().validate()
+    };
+    client(|_| {}).unwrap();
+    assert!(client(|config| config["interface"]["mtu"] = json!(100)).is_err());
+    assert!(client(|config| config["interface"]["address"] = json!("10.0.0.2/8")).is_err());
+}
+
+#[test]
+fn load_refuses_a_config_that_is_not_valid_and_names_the_file_and_the_field() {
+    let mut value = server_json();
+    value["role"]["server"]["iface"] = json!("en6) pass all");
+    let error = load_value(&value).unwrap_err();
+    assert_eq!(error.code, "CONFIG_INVALID");
+    assert!(error.message.contains("config.json"), "{}", error.message);
+    assert!(
+        error.message.contains("role.server.iface"),
+        "{}",
+        error.message
+    );
+}
+
 #[test]
 fn unknown_fields_are_rejected_at_any_depth() {
     let mut top = server_json();
@@ -184,6 +357,7 @@ fn legacy_import_maps_every_field() {
             keepalive: None,
         }],
         role: Role::Server(ServerConfig {
+            instance: Instance::default(),
             iface: "en6".into(),
             listen_port: 51830,
             lan: "10.73.0.0/24".parse().unwrap(),
@@ -340,6 +514,30 @@ fn keys_gen_prints_a_fresh_matching_pair() {
     assert_ne!(first["private_key"], generate()["private_key"]);
     let private: Key = first["private_key"].as_str().unwrap().parse().unwrap();
     assert_eq!(first["public_key"], private.public_key().to_string());
+}
+
+#[test]
+fn natwg_prints_into_a_closed_pipe_without_a_panic() {
+    let closed_pipe = || {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer
+    };
+    let output = natwg()
+        .args(["keys", "gen"])
+        .stdout(closed_pipe())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(stderr, "");
+
+    let output = natwg()
+        .args(["config", "show", "--config", "/natwg-none.json"])
+        .stderr(closed_pipe())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "CONFIG_UNREADABLE exits 1");
 }
 
 #[test]
