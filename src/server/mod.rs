@@ -204,6 +204,10 @@ impl Supervisor<'_> {
         for tick in [&mut status_tick, &mut nat_tick] {
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         }
+        // A new mapping, publish result or UPnP lease reaches the status at
+        // once instead of at the next tick.
+        let mut mapping = self.mapping.subscribe();
+        let (mut publish, mut lease) = (self.publish.clone(), self.lease.clone());
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun}, udp/{}", server.listen_port);
         loop {
@@ -217,6 +221,9 @@ impl Supervisor<'_> {
                 () = stop.as_mut() => return Exit::Stopped,
                 never = &mut keepalive => match never {},
                 _ = nat_tick.tick() => nat_ok = self.check_nat(device, nat_ok),
+                Ok(()) = mapping.changed() => status_tick.reset_immediately(),
+                Ok(()) = publish.changed() => status_tick.reset_immediately(),
+                Ok(()) = lease.changed() => status_tick.reset_immediately(),
                 _ = status_tick.tick() => {
                     if let Some(tun) = device.tun()
                         && BoundInterface::lookup(tun).is_err()
