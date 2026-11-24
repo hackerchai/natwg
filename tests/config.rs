@@ -167,6 +167,134 @@ fn an_instance_name_must_be_1_to_15_characters_from_a_z_0_9_and_underscore() {
     }
 }
 
+/// What `Config::validate` says about `server_json` after `change`.
+fn validated(change: impl FnOnce(&mut Value)) -> Result<(), String> {
+    let mut value = server_json();
+    change(&mut value);
+    serde_json::from_value::<Config>(value).unwrap().validate()
+}
+
+fn refused(field: &str, change: impl FnOnce(&mut Value)) {
+    let error = validated(change).unwrap_err();
+    assert!(error.starts_with(field), "expected {field}, got {error}");
+}
+
+#[test]
+fn the_uplink_interface_must_be_a_plain_interface_name() {
+    for name in ["en6", "eth0", "bridge101", "wlan-0.1_X", "a23456789012345"] {
+        validated(|config| config["role"]["server"]["iface"] = json!(name)).unwrap();
+    }
+    for name in [
+        "",
+        "a234567890123456",
+        "en 6",
+        "en6\n",
+        "en6) pass all",
+        "eth0\"",
+        "en6;",
+        "en6/",
+        "\u{e9}n6",
+    ] {
+        refused("role.server.iface", |config| {
+            config["role"]["server"]["iface"] = json!(name)
+        });
+    }
+}
+
+fn with_address(address: &str, lan: &str) -> impl FnOnce(&mut Value) {
+    let (address, lan) = (json!(address), json!(lan));
+    move |config| {
+        config["interface"]["address"] = address;
+        config["role"]["server"]["lan"] = lan;
+        config["role"]["server"]["doctor"] = Value::Null;
+        config["peers"] = json!([]);
+    }
+}
+
+#[test]
+fn the_tunnel_address_needs_a_prefix_of_16_bits_or_more() {
+    for address in ["10.66.0.1/16", "10.66.66.1/24", "10.66.66.1/32"] {
+        validated(with_address(address, "10.24.0.0/24")).unwrap();
+    }
+    for address in ["10.66.0.1/15", "10.0.0.1/8", "0.0.0.1/0"] {
+        refused("interface.address", with_address(address, "192.168.0.0/24"));
+    }
+}
+
+#[test]
+fn the_tunnel_subnet_and_the_lan_must_not_overlap() {
+    validated(with_address("10.24.1.1/24", "10.24.0.0/24")).unwrap();
+    for (address, lan) in [
+        ("10.24.0.200/24", "10.24.0.0/24"),
+        ("10.24.1.1/24", "10.24.0.0/16"),
+        ("10.24.0.1/16", "10.24.5.0/24"),
+        ("10.24.0.9/32", "10.24.0.0/24"),
+    ] {
+        refused("interface.address", with_address(address, lan));
+    }
+}
+
+#[test]
+fn the_mtu_must_be_between_576_and_9000() {
+    for mtu in [576, 1380, 9000] {
+        validated(|config| config["interface"]["mtu"] = json!(mtu)).unwrap();
+    }
+    for mtu in [0, 575, 9001, 65535] {
+        refused("interface.mtu", |config| {
+            config["interface"]["mtu"] = json!(mtu)
+        });
+    }
+}
+
+#[test]
+fn the_doctor_needs_a_tunnel_address_that_nobody_else_has() {
+    let doctor_at = |address: &'static str| {
+        move |config: &mut Value| config["role"]["server"]["doctor"]["address"] = json!(address)
+    };
+    validated(doctor_at("10.66.66.254")).unwrap();
+    for (address, why) in [
+        ("10.66.67.3", "outside the tunnel subnet"),
+        ("10.24.0.9", "outside the tunnel subnet"),
+        ("10.66.66.1", "the tunnel address of the server"),
+        ("10.66.66.2", "allowed_ips 10.66.66.2/32 of peer \"laptop\""),
+    ] {
+        let error = validated(doctor_at(address)).unwrap_err();
+        assert!(
+            error.starts_with("role.server.doctor.address") && error.contains(why),
+            "{address}: {error}"
+        );
+    }
+    refused("role.server.doctor.address", |config| {
+        config["peers"][0]["allowed_ips"] = json!(["192.168.9.0/24", "10.66.66.0/24"])
+    });
+}
+
+#[test]
+fn a_client_config_needs_a_valid_address_and_mtu_too() {
+    let client = |change: fn(&mut Value)| {
+        let mut value = client_json();
+        change(&mut value);
+        serde_json::from_value::<Config>(value).unwrap().validate()
+    };
+    client(|_| {}).unwrap();
+    assert!(client(|config| config["interface"]["mtu"] = json!(100)).is_err());
+    assert!(client(|config| config["interface"]["address"] = json!("10.0.0.2/8")).is_err());
+}
+
+#[test]
+fn load_refuses_a_config_that_is_not_valid_and_names_the_file_and_the_field() {
+    let mut value = server_json();
+    value["role"]["server"]["iface"] = json!("en6) pass all");
+    let error = load_value(&value).unwrap_err();
+    assert_eq!(error.code, "CONFIG_INVALID");
+    assert!(error.message.contains("config.json"), "{}", error.message);
+    assert!(
+        error.message.contains("role.server.iface"),
+        "{}",
+        error.message
+    );
+}
+
 #[test]
 fn unknown_fields_are_rejected_at_any_depth() {
     let mut top = server_json();

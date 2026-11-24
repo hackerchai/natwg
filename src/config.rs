@@ -22,6 +22,16 @@ pub const DEFAULT_PATH: &str = "/etc/natwg/config.json";
 
 pub const DEFAULT_MTU: u16 = 1380;
 
+// Every IPv4 host accepts a packet of 576 bytes, and 9000 bytes is a jumbo
+// frame.
+const MTU: std::ops::RangeInclusive<u16> = 576..=9000;
+
+// The server routes the whole subnet of its tunnel address into the tunnel.
+const SHORTEST_PREFIX: u8 = 16;
+
+// The longest interface name that Linux and macOS accept.
+const IFACE_NAME_MAX: usize = 15;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -229,8 +239,68 @@ impl Config {
         }
         let mut text = String::new();
         file.read_to_string(&mut text).map_err(unreadable)?;
-        serde_json::from_str(&text)
-            .map_err(|e| Error::new("CONFIG_INVALID", format!("{}: {e}", path.display())))
+        let invalid = |e: String| Error::new("CONFIG_INVALID", format!("{}: {e}", path.display()));
+        let config: Self = serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+        config.validate().map_err(invalid)?;
+        Ok(config)
+    }
+
+    /// Reject values that would make natwg take routes or rules that are not
+    /// its own, and name the field at fault. [`Config::load`] runs this, so
+    /// the rest of natwg trusts a loaded config.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let Interface { address, mtu } = self.interface;
+        if address.prefix() < SHORTEST_PREFIX {
+            return Err(format!(
+                "interface.address {address} has a prefix shorter than /{SHORTEST_PREFIX}, and natwg routes the whole subnet of the address into the tunnel"
+            ));
+        }
+        if !MTU.contains(&mtu) {
+            return Err(format!(
+                "interface.mtu {mtu} is not between {} and {}",
+                MTU.start(),
+                MTU.end()
+            ));
+        }
+        let Role::Server(server) = &self.role else {
+            return Ok(());
+        };
+        if !is_iface_name(&server.iface) {
+            return Err(format!(
+                "role.server.iface {:?} is not an interface name of 1 to {IFACE_NAME_MAX} characters from A-Z, a-z, 0-9, '.', '_' and '-'",
+                server.iface
+            ));
+        }
+        if address.overlaps(server.lan) {
+            return Err(format!(
+                "interface.address {address} and role.server.lan {} overlap, so the tunnel and the LAN would claim the same addresses",
+                server.lan
+            ));
+        }
+        let Some(doctor) = server.doctor.as_ref().map(|doctor| doctor.address) else {
+            return Ok(());
+        };
+        if !address.contains(doctor) {
+            return Err(format!(
+                "role.server.doctor.address {doctor} is outside the tunnel subnet of interface.address {address}"
+            ));
+        }
+        if doctor == address.ip() {
+            return Err(format!(
+                "role.server.doctor.address {doctor} is the tunnel address of the server"
+            ));
+        }
+        let taken = self.peers.iter().find_map(|peer| {
+            let allowed = peer.allowed_ips.iter().find(|net| net.contains(doctor))?;
+            Some((peer, allowed))
+        });
+        if let Some((peer, allowed)) = taken {
+            return Err(format!(
+                "role.server.doctor.address {doctor} is inside allowed_ips {allowed} of peer {:?}, and the doctor needs an address no peer uses",
+                peer.name
+            ));
+        }
+        Ok(())
     }
 
     /// Atomically replace `path` with this config, readable only by its owner.
@@ -284,6 +354,15 @@ impl Config {
         };
         serde_json::to_string_pretty(&view).expect("a config always serializes")
     }
+}
+
+// The name goes into the pf and the nftables rule as text, so a character
+// outside this set could end the rule and start another.
+fn is_iface_name(name: &str) -> bool {
+    (1..=IFACE_NAME_MAX).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn default_mtu() -> u16 {
