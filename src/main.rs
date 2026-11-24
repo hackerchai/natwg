@@ -77,7 +77,8 @@ enum Action {
     /// each of its allowed IPs, the TXT lookup that follows the server's
     /// endpoint, and the status file.
     Client {
-        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP.
+        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. `natwg
+        /// service install` runs the client in the background.
         #[arg(long, required = true)]
         foreground: bool,
     },
@@ -104,8 +105,8 @@ enum Action {
         #[command(subcommand)]
         action: DoctorAction,
     },
-    /// Run the server as a system service: a LaunchDaemon on macOS, a
-    /// systemd unit on Linux.
+    /// Run the server or the client as a system service: a LaunchDaemon on
+    /// macOS, a systemd unit on Linux.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -118,7 +119,9 @@ enum Action {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Install the server of --config as a service and start it.
+    /// Install the server or the client of --config as a service and start
+    /// it. The client's service is com.hackerchai.natwg.client on macOS and
+    /// natwg-client.service on Linux.
     ///
     /// natwg copies itself to /usr/local/libexec/natwg/natwg, and the service
     /// runs that copy. A part that is in place already stays, so a second
@@ -133,9 +136,10 @@ enum ServiceAction {
         /// binary.
         #[arg(long)]
         purge: bool,
-        /// Remove the service of this instance without reading --config, as
-        /// when the config is broken or gone. Its status file stays.
-        #[arg(long, value_name = "NAME", conflicts_with = "purge")]
+        /// Remove the service of this instance, or of the client with
+        /// `client`, without reading --config, as when the config is broken
+        /// or gone. Its status file stays.
+        #[arg(long, value_name = "NAME", conflicts_with = "purge", value_parser = service_instance)]
         instance: Option<Instance>,
     },
     /// Restart the service of --config, which then reads the config again.
@@ -238,6 +242,14 @@ const DNS_PORT: u16 = 53;
 
 fn millis(text: &str) -> std::result::Result<Duration, std::num::ParseIntError> {
     text.parse().map(Duration::from_millis)
+}
+
+/// An instance name, or `client` for the client's service.
+fn service_instance(name: &str) -> std::result::Result<Instance, &'static str> {
+    match name {
+        "client" => Ok(Instance::client()),
+        name => name.parse(),
+    }
 }
 
 fn main() {
