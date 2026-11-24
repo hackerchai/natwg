@@ -35,8 +35,16 @@ impl Rule {
     /// killed leaves this rule behind, and so does the Python daemon that
     /// served the same subnets. The check only reads.
     pub fn check(self) -> Result<Checked> {
-        let Some((place, line)) = self.foreign()? else {
-            return Ok(Checked(self));
+        self.listing()?;
+        Ok(Checked(self))
+    }
+
+    /// What the anchor or the table of the instance holds, which is nothing
+    /// or this rule. Anything else is the error of [`Rule::check`].
+    fn listing(&self) -> Result<String> {
+        let (place, listing) = self.current()?;
+        let Some(line) = foreign(&listing, self) else {
+            return Ok(listing);
         };
         Err(Error::new(
             "INSTANCE_IN_USE",
@@ -47,28 +55,25 @@ impl Rule {
     }
 
     #[cfg(target_os = "macos")]
-    fn foreign(&self) -> Result<Option<(String, String)>> {
+    fn current(&self) -> Result<(String, String)> {
         let anchor = pf::anchor(&self.instance);
+        let mut listing = String::new();
         for rules in ["nat", "rules"] {
-            let listing = read(&["pfctl", "-a", &anchor, "-s", rules])?;
-            if let Some(line) = pf::foreign(&listing, self) {
-                return Ok(Some((format!("the pf anchor {anchor}"), line.to_owned())));
-            }
+            listing += &read(&["pfctl", "-a", &anchor, "-s", rules])?;
         }
-        Ok(None)
+        Ok((format!("the pf anchor {anchor}"), listing))
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn foreign(&self) -> Result<Option<(String, String)>> {
+    fn current(&self) -> Result<(String, String)> {
         let name = self.instance.as_str();
+        let place = format!("the nftables table inet {name}");
         // `nft list table` fails for a table that does not exist, and a
         // failure must never count as a free table.
         if !nft::listed(&read(&["nft", "list", "tables"])?, &self.instance) {
-            return Ok(None);
+            return Ok((place, String::new()));
         }
-        let listing = read(&["nft", "list", "table", "inet", name])?;
-        let place = format!("the nftables table inet {name}");
-        Ok(nft::foreign(&listing, self).map(|line| (place, line.to_owned())))
+        Ok((place, read(&["nft", "list", "table", "inet", name])?))
     }
 }
 
@@ -100,6 +105,20 @@ impl Nat {
         self.down.run()
     }
 
+    /// Load `rule` again when it no longer takes effect, as after someone
+    /// flushed its anchor or table, and keep IP forwarding on. A rule of
+    /// someone else in its place is refused as [`Rule::check`] refuses it.
+    /// Returns whether the rule had to be loaded again.
+    pub fn ensure(&mut self, rule: &Rule) -> Result<bool> {
+        let missing = !in_effect(&rule.listing()?, rule)?;
+        if missing {
+            self.up(rule)?;
+        } else {
+            apply(&[forwarding()])?;
+        }
+        Ok(missing)
+    }
+
     #[cfg(target_os = "macos")]
     fn up(&mut self, rule: &Rule) -> Result<()> {
         if let Some(disable) = pf::enable()? {
@@ -123,6 +142,37 @@ fn down(instance: &Instance) -> Vec<Step> {
 #[cfg(not(target_os = "macos"))]
 fn down(instance: &Instance) -> Vec<Step> {
     nft::down(instance)
+}
+
+#[cfg(target_os = "macos")]
+fn foreign<'a>(listing: &'a str, rule: &Rule) -> Option<&'a str> {
+    pf::foreign(listing, rule)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn foreign<'a>(listing: &'a str, rule: &Rule) -> Option<&'a str> {
+    nft::foreign(listing, rule)
+}
+
+// pf applies no rule while it is disabled.
+#[cfg(target_os = "macos")]
+fn in_effect(listing: &str, rule: &Rule) -> Result<bool> {
+    Ok(pf::holds(listing, rule) && pf::enabled()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn in_effect(listing: &str, rule: &Rule) -> Result<bool> {
+    Ok(nft::holds(listing, rule))
+}
+
+#[cfg(target_os = "macos")]
+fn forwarding() -> Step {
+    pf::forwarding()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn forwarding() -> Step {
+    nft::forwarding()
 }
 
 /// A network as pfctl and nft print it. Both print the network address, and

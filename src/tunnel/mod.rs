@@ -10,13 +10,14 @@ use crate::netcfg;
 use crate::wire::transport::{BoundInterface, BoundUdp, StunPort};
 use crate::{Error, Result};
 use channel::{ChannelRecv, ChannelSend};
-use gotatun::device::{Device, DeviceBuilder, Peer};
+use gotatun::device::{Device, DeviceBuilder, DeviceTransports, Peer};
 use gotatun::packet::{Ip, Packet};
 use gotatun::tun::tun_async_device::TunDevice;
 use gotatun::tun::{IpRecv, IpSend};
 use gotatun::x25519;
 use ipnetwork::{IpNetwork, Ipv4Network};
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 const PACKET_QUEUE: usize = 64;
@@ -27,19 +28,32 @@ pub struct Tunnel {
     // Fields drop in this order, so a panic removes the NAT rules before it
     // reaches the device.
     nat: Nat,
+    rule: Rule,
     device: Device<(BoundUdp, TunDevice, TunDevice)>,
-    stun: StunPort,
     tun_name: String,
 }
 
+/// What a WireGuard device knows about one of its peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerStats {
+    pub public_key: PublicKey,
+    pub endpoint: Option<SocketAddr>,
+    /// How long ago the last handshake completed.
+    pub last_handshake: Option<Duration>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
 impl Tunnel {
-    /// Start the server that `config` describes. The checks that can refuse
-    /// the start run before anything on the host changes. A start that fails
-    /// later removes the TUN, the route and the NAT rule that it made.
-    pub async fn start(config: &Config) -> Result<Self> {
+    /// Start the server that `config` describes, and STUN on its socket. The
+    /// checks that can refuse the start run before anything on the host
+    /// changes. A start that fails later removes the TUN, the route and the
+    /// NAT rule that it made.
+    pub async fn start(config: &Config) -> Result<(Self, StunPort)> {
         let server = config.server()?;
         let subnet = subnet(config.interface.address);
-        let nat = Rule::new(&server.instance, &server.iface, subnet, server.lan).check()?;
+        let rule = Rule::new(&server.instance, &server.iface, subnet, server.lan);
+        let nat = rule.clone().check()?;
         // macOS needs no such check. The route step of its plan fails with
         // COMMAND_NO_EFFECT for a subnet that has a route.
         #[cfg(not(target_os = "macos"))]
@@ -67,12 +81,15 @@ impl Tunnel {
         );
         let nat = netcfg::apply(&plan).and_then(|()| nat.load());
         match nat {
-            Ok(nat) => Ok(Self {
-                nat,
-                device,
-                stun,
-                tun_name,
-            }),
+            Ok(nat) => {
+                let tunnel = Self {
+                    nat,
+                    rule,
+                    device,
+                    tun_name,
+                };
+                Ok((tunnel, stun))
+            }
             Err(error) => {
                 device.stop().await;
                 Err(error)
@@ -85,15 +102,20 @@ impl Tunnel {
         &self.tun_name
     }
 
-    /// STUN on the socket the device listens on.
-    pub fn stun(&mut self) -> &mut StunPort {
-        &mut self.stun
-    }
-
     /// Wait until the device can carry no more traffic, which happens when
     /// its TUN or its UDP socket fails.
     pub async fn failed(&mut self) {
         self.device.wait().await;
+    }
+
+    pub async fn peers(&self) -> Vec<PeerStats> {
+        peer_stats(&self.device).await
+    }
+
+    /// Load the NAT rule again if it no longer takes effect. Returns whether
+    /// it had to.
+    pub fn ensure_nat(&mut self) -> Result<bool> {
+        self.nat.ensure(&self.rule)
     }
 
     /// Remove the NAT rules and stop the device. The TUN closes with the
@@ -114,8 +136,9 @@ pub struct Detached {
 }
 
 impl Detached {
-    /// The device of [`Tunnel::start`] without its TUN, its route and its NAT.
-    pub async fn server(config: &Config) -> Result<Self> {
+    /// The device of [`Tunnel::start`] without its TUN, its route and its
+    /// NAT, and STUN on its socket.
+    pub async fn server(config: &Config) -> Result<(Self, StunPort)> {
         let server = config.server()?;
         let iface = BoundInterface::lookup(&server.iface)?;
         let peers = server_peers(config, server)?;
@@ -142,14 +165,15 @@ impl Detached {
         let peer = Peer::new(public(config.private_key.public_key()))
             .with_endpoint(endpoint.into())
             .with_allowed_ips(routed.map(IpNetwork::V4));
-        Self::start(
+        let (client, _) = Self::start(
             &doctor.private_key,
             iface,
             0,
             vec![peer],
             config.interface.mtu,
         )
-        .await
+        .await?;
+        Ok(client)
     }
 
     async fn start(
@@ -158,19 +182,35 @@ impl Detached {
         port: u16,
         peers: Vec<Peer>,
         mtu: u16,
-    ) -> Result<Self> {
+    ) -> Result<(Self, StunPort)> {
         let (outbound, from_caller) = mpsc::channel(PACKET_QUEUE);
         let (to_caller, inbound) = mpsc::channel(PACKET_QUEUE);
         let tun_rx = ChannelRecv {
             packets: from_caller,
             mtu,
         };
-        let (device, _) = device(key, iface, port, peers, ChannelSend(to_caller), tun_rx).await?;
-        Ok(Self {
+        let (device, stun) =
+            device(key, iface, port, peers, ChannelSend(to_caller), tun_rx).await?;
+        let detached = Self {
             device,
             outbound,
             inbound,
-        })
+        };
+        Ok((detached, stun))
+    }
+
+    /// Wait until the device can carry no more traffic, which happens when
+    /// its UDP socket fails.
+    pub async fn failed(&mut self) {
+        self.device.wait().await;
+    }
+
+    pub async fn peers(&self) -> Vec<PeerStats> {
+        peer_stats(&self.device).await
+    }
+
+    pub async fn stop(self) {
+        self.device.stop().await;
     }
 
     /// The UDP port the device listens on. The kernel chose it when the
@@ -193,6 +233,20 @@ impl Detached {
         let packet = self.inbound.recv().await.ok_or_else(stopped)?;
         Ok(packet.into_bytes().to_vec())
     }
+}
+
+async fn peer_stats<T: DeviceTransports>(device: &Device<T>) -> Vec<PeerStats> {
+    let peers = device.read(async |device| device.peers().await).await;
+    peers
+        .into_iter()
+        .map(|peer| PeerStats {
+            public_key: PublicKey::from(peer.peer.public_key.to_bytes()),
+            endpoint: peer.peer.endpoint,
+            last_handshake: peer.stats.last_handshake,
+            rx_bytes: peer.stats.rx_bytes as u64,
+            tx_bytes: peer.stats.tx_bytes as u64,
+        })
+        .collect()
 }
 
 fn stopped() -> Error {

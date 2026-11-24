@@ -9,12 +9,13 @@ use crate::netcfg::Step;
 /// IP forwarding on.
 pub fn up(rule: &Rule) -> Vec<Step> {
     let load = format!("{}{}", delete(&rule.instance), table(rule));
-    vec![
-        Step::new(&["nft", "-f", "-"]).stdin(load),
-        // `sysctl -w` exits 0 when /proc/sys is read-only, as in a container.
-        Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"])
-            .done_when(&["sysctl", "-n", "net.ipv4.ip_forward"], "1"),
-    ]
+    vec![Step::new(&["nft", "-f", "-"]).stdin(load), forwarding()]
+}
+
+pub fn forwarding() -> Step {
+    // `sysctl -w` exits 0 when /proc/sys is read-only, as in a container.
+    Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"])
+        .done_when(&["sysctl", "-n", "net.ipv4.ip_forward"], "1")
 }
 
 pub fn down(instance: &Instance) -> Vec<Step> {
@@ -52,6 +53,15 @@ pub fn listed(tables: &str, instance: &Instance) -> bool {
         line.split_whitespace()
             .eq(["table", "inet", instance.as_str()])
     })
+}
+
+/// Whether what `nft list table` prints holds every line of the table [`up`]
+/// loads.
+pub fn holds(listing: &str, rule: &Rule) -> bool {
+    let printed: Vec<&str> = listing.lines().map(str::trim).collect();
+    table(rule)
+        .lines()
+        .all(|line| printed.contains(&line.trim()))
 }
 
 /// The first line of what `nft list table` prints that is not a line of the
