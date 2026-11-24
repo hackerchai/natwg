@@ -11,7 +11,7 @@ use natwg::tunnel::Tunnel;
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
-use natwg::{Error, Result, doctor, keys::Key};
+use natwg::{Error, Result, doctor, keys::Key, service};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
@@ -67,8 +67,8 @@ enum Action {
     /// Run the WireGuard server: the tunnel with its route and LAN NAT, the
     /// STUN keepalive, the TXT record, the UPnP lease and the status file.
     Server {
-        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. natwg has no
-        /// other way to run the server yet.
+        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. `natwg
+        /// service install` runs the server in the background.
         #[arg(long, required = true)]
         foreground: bool,
     },
@@ -87,9 +87,39 @@ enum Action {
         #[command(subcommand)]
         action: DoctorAction,
     },
+    /// Run the server as a system service: a LaunchDaemon on macOS, a
+    /// systemd unit on Linux.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Run the server for a service manager, as `server --foreground` does.
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the server of --config as a service and start it.
+    ///
+    /// natwg copies itself to /usr/local/libexec/natwg/natwg, and the service
+    /// runs that copy. A part that is in place already stays, so a second
+    /// run with nothing changed keeps the running server.
+    Install,
+    /// Stop the service of --config and remove it.
+    ///
+    /// The definition and the status file go. The binary and the config
+    /// stay unless --purge is given.
+    Uninstall {
+        /// Also delete the config and, once no natwg service is left, the
+        /// binary.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Restart the service of --config, which then reads the config again.
+    Restart,
+    /// Show every natwg service on this host. Needs no root.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -264,7 +294,42 @@ fn run(cli: Cli) -> Result<()> {
                     attempts,
                 },
         } => doctor_loopback(&cli.config, iface.as_deref(), endpoint, attempts)?,
+        Action::Service { action } => service_action(&cli.config, action)?,
     }
+    Ok(())
+}
+
+fn service_action(config: &Path, action: ServiceAction) -> Result<()> {
+    let report = match action {
+        ServiceAction::Install => service::install(config)?,
+        ServiceAction::Uninstall { purge } => service::uninstall(config, purge)?,
+        ServiceAction::Restart => service::restart(config)?,
+        ServiceAction::Status => {
+            let services = service::status()?;
+            if services.is_empty() {
+                return Err(Error::new(
+                    "SERVICE_NOT_INSTALLED",
+                    "no natwg service is installed; run natwg service install",
+                ));
+            }
+            for (name, state) in &services {
+                say!("{name} {state}");
+            }
+            let stopped: Vec<&str> = services
+                .iter()
+                .filter(|(_, state)| !matches!(state, service::State::Running(_)))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if stopped.is_empty() {
+                return Ok(());
+            }
+            return Err(Error::new(
+                "SERVICE_STOPPED",
+                format!("{} does not run", stopped.join(" and ")),
+            ));
+        }
+    };
+    say!("{report}");
     Ok(())
 }
 
