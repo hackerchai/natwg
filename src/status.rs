@@ -33,7 +33,7 @@ pub struct Status {
     pub last_stun_ok: Option<u64>,
     /// STUN requests in a row that got no answer.
     pub stun_misses: u32,
-    /// What the TXT record holds since natwg last wrote it.
+    /// What the TXT record holds, as natwg last wrote or found it.
     pub published: Option<SocketAddrV4>,
     pub published_at: Option<u64>,
     pub publish_error: Option<String>,
