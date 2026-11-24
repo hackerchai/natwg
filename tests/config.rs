@@ -173,7 +173,7 @@ fn legacy_import_maps_every_field() {
         private_key: SERVER_PRIVATE.parse().unwrap(),
         interface: Interface {
             address: "10.66.66.1/24".parse().unwrap(),
-            mtu: 1380,
+            mtu: 1420,
         },
         peers: vec![PeerConfig {
             name: "laptop".into(),
@@ -198,7 +198,7 @@ fn legacy_import_maps_every_field() {
                     "111.206.174.3:3478".parse().unwrap(),
                     "111.206.174.2:3478".parse().unwrap(),
                 ],
-                interval_secs: NonZeroU64::new(25).unwrap(),
+                interval_secs: NonZeroU64::new(17).unwrap(),
                 dns_server: "223.5.5.5".parse().unwrap(),
             },
             upnp: Some(UpnpConfig {
@@ -357,4 +357,65 @@ fn a_client_config_cannot_carry_a_doctor() {
     value["role"]["client"]["doctor"] =
         json!({ "private_key": DOCTOR_PRIVATE, "address": "10.66.66.3" });
     assert_eq!(load_value(&value).unwrap_err().code, "CONFIG_INVALID");
+}
+
+#[test]
+fn a_malformed_legacy_key_line_never_echoes_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = fs::read_to_string(fixture("wg-home.conf"))
+        .unwrap()
+        .replace("PrivateKey = ", "PrivateKey: ");
+    let wg_conf = dir.path().join("wg-home.conf");
+    fs::write(&wg_conf, conf).unwrap();
+    let output = natwg()
+        .args(["config", "import-legacy", "--dry-run", "--natwg-json"])
+        .arg(fixture("natwg.json"))
+        .arg("--wg-conf")
+        .arg(&wg_conf)
+        .arg("--cf-token")
+        .arg(fixture("cf_token"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap().to_lowercase();
+    assert!(stderr.contains("legacy_invalid"), "{stderr}");
+    assert!(
+        !stderr.contains(&SERVER_PRIVATE[..16].to_lowercase()),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_empty_upnp_control_url_imports_as_upnp_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut legacy: Value =
+        serde_json::from_str(&fs::read_to_string(fixture("natwg.json")).unwrap()).unwrap();
+    legacy["upnp_control_url"] = json!("");
+    let natwg_json = dir.path().join("natwg.json");
+    fs::write(&natwg_json, legacy.to_string()).unwrap();
+    let config = natwg::legacy::import(
+        &natwg_json,
+        Some(&fixture("wg-home.conf")),
+        Some(&fixture("cf_token")),
+    )
+    .unwrap();
+    let Role::Server(server) = config.role else {
+        panic!("legacy import is a server config")
+    };
+    assert_eq!(server.upnp, None);
+}
+
+#[test]
+fn a_fifo_at_the_config_path_is_refused_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("config.json");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::set_permissions(&fifo, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(Config::load(&fifo).unwrap_err().code, "CONFIG_UNSAFE");
 }

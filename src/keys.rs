@@ -150,14 +150,13 @@ thread_local! {
 }
 
 pub(crate) fn exposing<T>(f: impl FnOnce() -> T) -> T {
-    struct Reset;
-    impl Drop for Reset {
+    struct Restore(bool);
+    impl Drop for Restore {
         fn drop(&mut self) {
-            EXPOSING.set(false);
+            EXPOSING.set(self.0);
         }
     }
-    EXPOSING.set(true);
-    let _reset = Reset;
+    let _restore = Restore(EXPOSING.replace(true));
     f()
 }
 
@@ -170,4 +169,21 @@ fn serialize_secret<S: Serializer>(
 
 fn decode(text: &str) -> Option<[u8; 32]> {
     STANDARD.decode(text).ok()?.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_exposing_keeps_the_outer_scope_exposed() {
+        let key = Key([7; 32]);
+        let plain = serde_json::to_string(&key.to_base64()).unwrap();
+        let outer = exposing(|| {
+            exposing(|| ());
+            serde_json::to_string(&key).unwrap()
+        });
+        assert_eq!(outer, plain);
+        assert_eq!(serde_json::to_string(&key).unwrap(), "\"<redacted>\"");
+    }
 }

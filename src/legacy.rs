@@ -83,7 +83,7 @@ pub fn import(
                 interval_secs: legacy.keepalive,
                 dns_server: legacy.dns_server,
             },
-            upnp: Some(UpnpConfig {
+            upnp: (!legacy.upnp_control_url.is_empty()).then_some(UpnpConfig {
                 control_url: legacy.upnp_control_url,
                 lease_secs: legacy.upnp_lease,
                 refresh_secs: legacy.upnp_refresh,
@@ -153,7 +153,11 @@ fn parse_wg_conf(text: &str) -> std::result::Result<WgServer, String> {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| at(&"expected a section header or Key = Value"))?;
-        let key = key.trim().to_ascii_lowercase();
+        let key = key.trim();
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return Err(at(&"expected a section header or Key = Value"));
+        }
+        let key = key.to_ascii_lowercase();
         let value = value.trim();
         match (&section, key.as_str()) {
             (Section::Interface, "privatekey") => {

@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU64,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
@@ -146,7 +146,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let unreadable =
             |e: std::io::Error| Error::new("CONFIG_UNREADABLE", format!("{}: {e}", path.display()));
-        let mut file = std::fs::File::open(path).map_err(unreadable)?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(unreadable)?;
         let meta = file.metadata().map_err(unreadable)?;
         let euid = unsafe { libc::geteuid() };
         if !meta.is_file() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
