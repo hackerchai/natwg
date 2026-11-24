@@ -5,3 +5,6 @@
 
 # Local agent guidance, decisions, plans and validation records
 /.local-docs/
+
+# A real natwg config holds private keys
+config.json
