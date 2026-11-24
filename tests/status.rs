@@ -202,3 +202,54 @@ fn each_instance_has_its_own_default_status_file() {
         "a status_file in the config wins"
     );
 }
+
+type Change = fn(&mut Status);
+
+#[test]
+fn natwg_status_exits_1_and_names_each_problem_it_shows() {
+    let cases: [(&str, Change); 6] = [
+        ("the status is ", |status| status.updated -= 120),
+        ("no tunnel runs", |status| {
+            status.tun = None;
+            status.nat_ok = None;
+        }),
+        ("NAT is not ok", |status| status.nat_ok = Some(false)),
+        ("no public mapping", |status| status.mapping = None),
+        ("the TXT publish failed", |status| {
+            status.publish_error = Some("CLOUDFLARE_HTTP: connection refused".into());
+        }),
+        ("UPnP failed", |status| status.upnp_ok = Some(false)),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    for (problem, change) in cases {
+        let mut status = fixture(now());
+        change(&mut status);
+        status.write(&path).unwrap();
+        for format in [&[][..], &["--json"]] {
+            let mut args = format.to_vec();
+            args.extend(["--status-file", path.to_str().unwrap()]);
+            let output = natwg_status(&args);
+            assert_eq!(output.status.code(), Some(1), "{problem}: {output:?}");
+            assert!(
+                !output.stdout.is_empty(),
+                "{problem}: the status still prints"
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let expected = format!("SERVER_UNHEALTHY: {problem}");
+            assert!(stderr.starts_with(&expected), "{problem}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn natwg_status_exits_0_when_upnp_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let mut status = fixture(now());
+    status.upnp_ok = None;
+    status.upnp_at = None;
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+}

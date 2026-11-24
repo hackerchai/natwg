@@ -73,6 +73,9 @@ enum Action {
         foreground: bool,
     },
     /// Show what the running server reported last. Needs no root.
+    ///
+    /// natwg exits 1 when the status is older than 60 s, or shows no tunnel,
+    /// no public mapping, a failed TXT publish, or failed NAT or UPnP.
     Status {
         /// Print the status file as JSON.
         #[arg(long)]
@@ -279,16 +282,18 @@ fn run(cli: Cli) -> Result<()> {
         Action::Server { foreground: _ } | Action::Daemon => server(&cli.config)?,
         Action::Status { json, status_file } => {
             let status = Status::read(&status_file)?;
+            let now = status::unix(SystemTime::now());
             if json {
                 say!(
                     "{}",
                     serde_json::to_string_pretty(&status).expect("a status always serializes")
                 );
             } else {
-                say!(
-                    "{}",
-                    status.render(status::unix(SystemTime::now())).trim_end()
-                );
+                say!("{}", status.render(now).trim_end());
+            }
+            let problems = status.problems(now);
+            if !problems.is_empty() {
+                return Err(Error::new("SERVER_UNHEALTHY", problems.join(", ")));
             }
         }
         Action::Doctor {
