@@ -98,9 +98,14 @@ pub fn default_path() -> PathBuf {
 /// it, which it does every 10 s.
 pub const STALE_AFTER: u64 = 60;
 
-/// A WireGuard session lives at most this long, so a client that keeps its
-/// session alive has a newer handshake while it reaches the server.
-pub const HANDSHAKE_STALE_AFTER: u64 = 180;
+/// A WireGuard session lives 180 s. A client that only sends keepalives
+/// does not renew it before then, and starts the next handshake with the
+/// first keepalive after it expired, so with a keepalive every `keepalive`
+/// seconds and 30 s for retries, an older handshake means the server does
+/// not answer.
+pub fn handshake_stale_after(keepalive: u16) -> u64 {
+    180 + u64::from(keepalive) + 30
+}
 
 pub fn unix(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
@@ -306,7 +311,7 @@ impl ClientStatus {
         let handshake_problem = match handshake {
             _ if !tunnel || self.keepalive == 0 => None,
             None => Some("no handshake yet".to_owned()),
-            Some(ago) if ago > HANDSHAKE_STALE_AFTER => {
+            Some(ago) if ago > handshake_stale_after(self.keepalive) => {
                 Some(format!("the last handshake is {ago}s old"))
             }
             Some(_) => None,

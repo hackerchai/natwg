@@ -26,7 +26,6 @@ use uplink::Uplink;
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const HANDSHAKE_CHECK: Duration = Duration::from_secs(1);
-const HANDSHAKE_STALE: Duration = Duration::from_secs(status::HANDSHAKE_STALE_AFTER);
 // A wall clock that ran this much further than the monotonic clock between
 // two looks at the uplink means the host slept, and the monotonic clock,
 // which WireGuard's timers run on, stood still meanwhile.
@@ -351,12 +350,14 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                     }
                     let server = device.server().await;
                     let ago = server.as_ref().and_then(|server| server.last_handshake);
+                    let stale_after = Duration::from_secs(status::handshake_stale_after(self.keepalive));
                     let stale = self.keepalive > 0
-                        && ago.unwrap_or(pointed_at.elapsed()) > HANDSHAKE_STALE;
+                        && ago.unwrap_or(pointed_at.elapsed()) > stale_after;
                     if stale && greeted {
                         let endpoint = self.endpoint().map_or("no endpoint".to_owned(), |e| e.to_string());
-                        tracing::warn!("no handshake with the server at {endpoint} for {} s", HANDSHAKE_STALE.as_secs());
-                        greeted = false;
+                        tracing::warn!("no handshake with the server at {endpoint} for {} s", stale_after.as_secs());
+                        // Only a handshake from now on is news.
+                        (pointed_at, greeted) = (Instant::now(), false);
                     }
                     self.write_status(device.tun(), Some(uplink), server);
                 }

@@ -346,8 +346,8 @@ fn natwg_status_of_a_client_exits_1_and_names_each_problem() {
         ("no handshake yet", |status| {
             status.server.as_mut().unwrap().last_handshake = None;
         }),
-        ("the last handshake is 200s old", |status| {
-            status.server.as_mut().unwrap().last_handshake = Some(status.updated - 200);
+        ("the last handshake is 240s old", |status| {
+            status.server.as_mut().unwrap().last_handshake = Some(status.updated - 240);
         }),
     ];
     let dir = tempfile::tempdir().unwrap();
@@ -382,6 +382,14 @@ fn natwg_status_of_a_healthy_client_exits_0_and_prints_json_as_written() {
     assert!(output.status.success(), "{output:?}");
     let printed: ClientStatus = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(printed, status);
+
+    // A session that only keepalives use expires after 180 s, and the next
+    // keepalive, up to 25 s later, renews it.
+    let mut renewing = client_fixture(now());
+    renewing.server.as_mut().unwrap().last_handshake = Some(renewing.updated - 205);
+    renewing.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
 
     let mut idle = client_fixture(now());
     idle.keepalive = 0;
