@@ -142,7 +142,6 @@ impl Upnp {
     }
 }
 
-/// The first IPv4 address of the interface named `iface`.
 fn ipv4_address(iface: &str) -> Option<Ipv4Addr> {
     let mut list = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut list) } != 0 {
