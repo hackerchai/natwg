@@ -5,9 +5,10 @@ use super::{Step, read};
 use crate::{Error, Result};
 use ipnetwork::Ipv4Network;
 
-/// Refuse a tunnel subnet that another device routes already. The kernel
-/// would keep both routes and send the traffic for the tunnel peers to the
-/// other device.
+/// Refuse a network that natwg routes into the tunnel, the server's tunnel
+/// subnet or an allowed IP of the client's server, when another device
+/// routes it already. The kernel would keep both routes and send the traffic
+/// for the tunnel to the other device.
 pub fn require_free_route(tun: &str, subnet: Ipv4Network) -> Result<()> {
     let listing = read(&["ip", "-4", "route", "show", "exact", &subnet.to_string()])?;
     let Some(route) = foreign_route(&listing, tun) else {
@@ -16,7 +17,7 @@ pub fn require_free_route(tun: &str, subnet: Ipv4Network) -> Result<()> {
     Err(Error::new(
         "ROUTE_IN_USE",
         format!(
-            "the tunnel subnet {subnet} already has the route {route:?}, and a second route for it through {tun} would not carry the traffic; remove that route or change interface.address"
+            "{subnet} already has the route {route:?}, and a second route for it through {tun} would not carry the traffic; remove that route or change the config"
         ),
     ))
 }

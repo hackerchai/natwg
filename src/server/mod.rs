@@ -295,7 +295,7 @@ impl Supervisor<'_> {
     }
 }
 
-fn peer_status(peer: PeerStats, now: SystemTime) -> PeerStatus {
+pub(crate) fn peer_status(peer: PeerStats, now: SystemTime) -> PeerStatus {
     let key = peer.public_key.to_string();
     PeerStatus {
         key: format!("{}…", &key[..10]),

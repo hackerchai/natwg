@@ -1,4 +1,4 @@
-use natwg::status::{PeerStatus, Status};
+use natwg::status::{ClientRole, ClientStatus, PeerStatus, Report, Status};
 use serde_json::json;
 use std::{
     os::unix::fs::PermissionsExt,
@@ -252,4 +252,152 @@ fn natwg_status_exits_0_when_upnp_is_off() {
     status.write(&path).unwrap();
     let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
     assert!(output.status.success(), "{output:?}");
+}
+
+fn client_fixture(updated: u64) -> ClientStatus {
+    ClientStatus {
+        role: ClientRole::Client,
+        updated,
+        pid: 4343,
+        uplink: Some("en0".into()),
+        uplink_address: Some("10.16.0.105".parse().unwrap()),
+        tun: Some("utun13".into()),
+        record: Some("_wg-home.example.com".into()),
+        endpoint: Some("183.192.36.226:7105".parse().unwrap()),
+        endpoint_since: Some(updated - 300),
+        looked_up: Some(updated - 20),
+        lookup_error: None,
+        keepalive: 25,
+        rebuilds: 0,
+        server: Some(PeerStatus {
+            key: "paDfvm0HLq…".into(),
+            endpoint: Some("183.192.36.226:7105".parse().unwrap()),
+            last_handshake: Some(updated - 40),
+            rx: 4096,
+            tx: 8192,
+        }),
+    }
+}
+
+#[test]
+fn the_client_status_file_is_tagged_with_its_role() {
+    let status = client_fixture(1_000_000);
+    let value = serde_json::to_value(&status).unwrap();
+    assert_eq!(value["role"], "client");
+    assert_eq!(value["endpoint"], "183.192.36.226:7105");
+    assert_eq!(value["server"]["last_handshake"], 1_000_000 - 40);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("client.status.json");
+    status.write(&path).unwrap();
+    assert_eq!(Report::read(&path).unwrap(), Report::Client(status));
+    let server = fixture(1_000_000);
+    server.write(&path).unwrap();
+    assert_eq!(Report::read(&path).unwrap(), Report::Server(server));
+}
+
+#[test]
+fn the_client_human_view_shows_the_endpoint_handshake_and_traffic() {
+    let now = 1_000_000;
+    let text = client_fixture(now).render(now + 3);
+    for line in [
+        "server endpoint : 183.192.36.226:7105 from TXT _wg-home.example.com (since 303s ago)",
+        "TXT lookup      : 23s ago",
+        "handshake       : 43s ago, peer paDfvm0HLq… endpoint=183.192.36.226:7105 rx=4096 tx=8192, keepalive 25s",
+        "tunnel          : utun13 via en0 (10.16.0.105), rebuilds=0",
+        "status written  : 3s ago",
+    ] {
+        assert!(text.contains(line), "{line:?} is missing from\n{text}");
+    }
+    let mut status = client_fixture(now);
+    status.record = None;
+    status.lookup_error = Some("TXT_NO_ENDPOINT: nothing".into());
+    let text = status.render(now);
+    assert!(text.contains("from config"), "{text}");
+    assert!(text.contains("TXT lookup      : off"), "{text}");
+}
+
+#[test]
+fn the_client_status_file_sits_beside_the_server_one() {
+    let client: natwg::config::ClientConfig = serde_json::from_value(json!({})).unwrap();
+    let default = std::path::Path::new(natwg::status::DEFAULT_PATH);
+    assert_eq!(
+        natwg::status::client_path(&client),
+        default.with_file_name("client.status.json")
+    );
+    let client: natwg::config::ClientConfig =
+        serde_json::from_value(json!({ "status_file": "/tmp/natwg-lane-a/status.json" })).unwrap();
+    assert_eq!(
+        natwg::status::client_path(&client),
+        std::path::Path::new("/tmp/natwg-lane-a/status.json")
+    );
+}
+
+type ClientChange = fn(&mut ClientStatus);
+
+#[test]
+fn natwg_status_of_a_client_exits_1_and_names_each_problem() {
+    let cases: [(&str, ClientChange); 6] = [
+        ("the status is ", |status| status.updated -= 120),
+        ("no tunnel runs", |status| status.tun = None),
+        ("no server endpoint", |status| status.endpoint = None),
+        ("the TXT lookup failed", |status| {
+            status.lookup_error = Some("TXT_NO_ENDPOINT: 223.5.5.5 timed out".into());
+        }),
+        ("no handshake yet", |status| {
+            status.server.as_mut().unwrap().last_handshake = None;
+        }),
+        ("the last handshake is 240s old", |status| {
+            status.server.as_mut().unwrap().last_handshake = Some(status.updated - 240);
+        }),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("client.status.json");
+    for (problem, change) in cases {
+        let mut status = client_fixture(now());
+        change(&mut status);
+        status.write(&path).unwrap();
+        let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(1), "{problem}: {output:?}");
+        assert!(
+            !output.stdout.is_empty(),
+            "{problem}: the status still prints"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.starts_with(&format!("CLIENT_UNHEALTHY: {problem}")),
+            "{problem}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn natwg_status_of_a_healthy_client_exits_0_and_prints_json_as_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("client.status.json");
+    let status = client_fixture(now());
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let output = natwg_status(&["--json", "--status-file", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let printed: ClientStatus = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(printed, status);
+
+    // A session that only keepalives use expires after 180 s, and the next
+    // keepalive, up to 25 s later, renews it.
+    let mut renewing = client_fixture(now());
+    renewing.server.as_mut().unwrap().last_handshake = Some(renewing.updated - 205);
+    renewing.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+
+    let mut idle = client_fixture(now());
+    idle.keepalive = 0;
+    idle.server.as_mut().unwrap().last_handshake = Some(idle.updated - 900);
+    idle.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "without a keepalive an old handshake is no problem: {output:?}"
+    );
 }

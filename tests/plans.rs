@@ -542,3 +542,22 @@ fn only_an_inet_table_with_the_exact_instance_name_is_listed() {
         assert!(!nft::listed(tables, &next), "{tables:?}");
     }
 }
+
+#[test]
+fn a_client_leaves_out_the_lan_it_sits_on() {
+    let routes: Vec<ipnetwork::Ipv4Network> = ["10.66.66.0/24", "10.24.0.0/24"]
+        .iter()
+        .map(|net| net.parse().unwrap())
+        .collect();
+    let at = |name: &str, address: &str| (name.to_owned(), address.parse().unwrap());
+    let away = [at("lo0", "127.0.0.1"), at("en0", "192.168.1.20")];
+    assert!(netcfg::local_networks(&routes, &away).is_empty());
+    let home = [at("en0", "10.24.0.37"), at("utun4", "10.66.66.2")];
+    assert_eq!(netcfg::local_networks(&routes, &home), vec![routes[1]]);
+    let old_tunnels = [
+        at("utun9", "10.24.0.9"),
+        at("wg-home", "10.66.66.2"),
+        at("natwg-client", "10.66.66.2"),
+    ];
+    assert!(netcfg::local_networks(&routes, &old_tunnels).is_empty());
+}
