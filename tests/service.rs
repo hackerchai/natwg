@@ -52,6 +52,42 @@ fn the_instance_natwg_keeps_the_plain_names_and_another_instance_adds_its_own() 
 }
 
 #[test]
+fn the_client_service_has_names_no_server_can_take() {
+    let client = Instance::client();
+    assert!(
+        "client".parse::<Instance>().is_err(),
+        "no server is named client"
+    );
+    assert_eq!(launchd::name(&client), "com.hackerchai.natwg.client");
+    assert_eq!(
+        launchd::definition_path(&client),
+        Path::new("/Library/LaunchDaemons/com.hackerchai.natwg.client.plist")
+    );
+    assert_eq!(launchd::log(&client), "/usr/local/var/log/natwg-client.log");
+    assert_eq!(systemd::name(&client), "natwg-client.service");
+    for server in ["natwg", "natwg_next", "client0", "natwg_client"] {
+        let server = instance(server);
+        assert_ne!(launchd::name(&server), launchd::name(&client));
+        assert_ne!(systemd::name(&server), systemd::name(&client));
+    }
+    let service = Service {
+        instance: client,
+        config: PathBuf::from("/etc/natwg/config.json"),
+    };
+    let unit = systemd::definition(&service).unwrap();
+    assert!(
+        unit.contains("Description=natwg WireGuard client\n"),
+        "{unit}"
+    );
+    let plist = launchd::definition(&service).unwrap();
+    assert!(
+        plist.contains("<string>com.hackerchai.natwg.client</string>"),
+        "{plist}"
+    );
+    assert!(plist.contains("<string>daemon</string>"), "{plist}");
+}
+
+#[test]
 fn the_plist_runs_the_installed_binary_and_restarts_it_every_10_s() {
     let plist = launchd::definition(&service("natwg", "/usr/local/etc/natwg/config.json")).unwrap();
     assert_eq!(
@@ -190,8 +226,12 @@ fn an_open_config_directory_becomes_private_and_passes_no_acl_to_a_new_config() 
     let config: Config = serde_json::from_value(serde_json::json!({
         "version": 1,
         "private_key": natwg::keys::Key::generate().unwrap().to_base64(),
-        "interface": { "address": "10.66.67.1/24" },
-        "peers": [],
+        "interface": { "address": "10.66.67.2/32" },
+        "peers": [{
+            "name": "server",
+            "public_key": natwg::keys::Key::generate().unwrap().public_key(),
+            "allowed_ips": ["10.66.67.0/24"]
+        }],
         "role": { "client": { "record": "_wg.example.com", "resolvers": ["223.5.5.5"] } }
     }))
     .unwrap();
@@ -219,6 +259,7 @@ fn service_commands_that_change_the_host_need_root() {
         &["install"][..],
         &["uninstall"],
         &["uninstall", "--instance", "natwg_gone"],
+        &["uninstall", "--instance", "client"],
         &["restart"],
     ] {
         let output = natwg_service(action);

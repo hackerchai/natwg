@@ -4,14 +4,15 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use clap::{Args, Parser, Subcommand};
-use natwg::config::{Config, Instance};
+use natwg::client::{self, uplink};
+use natwg::config::{Config, Instance, Role};
 use natwg::server::{self, cloudflare};
-use natwg::status::{self, Status};
-use natwg::tunnel::Tunnel;
+use natwg::status::{self, Report, Status};
+use natwg::tunnel::{self, Tunnel};
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
-use natwg::{Error, Result, doctor, keys::Key, service};
+use natwg::{Error, Result, doctor, keys::Key, peer, service};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
@@ -54,7 +55,7 @@ enum Action {
         #[command(subcommand)]
         action: KeysAction,
     },
-    /// Show the configuration or import it from the Python natwg install.
+    /// Show the configuration, or import a wg-quick client config.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -72,39 +73,90 @@ enum Action {
         #[arg(long, required = true)]
         foreground: bool,
     },
-    /// Show what the running server reported last. Needs no root.
+    /// Run the WireGuard client: the tunnel to the server with a route for
+    /// each of its allowed IPs, the TXT lookup that follows the server's
+    /// endpoint, and the status file.
+    Client {
+        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. `natwg
+        /// service install` runs the client in the background.
+        #[arg(long, required = true)]
+        foreground: bool,
+    },
+    /// Add, list or remove the clients of the server config.
     ///
-    /// natwg exits 1 when the status is older than 60 s, or shows no tunnel,
-    /// no public mapping, a failed TXT publish, or failed NAT or UPnP.
+    /// natwg replaces --config in one step. Restart the server to load the
+    /// change: sudo natwg service restart.
+    Peer {
+        #[command(subcommand)]
+        action: PeerAction,
+    },
+    /// Show what the running server or client reported last. Needs no root.
+    ///
+    /// natwg exits 1 when the status is older than 60 s or shows a problem:
+    /// for a server no tunnel, no public mapping, a failed TXT publish, or
+    /// failed NAT or UPnP; for a client no tunnel, no endpoint, a failed TXT
+    /// lookup, or, with a keepalive, no handshake yet or none for 210 s plus
+    /// the keepalive.
     Status {
         /// Print the status file as JSON.
         #[arg(long)]
         json: bool,
-        /// The status file of the server. A server of another instance than
-        /// natwg writes <instance>.status.json beside the default, and a
-        /// config can name its own in role.server.status_file.
-        #[arg(long, value_name = "PATH", default_value = natwg::status::DEFAULT_PATH)]
-        status_file: PathBuf,
+        /// The status file (default: the server's, else the client's when
+        /// only that exists). A server of another instance than natwg writes
+        /// <instance>.status.json beside the default, the client writes
+        /// client.status.json there, and a config can name its own in
+        /// status_file.
+        #[arg(long, value_name = "PATH")]
+        status_file: Option<PathBuf>,
     },
     /// Test a running server from this host.
     Doctor {
         #[command(subcommand)]
         action: DoctorAction,
     },
-    /// Run the server as a system service: a LaunchDaemon on macOS, a
-    /// systemd unit on Linux.
+    /// Run the server or the client as a system service: a LaunchDaemon on
+    /// macOS, a systemd unit on Linux.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Run the server for a service manager, as `server --foreground` does.
+    /// Run the server or the client of --config for a service manager, as
+    /// `server --foreground` and `client --foreground` do.
     #[command(hide = true)]
     Daemon,
 }
 
 #[derive(Subcommand)]
+enum PeerAction {
+    /// Give a new client fresh keys and the next free tunnel address, add it
+    /// to the server config, and print the client's config.json.
+    ///
+    /// The client config holds the client's private key. Copy it to the
+    /// client privately, as /usr/local/etc/natwg/config.json (macOS) or
+    /// /etc/natwg/config.json (Linux), owned by root with mode 0600.
+    Add {
+        /// The name of the peer: 1 to 32 characters from A-Z, a-z, 0-9, '.',
+        /// '_' and '-'.
+        name: String,
+        /// Write the client config here, readable only by its owner, instead
+        /// of printing it.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Replace a file at --out.
+        #[arg(long, requires = "out")]
+        force: bool,
+    },
+    /// Print each peer: its name, allowed IPs and public key.
+    List,
+    /// Remove a peer from the server config.
+    Remove { name: String },
+}
+
+#[derive(Subcommand)]
 enum ServiceAction {
-    /// Install the server of --config as a service and start it.
+    /// Install the server or the client of --config as a service and start
+    /// it. The client's service is com.hackerchai.natwg.client on macOS and
+    /// natwg-client.service on Linux.
     ///
     /// natwg copies itself to /usr/local/libexec/natwg/natwg, and the service
     /// runs that copy. A part that is in place already stays, so a second
@@ -119,9 +171,10 @@ enum ServiceAction {
         /// binary.
         #[arg(long)]
         purge: bool,
-        /// Remove the service of this instance without reading --config, as
-        /// when the config is broken or gone. Its status file stays.
-        #[arg(long, value_name = "NAME", conflicts_with = "purge")]
+        /// Remove the service of this instance, or of the client with
+        /// `client`, without reading --config, as when the config is broken
+        /// or gone. Its status file stays.
+        #[arg(long, value_name = "NAME", conflicts_with = "purge", value_parser = service_instance)]
         instance: Option<Instance>,
     },
     /// Restart the service of --config, which then reads the config again.
@@ -161,16 +214,22 @@ enum KeysAction {
 enum ConfigAction {
     /// Print the configuration with secrets redacted and the public key added.
     Show,
-    /// Convert the Python natwg install into a configuration file.
-    ImportLegacy {
-        #[arg(long, default_value = natwg::legacy::DEFAULT_NATWG_JSON)]
-        natwg_json: PathBuf,
-        /// The WireGuard server config (default: wg_conf in natwg.json).
-        #[arg(long)]
-        wg_conf: Option<PathBuf>,
-        /// The Cloudflare token file (default: cf_token_file in natwg.json).
-        #[arg(long)]
-        cf_token: Option<PathBuf>,
+    /// Turn the wg-quick config of a client into a natwg client config that
+    /// keeps its keys and its tunnel address.
+    ///
+    /// The config must have one [Peer], the server. wg-quick's placeholder
+    /// `Endpoint = 0.0.0.0:0` counts as no endpoint.
+    ImportWgQuick {
+        /// The wg-quick config, such as /etc/wireguard/wg-home.conf.
+        wg_conf: PathBuf,
+        /// The TXT record that holds the server's endpoint as "ip:port".
+        /// Without it, the client dials the Endpoint of the [Peer].
+        #[arg(long, value_name = "NAME")]
+        record: Option<String>,
+        /// A DNS server to ask for --record, in order; repeat it for more
+        /// (default: 223.5.5.5, 119.29.29.29, 1.1.1.1 and 8.8.8.8).
+        #[arg(long = "resolver", value_name = "IP")]
+        resolvers: Vec<Ipv4Addr>,
         /// Where to write the configuration (default: --config).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -215,6 +274,9 @@ enum ProbeAction {
     Dns(Lookup),
     /// Print the TXT records of a name, one per line.
     Txt(Lookup),
+    /// Print the uplink natwg client picks: the physical interface of the
+    /// default route that has an IPv4 address, skipping VPN tunnels.
+    Uplink,
 }
 
 #[derive(Args)]
@@ -243,6 +305,14 @@ fn millis(text: &str) -> std::result::Result<Duration, std::num::ParseIntError> 
     text.parse().map(Duration::from_millis)
 }
 
+/// An instance name, or `client` for the client's service.
+fn service_instance(name: &str) -> std::result::Result<Instance, &'static str> {
+    match name {
+        "client" => Ok(Instance::client()),
+        name => name.parse(),
+    }
+}
+
 fn main() {
     if let Err(error) = run(Cli::parse()) {
         warn!("{error}");
@@ -267,17 +337,16 @@ fn run(cli: Cli) -> Result<()> {
         } => say!("{}", Config::load(&cli.config)?.redacted()),
         Action::Config {
             action:
-                ConfigAction::ImportLegacy {
-                    natwg_json,
+                ConfigAction::ImportWgQuick {
                     wg_conf,
-                    cf_token,
+                    record,
+                    resolvers,
                     out,
                     dry_run,
                     force,
                 },
         } => {
-            let config =
-                natwg::legacy::import(&natwg_json, wg_conf.as_deref(), cf_token.as_deref())?;
+            let config = client::wg_quick::import(&wg_conf, record, resolvers)?;
             say!("{}", config.redacted());
             if !dry_run {
                 let out = out.unwrap_or(cli.config);
@@ -306,9 +375,12 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Action::Probe { action } => probe(action)?,
-        Action::Server { foreground: _ } | Action::Daemon => server(&cli.config)?,
+        Action::Server { foreground: _ } => daemon(&cli.config, Some(Want::Server))?,
+        Action::Client { foreground: _ } => daemon(&cli.config, Some(Want::Client))?,
+        Action::Daemon => daemon(&cli.config, None)?,
+        Action::Peer { action } => peer_action(&cli.config, action)?,
         Action::Status { json, status_file } => {
-            let status = Status::read(&status_file)?;
+            let status = Report::read(&status_file.unwrap_or_else(status::default_path))?;
             let now = status::unix(SystemTime::now());
             if json {
                 say!(
@@ -320,7 +392,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let problems = status.problems(now);
             if !problems.is_empty() {
-                return Err(Error::new("SERVER_UNHEALTHY", problems.join(", ")));
+                return Err(Error::new(status.unhealthy(), problems.join(", ")));
             }
         }
         Action::Doctor {
@@ -332,6 +404,51 @@ fn run(cli: Cli) -> Result<()> {
                 },
         } => doctor_loopback(&cli.config, iface.as_deref(), endpoint, attempts)?,
         Action::Service { action } => service_action(&cli.config, action)?,
+    }
+    Ok(())
+}
+
+fn peer_action(path: &Path, action: PeerAction) -> Result<()> {
+    let mut config = Config::load(path)?;
+    match action {
+        PeerAction::List => {
+            match peer::list(&config)?.trim_end() {
+                "" => warn!("{} has no peers", path.display()),
+                listed => say!("{listed}"),
+            }
+            return Ok(());
+        }
+        PeerAction::Add { name, out, force } => {
+            let client = peer::add(&mut config, &name)?;
+            // The client's file comes first, so a refused --out leaves the
+            // server config as it was.
+            if let Some(out) = &out {
+                if force {
+                    client.save(out)?;
+                } else {
+                    client.create(out)?;
+                }
+            }
+            config.save(path)?;
+            let address = client.interface.address;
+            match &out {
+                Some(out) => warn!("Wrote the config of {name} to {}", out.display()),
+                None => say!("{}", client.exposed()),
+            }
+            warn!(
+                "Added peer {name} at {address} to {}; sudo natwg service restart loads it",
+                path.display()
+            );
+        }
+        PeerAction::Remove { name } => {
+            let removed = peer::remove(&mut config, &name)?;
+            config.save(path)?;
+            warn!(
+                "Removed peer {name} ({}) from {}; sudo natwg service restart drops it",
+                removed.public_key,
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -427,15 +544,35 @@ fn runtime(mut builder: tokio::runtime::Builder) -> Result<tokio::runtime::Runti
         .map_err(|e| Error::new("RUNTIME_UNAVAILABLE", e.to_string()))
 }
 
-fn server(config: &Path) -> Result<()> {
+/// The role a command needs of the config.
+#[derive(Clone, Copy)]
+enum Want {
+    Server,
+    Client,
+}
+
+/// Run the server or the client of `config` until a signal stops it. With
+/// `want`, the config must have that role.
+fn daemon(config: &Path, want: Option<Want>) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        return Err(Error::new(
-            "NOT_ROOT",
-            "natwg server opens a TUN and loads NAT rules; run it as root",
-        ));
+        let what = match want {
+            Some(Want::Server) => "natwg server opens a TUN and loads NAT rules",
+            Some(Want::Client) => "natwg client opens a TUN and adds routes",
+            None => "natwg daemon opens a TUN",
+        };
+        return Err(Error::new("NOT_ROOT", format!("{what}; run it as root")));
     }
     let config = Config::load(config)?;
-    // A write error must not panic, because the server outlives the reader
+    match want {
+        Some(Want::Server) => {
+            config.server()?;
+        }
+        Some(Want::Client) => {
+            config.client()?;
+        }
+        None => {}
+    }
+    // A write error must not panic, because the daemon outlives the reader
     // of its output.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -446,11 +583,20 @@ fn server(config: &Path) -> Result<()> {
     runtime(tokio::runtime::Builder::new_multi_thread())?.block_on(async {
         let mut stop = Stop::listen()?;
         let stop = async move { stop.requested().await };
-        server::run(&config, cloudflare::API, Tunnel::start, stop).await
+        match &config.role {
+            Role::Server(_) => server::run(&config, cloudflare::API, Tunnel::start, stop).await,
+            Role::Client(_) => {
+                let build = async |config: &Config, uplink: &uplink::Uplink, endpoint| {
+                    tunnel::Client::start(config, &uplink.iface, endpoint).await
+                };
+                let options = client::Options::default();
+                client::run(&config, &options, uplink::find, build, stop).await
+            }
+        }
     })
 }
 
-/// The signals that stop the server. SIGHUP is one of them, because a
+/// The signals that stop the server or the client. SIGHUP is one of them, because a
 /// terminal that closes sends it, and its default action ends the process
 /// with the NAT rule still loaded.
 struct Stop {
@@ -495,6 +641,10 @@ fn probe(action: ProbeAction) -> Result<()> {
             } => probe_stun(uplink, port, servers, fallbacks).await,
             ProbeAction::Dns(lookup) => probe_records(lookup, RecordKind::A).await,
             ProbeAction::Txt(lookup) => probe_records(lookup, RecordKind::Txt).await,
+            ProbeAction::Uplink => {
+                say!("{}", uplink::find(None)?);
+                Ok(())
+            }
         }
     })
 }
