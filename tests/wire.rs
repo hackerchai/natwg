@@ -424,3 +424,131 @@ fn names_dns_cannot_carry_are_rejected() {
         assert_eq!(error.code, "DNS_NAME_INVALID", "{name:?}");
     }
 }
+
+#[test]
+fn xor_mapped_address_wins_when_it_follows_mapped_and_unknown_attributes() {
+    let id = [3; 12];
+    let message = stun_response(
+        id,
+        &[
+            (MAPPED_ADDRESS, mapped(addr("192.0.2.10:1111"))),
+            (0x802b, vec![0; 8]),
+            (0x802c, vec![0; 8]),
+            (XOR_MAPPED_ADDRESS, xor_mapped(addr("198.51.100.7:4242"))),
+        ],
+    );
+    assert_eq!(
+        parse_binding_success(&message),
+        Some((TransactionId(id), addr("198.51.100.7:4242")))
+    );
+}
+
+#[test]
+fn a_truncated_dns_response_is_an_error() {
+    let mut response = hex(A_STUN_MIWIFI);
+    response[2] |= 0x02;
+    assert_eq!(
+        dns::parse_response(&response, CAPTURE_ID).unwrap_err().code,
+        "DNS_TRUNCATED"
+    );
+}
+
+fn with_id(mut response: Vec<u8>, id: [u8; 2]) -> Vec<u8> {
+    response[..2].copy_from_slice(&id);
+    response
+}
+
+async fn dns_server(reply: impl FnOnce([u8; 2]) -> Vec<Vec<u8>> + Send + 'static) -> SocketAddrV4 {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = v4(socket.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut query = [0; 512];
+        let (_, client) = socket.recv_from(&mut query).await.unwrap();
+        for datagram in reply([query[0], query[1]]) {
+            socket.send_to(&datagram, client).await.unwrap();
+        }
+    });
+    address
+}
+
+async fn resolve_miwifi(server: SocketAddrV4) -> natwg::Result<Vec<Record>> {
+    dns::resolve(
+        &loopback(),
+        server,
+        "stun.miwifi.com",
+        RecordKind::A,
+        Duration::from_secs(2),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn resolve_skips_datagrams_shorter_than_a_dns_header() {
+    let server = dns_server(|id| vec![vec![0xff, 0xff], with_id(hex(A_STUN_MIWIFI), id)]).await;
+    assert_eq!(
+        resolve_miwifi(server).await.unwrap(),
+        vec![
+            Record::A("111.206.174.3".parse().unwrap()),
+            Record::A("111.206.174.2".parse().unwrap()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn resolve_without_a_matching_record_names_the_server_and_the_name() {
+    let server = dns_server(|id| {
+        let mut response = with_id(hex(A_STUN_MIWIFI), id);
+        response[7] = 0;
+        response.truncate(33);
+        vec![response]
+    })
+    .await;
+    let error = resolve_miwifi(server).await.unwrap_err();
+    assert_eq!(error.code, "DNS_NO_ANSWER");
+    assert!(
+        error.message.contains("stun.miwifi.com"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains(&server.to_string()),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn resolve_errors_name_the_server_and_the_name() {
+    let server = dns_server(|id| {
+        let mut response = with_id(hex(A_STUN_MIWIFI), id);
+        response[3] = (response[3] & 0xF0) | 3;
+        vec![response]
+    })
+    .await;
+    let error = resolve_miwifi(server).await.unwrap_err();
+    assert_eq!(error.code, "DNS_NXDOMAIN");
+    assert!(
+        error.message.contains("stun.miwifi.com"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains(&server.to_string()),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn a_rebind_waits_for_the_previous_socket_to_free_the_port() {
+    let holder = natwg::wire::transport::bound_udp_socket(&loopback(), 0).unwrap();
+    let port = holder.local_addr().unwrap().port();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(holder);
+    });
+    let (mut udp, _stun) = BoundUdp::new(loopback());
+    let bound = udp.bind(&params(port)).await;
+    release.await.unwrap();
+    assert!(bound.is_ok(), "{:?}", bound.err());
+}

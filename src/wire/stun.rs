@@ -11,6 +11,21 @@ const MAPPED_ADDRESS: u16 = 0x0001;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const FAMILY_IPV4: u8 = 0x01;
 
+/// The STUN servers natwg asks when none are configured: the same list the
+/// Python relay shipped with.
+pub const DEFAULT_SERVERS: [(&str, u16); 4] = [
+    ("stun.miwifi.com", 3478),
+    ("stun.chat.bilibili.com", 3478),
+    ("stun.hitv.com", 3478),
+    ("stun.cloudflare.com", 3478),
+];
+
+/// STUN server addresses tried after [`DEFAULT_SERVERS`], for when DNS fails.
+pub const DEFAULT_FALLBACKS: [SocketAddrV4; 2] = [
+    SocketAddrV4::new(Ipv4Addr::new(111, 206, 174, 3), 3478),
+    SocketAddrV4::new(Ipv4Addr::new(111, 206, 174, 2), 3478),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransactionId(pub [u8; 12]);
 

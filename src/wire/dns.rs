@@ -3,12 +3,17 @@
 
 use crate::wire::transport::{BoundInterface, bound_udp_socket};
 use crate::{Error, Result};
-use std::{fmt, io, net::Ipv4Addr, time::Duration};
+use std::{
+    fmt, io,
+    net::{Ipv4Addr, SocketAddrV4},
+    time::Duration,
+};
 use tokio::net::UdpSocket;
 
 const HEADER_LEN: usize = 12;
-const MAX_UDP_MESSAGE: usize = 512;
+const RECV_BUFFER: usize = 4096;
 const RECURSION_DESIRED: u16 = 0x0100;
+const TRUNCATED: u16 = 0x0200;
 const CLASS_IN: u16 = 1;
 const TYPE_A: u16 = 1;
 const TYPE_TXT: u16 = 16;
@@ -26,6 +31,15 @@ pub enum Record {
     A(Ipv4Addr),
     /// The record's character-strings joined with nothing between them.
     Txt(String),
+}
+
+impl Record {
+    pub fn kind(&self) -> RecordKind {
+        match self {
+            Self::A(_) => RecordKind::A,
+            Self::Txt(_) => RecordKind::Txt,
+        }
+    }
 }
 
 impl fmt::Display for Record {
@@ -91,6 +105,12 @@ pub fn parse_response(bytes: &[u8], id: u16) -> Result<Vec<Record>> {
             ));
         }
     }
+    if field(1) & TRUNCATED != 0 {
+        return Err(Error::new(
+            "DNS_TRUNCATED",
+            "the DNS response is truncated, and natwg does not retry over TCP",
+        ));
+    }
     let mut reader = Reader {
         bytes,
         at: HEADER_LEN,
@@ -102,7 +122,7 @@ pub fn parse_response(bytes: &[u8], id: u16) -> Result<Vec<Record>> {
 /// `iface`. Responses to other queries are ignored.
 pub async fn resolve(
     iface: &BoundInterface,
-    server: Ipv4Addr,
+    server: SocketAddrV4,
     name: &str,
     kind: RecordKind,
     timeout: Duration,
@@ -114,14 +134,31 @@ pub async fn resolve(
         bound_udp_socket(iface, 0).map_err(|e| Error::new("UDP_BIND", format!("{iface}: {e}")))?;
     let socket = UdpSocket::from_std(socket).map_err(failed)?;
     let exchange = async {
-        socket.connect((server, 53)).await.map_err(failed)?;
+        socket.connect(server).await.map_err(failed)?;
         socket.send(&message).await.map_err(failed)?;
-        let mut response = [0; MAX_UDP_MESSAGE];
+        let mut response = [0; RECV_BUFFER];
         loop {
             let len = socket.recv(&mut response).await.map_err(failed)?;
+            if len < HEADER_LEN {
+                continue;
+            }
             match parse_response(&response[..len], id) {
                 Err(e) if e.code == ID_MISMATCH => continue,
-                records => return records,
+                Err(e) => {
+                    return Err(Error::new(
+                        e.code,
+                        format!("{server} for {name}: {}", e.message),
+                    ));
+                }
+                Ok(records) if records.iter().any(|record| record.kind() == kind) => {
+                    return Ok(records);
+                }
+                Ok(_) => {
+                    return Err(Error::new(
+                        "DNS_NO_ANSWER",
+                        format!("{server} has no {kind:?} record for {name}"),
+                    ));
+                }
             }
         }
     };

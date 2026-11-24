@@ -21,6 +21,8 @@ use tokio::{
 };
 
 const ANSWER_QUEUE: usize = 16;
+const REBIND_ATTEMPTS: u32 = 40;
+const REBIND_PAUSE: Duration = Duration::from_millis(5);
 
 type Answer = (TransactionId, SocketAddrV4);
 
@@ -104,7 +106,7 @@ impl UdpTransportFactory for BoundUdp {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> io::Result<(BoundSend, BoundRecv)> {
-        let socket = bound_udp_socket(&self.iface, params.port)?;
+        let socket = bind_retrying(&self.iface, params.port).await?;
         let socket = Arc::new(UdpSocket::from_std(socket)?);
         self.socket.send_replace(Arc::downgrade(&socket));
         let recv = BoundRecv {
@@ -112,6 +114,26 @@ impl UdpTransportFactory for BoundUdp {
             answers: self.answers.clone(),
         };
         Ok((BoundSend(socket), recv))
+    }
+}
+
+// gotatun aborts the tasks that hold its previous socket without awaiting them,
+// so on a multi-threaded runtime that socket can still own the port for a few
+// milliseconds after gotatun asks for the same port again.
+async fn bind_retrying(iface: &BoundInterface, port: u16) -> io::Result<std::net::UdpSocket> {
+    let mut attempts = 0;
+    loop {
+        match bound_udp_socket(iface, port) {
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrInUse
+                    && port != 0
+                    && attempts < REBIND_ATTEMPTS =>
+            {
+                attempts += 1;
+                tokio::time::sleep(REBIND_PAUSE).await;
+            }
+            result => return result,
+        }
     }
 }
 

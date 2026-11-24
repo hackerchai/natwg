@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use natwg::wire::dns::{self, Record, RecordKind};
+use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
 use natwg::{Error, Result, config::Config, keys::Key};
 use std::{
@@ -78,7 +79,8 @@ enum ProbeAction {
         /// The local UDP port; 0 picks a free one.
         #[arg(long, default_value_t = 0)]
         port: u16,
-        /// A STUN server, resolved through --dns. Servers are tried in order.
+        /// A STUN server, resolved through --dns. Servers are tried in order. With
+        /// no --server and no --fallback, natwg uses its built-in list.
         #[arg(long = "server", value_name = "HOST:PORT", value_parser = host_port)]
         servers: Vec<(String, u16)>,
         /// A STUN server address, tried after every --server.
@@ -110,6 +112,8 @@ struct Uplink {
     #[arg(long = "timeout-ms", value_name = "MS", default_value = "3000", value_parser = millis)]
     timeout: Duration,
 }
+
+const DNS_PORT: u16 = 53;
 
 fn host_port(text: &str) -> std::result::Result<(String, u16), String> {
     let (host, port) = text.rsplit_once(':').ok_or("expected HOST:PORT")?;
@@ -195,7 +199,8 @@ async fn probe_records(lookup: Lookup, kind: RecordKind) -> Result<()> {
         timeout,
     } = lookup.uplink;
     let iface = BoundInterface::lookup(&iface)?;
-    for record in dns::resolve(&iface, dns, &lookup.name, kind, timeout).await? {
+    let server = SocketAddrV4::new(dns, DNS_PORT);
+    for record in dns::resolve(&iface, server, &lookup.name, kind, timeout).await? {
         println!("{record}");
     }
     Ok(())
@@ -208,10 +213,17 @@ async fn probe_stun(
     fallbacks: Vec<SocketAddrV4>,
 ) -> Result<()> {
     let iface = BoundInterface::lookup(&uplink.iface)?;
+    let (servers, fallbacks) = if servers.is_empty() && fallbacks.is_empty() {
+        let servers = stun::DEFAULT_SERVERS.map(|(host, port)| (host.to_owned(), port));
+        (servers.to_vec(), stun::DEFAULT_FALLBACKS.to_vec())
+    } else {
+        (servers, fallbacks)
+    };
     let mut stun = StunPort::bind(iface.clone(), port).await?;
     let mut targets = Vec::new();
     for (host, server_port) in servers {
-        match dns::resolve(&iface, uplink.dns, &host, RecordKind::A, uplink.timeout).await {
+        let server = SocketAddrV4::new(uplink.dns, DNS_PORT);
+        match dns::resolve(&iface, server, &host, RecordKind::A, uplink.timeout).await {
             Ok(records) => targets.extend(records.into_iter().filter_map(|record| match record {
                 Record::A(ip) => Some(SocketAddrV4::new(ip, server_port)),
                 Record::Txt(_) => None,

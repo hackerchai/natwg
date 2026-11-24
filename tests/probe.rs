@@ -80,3 +80,21 @@ fn probe_stun_on_a_missing_interface_exits_with_iface_not_found() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.starts_with(b"IFACE_NOT_FOUND"));
 }
+
+#[test]
+fn probe_stun_without_servers_tries_the_built_in_list() {
+    let output = natwg_probe(&[
+        "stun",
+        "--iface",
+        LOOPBACK,
+        "--dns",
+        "127.0.0.1",
+        "--timeout-ms",
+        "100",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("stun.miwifi.com"), "{stderr}");
+    assert!(stderr.contains("111.206.174.3:3478"), "{stderr}");
+    assert!(!stderr.contains("STUN_NO_SERVER"), "{stderr}");
+}
