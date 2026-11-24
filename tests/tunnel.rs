@@ -1,4 +1,7 @@
+//! The WireGuard device and the doctor, run in memory over loopback UDP.
+
 use natwg::config::Config;
+use natwg::doctor::{self, Echo, EchoKind, Probe};
 use natwg::keys::Key;
 use natwg::tunnel::Detached;
 use serde_json::{Value, json};
@@ -210,4 +213,256 @@ async fn a_doctor_on_a_missing_interface_reports_the_interface() {
         .err()
         .unwrap();
     assert_eq!(error.code, "IFACE_NOT_FOUND");
+}
+
+// An echo request and its reply as the macOS kernel wrote them, captured on
+// lo0 with `tcpdump -x` during `ping -c 1 -s 24 127.0.0.1`.
+const KERNEL_REQUEST: &str = "4500 0034 282e 0000 4001 0000 7f00 0001 7f00 0001
+    0800 4898 6d96 0000 6b05 27da 0000 3671 0809 0a0b 0c0d 0e0f 1011 1213 1415 1617";
+const KERNEL_REPLY: &str = "4500 0034 7d50 0000 4001 0000 7f00 0001 7f00 0001
+    0000 5098 6d96 0000 6b05 27da 0000 3671 0809 0a0b 0c0d 0e0f 1011 1213 1415 1617";
+
+fn hex(text: &str) -> Vec<u8> {
+    let digits: Vec<u8> = text.bytes().filter(u8::is_ascii_hexdigit).collect();
+    digits
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
+
+fn ones_complement_sum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for pair in bytes.chunks(2) {
+        sum += u32::from(pair[0]) << 8 | u32::from(*pair.get(1).unwrap_or(&0));
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    sum as u16
+}
+
+fn request() -> Echo {
+    Echo {
+        kind: EchoKind::Request,
+        source: DOCTOR,
+        destination: SERVER,
+        id: 0x1234,
+        seq: 7,
+    }
+}
+
+fn pong(request: Echo) -> Echo {
+    Echo {
+        kind: EchoKind::Reply,
+        source: request.destination,
+        destination: request.source,
+        ..request
+    }
+}
+
+#[test]
+fn an_echo_request_is_an_ipv4_icmp_packet_with_valid_checksums() {
+    let packet = request().encode();
+    assert_eq!(packet[0], 0x45, "IPv4 with a 20-byte header");
+    assert_eq!(
+        usize::from(u16::from_be_bytes([packet[2], packet[3]])),
+        packet.len()
+    );
+    assert_eq!(packet[9], 1, "protocol ICMP");
+    assert_eq!(packet[12..16], DOCTOR.octets());
+    assert_eq!(packet[16..20], SERVER.octets());
+    assert_eq!(packet[20..22], [8, 0], "echo request, code 0");
+    assert_eq!(packet[24..28], [0x12, 0x34, 0x00, 0x07], "id then sequence");
+    assert_eq!(ones_complement_sum(&packet[..20]), 0xFFFF, "IP header");
+    assert_eq!(ones_complement_sum(&packet[20..]), 0xFFFF, "ICMP message");
+
+    let reply = pong(request()).encode();
+    assert_eq!(reply[20..22], [0, 0], "echo reply, code 0");
+    assert_eq!(ones_complement_sum(&reply[20..]), 0xFFFF, "ICMP message");
+}
+
+#[test]
+fn echo_messages_from_the_kernel_decode() {
+    let localhost = Ipv4Addr::LOCALHOST;
+    let expected = Echo {
+        kind: EchoKind::Request,
+        source: localhost,
+        destination: localhost,
+        id: 0x6d96,
+        seq: 0,
+    };
+    assert_eq!(Echo::decode(&hex(KERNEL_REQUEST)), Some(expected));
+    let expected = Echo {
+        kind: EchoKind::Reply,
+        ..expected
+    };
+    assert_eq!(Echo::decode(&hex(KERNEL_REPLY)), Some(expected));
+}
+
+#[test]
+fn an_encoded_echo_decodes_to_itself() {
+    for echo in [request(), pong(request())] {
+        assert_eq!(Echo::decode(&echo.encode()), Some(echo));
+    }
+}
+
+#[test]
+fn an_echo_behind_ip_options_decodes() {
+    let mut packet = hex(KERNEL_REPLY);
+    packet[0] = 0x46;
+    packet[3] += 4;
+    packet.splice(20..20, [1, 1, 1, 1]);
+    let echo = Echo::decode(&packet).expect("a 24-byte header is valid");
+    assert_eq!((echo.kind, echo.id, echo.seq), (EchoKind::Reply, 0x6d96, 0));
+}
+
+#[test]
+fn packets_that_are_not_a_whole_echo_message_decode_to_nothing() {
+    let reply = hex(KERNEL_REPLY);
+    for len in 0..28 {
+        assert_eq!(Echo::decode(&reply[..len]), None, "cut at {len} bytes");
+    }
+    let change = |at: usize, value: u8| {
+        let mut packet = reply.clone();
+        packet[at] = value;
+        packet
+    };
+    for (what, packet) in [
+        ("IPv6", change(0, 0x65)),
+        ("a header shorter than 20 bytes", change(0, 0x44)),
+        ("UDP", change(9, 17)),
+        ("the first fragment", change(6, 0x20)),
+        ("a later fragment", change(7, 3)),
+        ("destination unreachable", change(20, 3)),
+        ("a non-zero code", change(21, 1)),
+        ("a total length past the end", change(3, 0x35)),
+        ("a total length inside the ICMP header", change(3, 27)),
+    ] {
+        assert_eq!(Echo::decode(&packet), None, "{what}");
+    }
+    assert!(
+        Echo::decode(&change(6, 0x40)).is_some(),
+        "the don't-fragment flag alone is not a fragment"
+    );
+}
+
+/// Run `server` as the kernel behind a tunnel would. Each echo request gets
+/// the replies that `replies` makes of it.
+fn answering(mut server: Detached, replies: impl Fn(Echo) -> Vec<Echo> + Send + 'static) {
+    tokio::spawn(async move {
+        while let Ok(packet) = server.recv().await {
+            let request = Echo::decode(&packet).filter(|echo| echo.kind == EchoKind::Request);
+            for reply in request.map(&replies).unwrap_or_default() {
+                server.send(&reply.encode()).await.unwrap();
+            }
+        }
+    });
+}
+
+async fn doctor_run(
+    replies: impl Fn(Echo) -> Vec<Echo> + Send + 'static,
+    attempts: u16,
+) -> Vec<Probe> {
+    let config = with_doctor();
+    let server = Detached::server(&config).await.unwrap();
+    let endpoint = endpoint(&server).await;
+    answering(server, replies);
+    doctor::loopback(&config, None, endpoint, attempts)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_doctor_gets_replies_from_the_tunnel_address_and_the_first_lan_host() {
+    let probes = doctor_run(|request| vec![pong(request)], 3).await;
+    let targets: Vec<Ipv4Addr> = probes.iter().map(|probe| probe.target).collect();
+    assert_eq!(targets, [SERVER, LAN_HOST]);
+    assert!(
+        probes.iter().all(|probe| probe.reply.is_some()),
+        "{probes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_target_that_stays_silent_has_no_reply() {
+    let probes = doctor_run(
+        |request| {
+            if request.destination == SERVER {
+                vec![pong(request)]
+            } else {
+                vec![]
+            }
+        },
+        2,
+    )
+    .await;
+    assert!(probes[0].reply.is_some(), "{probes:?}");
+    assert_eq!(
+        probes[1],
+        Probe {
+            target: LAN_HOST,
+            reply: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn only_a_reply_with_the_id_and_a_sequence_of_a_request_counts() {
+    let probes = doctor_run(
+        |request| {
+            let reply = pong(request);
+            vec![
+                Echo {
+                    id: reply.id ^ 1,
+                    ..reply
+                },
+                Echo {
+                    seq: reply.seq + 100,
+                    ..reply
+                },
+                Echo {
+                    source: Ipv4Addr::new(10, 66, 67, 9),
+                    ..reply
+                },
+                Echo {
+                    kind: EchoKind::Request,
+                    ..reply
+                },
+            ]
+        },
+        1,
+    )
+    .await;
+    assert!(
+        probes.iter().all(|probe| probe.reply.is_none()),
+        "{probes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_first_request_is_sent_again_and_the_reply_time_is_that_of_its_own_request() {
+    let probes = doctor_run(
+        |request| {
+            if request.seq == 0 {
+                vec![]
+            } else {
+                vec![pong(request)]
+            }
+        },
+        3,
+    )
+    .await;
+    for probe in probes {
+        let reply = probe.reply.expect("the second request gets a reply");
+        assert!(reply < Duration::from_millis(900), "{reply:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_doctor_needs_a_doctor_section() {
+    let mut value = server_json(&key());
+    value["peers"] = json!([{ "name": "laptop", "public_key": public(&key()), "allowed_ips": ["10.66.67.2/32"] }]);
+    let endpoint = "127.0.0.1:9".parse().unwrap();
+    let error = doctor::loopback(&config(value), None, endpoint, 1)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "DOCTOR_NOT_CONFIGURED");
 }
