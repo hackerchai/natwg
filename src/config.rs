@@ -11,7 +11,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU64,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -111,6 +111,9 @@ pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upnp: Option<UpnpConfig>,
     pub cloudflare: CloudflareConfig,
+    /// Where the server writes its status (default: `status::DEFAULT_PATH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doctor: Option<DoctorConfig>,
 }

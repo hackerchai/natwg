@@ -94,6 +94,7 @@ pub fn import(
                 record: legacy.cf_record,
                 token,
             },
+            status_file: None,
             doctor: None,
         }),
     })

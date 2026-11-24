@@ -78,6 +78,12 @@ impl PublicKey {
     }
 }
 
+impl From<[u8; 32]> for PublicKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl FromStr for PublicKey {
     type Err = &'static str;
 

@@ -4,7 +4,9 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use clap::{Args, Parser, Subcommand};
-use natwg::config::{Config, ServerConfig};
+use natwg::config::Config;
+use natwg::server::{self, cloudflare};
+use natwg::status::{self, Status};
 use natwg::tunnel::Tunnel;
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
@@ -14,7 +16,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
@@ -62,12 +64,23 @@ enum Action {
         #[command(subcommand)]
         action: ProbeAction,
     },
-    /// Run the WireGuard server: the tunnel interface, its route and LAN NAT.
+    /// Run the WireGuard server: the tunnel with its route and LAN NAT, the
+    /// STUN keepalive, the TXT record, the UPnP lease and the status file.
     Server {
         /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. natwg has no
         /// other way to run the server yet.
         #[arg(long, required = true)]
         foreground: bool,
+    },
+    /// Show what the running server reported last. Needs no root.
+    Status {
+        /// Print the status file as JSON.
+        #[arg(long)]
+        json: bool,
+        /// The status file of the server. Set it when the server config
+        /// names another one in role.server.status_file.
+        #[arg(long, value_name = "PATH", default_value = natwg::status::DEFAULT_PATH)]
+        status_file: PathBuf,
     },
     /// Test a running server from this host.
     Doctor {
@@ -83,10 +96,10 @@ enum DoctorAction {
     /// of the server config. A reply time is that of the first echo that got
     /// an answer, so it includes the WireGuard handshake.
     Loopback {
-        /// Where the client dials the server, such as the mapping that natwg
-        /// server prints. Required, because natwg cannot look the mapping up yet.
+        /// Where the client dials the server (default: the mapping in the
+        /// status file of the server).
         #[arg(long, value_name = "IP:PORT")]
-        endpoint: SocketAddrV4,
+        endpoint: Option<SocketAddrV4>,
         /// The interface the client sends through (default: the server's interface).
         #[arg(long)]
         iface: Option<String>,
@@ -137,7 +150,7 @@ enum ProbeAction {
         port: u16,
         /// A STUN server, resolved through --dns. Servers are tried in order. With
         /// no --server and no --fallback, natwg uses its built-in list.
-        #[arg(long = "server", value_name = "HOST:PORT", value_parser = host_port)]
+        #[arg(long = "server", value_name = "HOST:PORT", value_parser = stun::host_port)]
         servers: Vec<(String, u16)>,
         /// A STUN server address, tried after every --server.
         #[arg(long = "fallback", value_name = "IP:PORT")]
@@ -170,15 +183,6 @@ struct Uplink {
 }
 
 const DNS_PORT: u16 = 53;
-const STUN_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn host_port(text: &str) -> std::result::Result<(String, u16), String> {
-    let (host, port) = text.rsplit_once(':').ok_or("expected HOST:PORT")?;
-    let port = port
-        .parse()
-        .map_err(|_| format!("{port:?} is not a port number"))?;
-    Ok((host.to_owned(), port))
-}
 
 fn millis(text: &str) -> std::result::Result<Duration, std::num::ParseIntError> {
     text.parse().map(Duration::from_millis)
@@ -227,6 +231,20 @@ fn run(cli: Cli) -> Result<()> {
         }
         Action::Probe { action } => probe(action)?,
         Action::Server { foreground: _ } => server(&cli.config)?,
+        Action::Status { json, status_file } => {
+            let status = Status::read(&status_file)?;
+            if json {
+                say!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).expect("a status always serializes")
+                );
+            } else {
+                say!(
+                    "{}",
+                    status.render(status::unix(SystemTime::now())).trim_end()
+                );
+            }
+        }
         Action::Doctor {
             action:
                 DoctorAction::Loopback {
@@ -242,10 +260,22 @@ fn run(cli: Cli) -> Result<()> {
 fn doctor_loopback(
     config: &Path,
     iface: Option<&str>,
-    endpoint: SocketAddrV4,
+    endpoint: Option<SocketAddrV4>,
     attempts: NonZeroU16,
 ) -> Result<()> {
     let config = Config::load(config)?;
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint,
+        None => {
+            let path = status::path(config.server()?);
+            Status::read(path)?.mapping.ok_or_else(|| {
+                Error::new(
+                    "DOCTOR_NO_ENDPOINT",
+                    format!("{} holds no mapping yet; pass --endpoint", path.display()),
+                )
+            })?
+        }
+    };
     let probes = runtime(tokio::runtime::Builder::new_current_thread())?
         .block_on(doctor::loopback(&config, iface, endpoint, attempts))?;
     let mut silent = Vec::new();
@@ -285,20 +315,19 @@ fn server(config: &Path) -> Result<()> {
         ));
     }
     let config = Config::load(config)?;
-    runtime(tokio::runtime::Builder::new_multi_thread())?.block_on(serve(&config))
-}
-
-async fn serve(config: &Config) -> Result<()> {
-    let server = config.server()?;
-    let mut stop = Stop::listen()?;
-    let mut tunnel = Tunnel::start(config).await?;
-    say!("tun {}", tunnel.tun_name());
-    let served = tokio::select! {
-        failure = until_failure(&mut tunnel, server) => Err(failure),
-        () = stop.requested() => Ok(()),
-    };
-    let stopped = tunnel.stop().await;
-    served.and(stopped)
+    // A write error must not panic, because the server outlives the reader
+    // of its output.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .log_internal_errors(false)
+        .init();
+    runtime(tokio::runtime::Builder::new_multi_thread())?.block_on(async {
+        let mut stop = Stop::listen()?;
+        let stop = async move { stop.requested().await };
+        server::run(&config, cloudflare::API, Tunnel::start, stop).await
+    })
 }
 
 /// The signals that stop the server. SIGHUP is one of them, because a
@@ -328,44 +357,6 @@ impl Stop {
             _ = self.hangup.recv() => {}
         }
     }
-}
-
-/// Print the public mapping of the server's socket, then wait for the device
-/// to fail. A server that learns no mapping keeps its tunnel up.
-async fn until_failure(tunnel: &mut Tunnel, server: &ServerConfig) -> Error {
-    match public_mapping(tunnel.stun(), server).await {
-        Ok(mapping) => say!("mapping {mapping}"),
-        Err(error) => warn!("{error}"),
-    }
-    tunnel.failed().await;
-    Error::new(
-        "TUNNEL_FAILED",
-        "the WireGuard device stopped, because its TUN or its UDP socket failed",
-    )
-}
-
-/// Ask the configured STUN servers, then the built-in ones.
-async fn public_mapping(stun: &mut StunPort, server: &ServerConfig) -> Result<SocketAddrV4> {
-    let iface = BoundInterface::lookup(&server.iface)?;
-    let dns = server.stun.dns_server;
-    let mut servers = Vec::new();
-    for entry in &server.stun.servers {
-        match host_port(entry) {
-            Ok(server) => servers.push(server),
-            Err(error) => warn!("STUN_SERVER_INVALID: {entry:?}: {error}"),
-        }
-    }
-    let fallbacks = server.stun.fallback.clone();
-    let configured = first_mapping(stun, &iface, dns, STUN_TIMEOUT, servers, fallbacks).await;
-    let (mapping, _) = match configured {
-        Ok(found) => found,
-        Err(error) => {
-            warn!("{error}; trying the built-in STUN servers");
-            let (servers, fallbacks) = built_in_stun();
-            first_mapping(stun, &iface, dns, STUN_TIMEOUT, servers, fallbacks).await?
-        }
-    };
-    Ok(mapping)
 }
 
 fn built_in_stun() -> (Vec<(String, u16)>, Vec<SocketAddrV4>) {
