@@ -11,7 +11,8 @@ use launchd as manager;
 use systemd as manager;
 
 use crate::config::{self, Config, Instance};
-use crate::{Error, Result, status};
+use crate::status::{self, Status};
+use crate::{Error, Result};
 use std::{
     fmt::Write as _,
     fs,
@@ -29,8 +30,11 @@ const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 // launchd and systemd give a stopping server 15 s before they kill it.
 const STOP_WAIT: Duration = Duration::from_secs(20);
-const START_WAIT: Duration = Duration::from_secs(15);
+// A server whose first start fails, as when the old one still holds the
+// port, gets one more start 10 s later within this time.
+const SERVE_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(250);
+const LOG_LINES: usize = 8;
 
 /// The server of `instance` as the service manager runs it, reading
 /// `config`.
@@ -47,7 +51,9 @@ pub enum State {
     Missing,
     /// The job is loaded and has no process, for the reason given.
     Stopped(String),
-    Running(u32),
+    /// The job runs the process `pid`, and the manager started it `runs`
+    /// times since it loaded the job.
+    Running { pid: u32, runs: u32 },
 }
 
 /// Copy this natwg to [`BINARY`], write the service definition for the
@@ -56,7 +62,7 @@ pub enum State {
 pub fn install(config: &Path) -> Result<String> {
     require_root()?;
     // Everything that can refuse the install runs before the host changes.
-    let service = load(config)?;
+    let (service, status) = load(config)?;
     let text = manager::definition(&service)?;
     let binary_dir = Path::new(BINARY).parent().expect("BINARY has a directory");
     for dir in std::iter::once(binary_dir).chain(manager::log_dir()) {
@@ -89,9 +95,9 @@ pub fn install(config: &Path) -> Result<String> {
             manager::kick(&name)?;
             "started"
         }
-        State::Running(_) => "unchanged",
+        State::Running { .. } => "unchanged",
     };
-    let pid = wait_running(&service, None)?;
+    let pid = wait_serving(&service, &status, None)?;
     let changed = |changed| if changed { "written" } else { "unchanged" };
     let mut report = String::new();
     let _ = writeln!(report, "binary     {BINARY} ({})", changed(binary));
@@ -187,7 +193,7 @@ fn remove_service(instance: &Instance, files: Option<Files>) -> Result<String> {
 /// config again.
 pub fn restart(config: &Path) -> Result<String> {
     require_root()?;
-    let service = load(config)?;
+    let (service, status) = load(config)?;
     let name = manager::name(&service.instance);
     let before = match manager::state(&name)? {
         State::Missing => {
@@ -196,11 +202,11 @@ pub fn restart(config: &Path) -> Result<String> {
                 format!("{name} is not loaded; run natwg service install"),
             ));
         }
-        State::Running(pid) => Some(pid),
+        State::Running { pid, .. } => Some(pid),
         State::Stopped(_) => None,
     };
     manager::restart(&name)?;
-    let pid = wait_running(&service, before)?;
+    let pid = wait_serving(&service, &status, before)?;
     Ok(format!("{name} running, pid {pid} (restarted)"))
 }
 
@@ -220,15 +226,19 @@ impl std::fmt::Display for State {
         match self {
             Self::Missing => f.write_str("defined but not loaded"),
             Self::Stopped(reason) => write!(f, "not running: {reason}"),
-            Self::Running(pid) => write!(f, "running, pid {pid}"),
+            Self::Running { pid, .. } => write!(f, "running, pid {pid}"),
         }
     }
 }
 
-fn load(config: &Path) -> Result<Service> {
+/// The service of the server in `config`, and where that server writes
+/// its status.
+fn load(config: &Path) -> Result<(Service, PathBuf)> {
     let config = canonical(config)?;
-    let instance = Config::load(&config)?.server()?.instance.clone();
-    Ok(Service { instance, config })
+    let parsed = Config::load(&config)?;
+    let server = parsed.server()?;
+    let instance = server.instance.clone();
+    Ok((Service { instance, config }, status::path(server)))
 }
 
 /// Refuse `dir` unless root owns it and every directory above it, and no
@@ -324,27 +334,58 @@ fn storage(path: &Path, error: std::io::Error) -> Error {
     Error::new("SERVICE_STORAGE", format!("{}: {error}", path.display()))
 }
 
-/// Wait until the job runs with a process other than `not`, and return its
-/// process ID.
-fn wait_running(service: &Service, not: Option<u32>) -> Result<u32> {
+/// Wait until the job runs a process other than `not` that wrote a running
+/// tunnel to `status`, and return its process ID. A process ID alone proves
+/// nothing, because launchd and systemd show one for every start of a
+/// server that then exits, as on UDP_BIND.
+fn wait_serving(service: &Service, status: &Path, not: Option<u32>) -> Result<u32> {
     let name = manager::name(&service.instance);
-    let deadline = Instant::now() + START_WAIT;
+    let log = || manager::recent_log(&service.instance, LOG_LINES);
+    until_serving(
+        &name,
+        || manager::state(&name),
+        status,
+        not,
+        SERVE_WAIT,
+        log,
+    )
+}
+
+/// [`wait_serving`] with the job state from `state` and the end of the log
+/// from `log`. The state must not change while natwg reads the status file,
+/// so a status of a process that the manager replaced meanwhile does not
+/// count.
+fn until_serving(
+    name: &str,
+    mut state: impl FnMut() -> Result<State>,
+    status: &Path,
+    not: Option<u32>,
+    wait: Duration,
+    log: impl FnOnce() -> String,
+) -> Result<u32> {
+    let deadline = Instant::now() + wait;
+    let wrote_a_tunnel =
+        |pid| Status::read(status).is_ok_and(|written| written.pid == pid && written.tun.is_some());
     loop {
-        let state = manager::state(&name)?;
-        match state {
-            State::Running(pid) if Some(pid) != not => return Ok(pid),
-            _ if Instant::now() >= deadline => {
-                return Err(Error::new(
-                    "SERVICE_NOT_RUNNING",
-                    format!(
-                        "{name} did not run within {} s and is {state}; see {}",
-                        START_WAIT.as_secs(),
-                        manager::log(&service.instance)
-                    ),
-                ));
-            }
-            _ => std::thread::sleep(POLL),
+        let before = state()?;
+        if let State::Running { pid, .. } = before
+            && Some(pid) != not
+            && wrote_a_tunnel(pid)
+            && state()? == before
+        {
+            return Ok(pid);
         }
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                "SERVICE_NOT_STABLE",
+                format!(
+                    "{name} did not bring its tunnel up within {} s and is {before}. It stays installed, and its service manager keeps starting it. The log ends with:\n{}",
+                    wait.as_secs(),
+                    log()
+                ),
+            ));
+        }
+        std::thread::sleep(POLL);
     }
 }
 
@@ -356,7 +397,7 @@ fn wait_stopped(name: &str, gone: bool) -> Result<()> {
         let done = match state {
             State::Missing => true,
             State::Stopped(_) => !gone,
-            State::Running(_) => false,
+            State::Running { .. } => false,
         };
         if done {
             return Ok(());
@@ -422,4 +463,107 @@ fn text(path: &Path) -> Result<&str> {
                 ),
             )
         })
+}
+
+/// The last `count` lines of `text`.
+fn last_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{State, until_serving};
+    use crate::status::Status;
+    use std::{path::Path, time::Duration};
+
+    const NAME: &str = "com.hackerchai.natwg.natwg_test";
+    const LOG: &str = "UDP_BIND: en6 udp/51839: Address already in use (os error 48)";
+    const WAIT: Duration = Duration::from_millis(600);
+
+    fn running(pid: u32, runs: u32) -> State {
+        State::Running { pid, runs }
+    }
+
+    /// A status file in `dir` that the server `pid` wrote, with a running
+    /// tunnel when `tun` is set.
+    fn written(dir: &Path, pid: u32, tun: bool) -> std::path::PathBuf {
+        let status: Status = serde_json::from_value(serde_json::json!({
+            "updated": 1, "pid": pid, "iface": "en6", "listen_port": 51839,
+            "tun": tun.then_some("utun13"), "mapping": null, "mapping_since": null,
+            "last_stun_ok": null, "stun_misses": 0, "published": null,
+            "published_at": null, "publish_error": null, "upnp_ok": null,
+            "upnp_at": null, "nat_ok": null, "rebuilds": 0, "peers": [],
+        }))
+        .unwrap();
+        let path = dir.join("status.json");
+        status.write(&path).unwrap();
+        path
+    }
+
+    fn wait(states: impl Fn(u32) -> State, status: &Path, not: Option<u32>) -> crate::Result<u32> {
+        let mut calls = 0;
+        let state = || {
+            calls += 1;
+            Ok(states(calls))
+        };
+        until_serving(NAME, state, status, not, WAIT, || LOG.to_owned())
+    }
+
+    #[test]
+    fn the_process_that_wrote_a_running_tunnel_is_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = written(dir.path(), 200, true);
+        assert_eq!(wait(|_| running(200, 3), &status, None).unwrap(), 200);
+    }
+
+    #[test]
+    fn a_server_that_keeps_exiting_is_not_stable_and_the_error_quotes_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("status.json");
+        let crash_loop = |call| match call % 3 {
+            0 => State::Stopped("spawn scheduled, last exit code 1".into()),
+            _ => running(100 + call, call),
+        };
+        let error = wait(crash_loop, &status, None).unwrap_err();
+        assert_eq!(error.code, "SERVICE_NOT_STABLE");
+        assert!(error.message.starts_with(NAME), "{}", error.message);
+        assert!(error.message.ends_with(LOG), "{}", error.message);
+    }
+
+    #[test]
+    fn a_status_that_another_process_wrote_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = written(dir.path(), 199, true);
+        let error = wait(|_| running(200, 3), &status, None).unwrap_err();
+        assert_eq!(error.code, "SERVICE_NOT_STABLE");
+    }
+
+    #[test]
+    fn a_status_without_a_tunnel_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = written(dir.path(), 200, false);
+        let error = wait(|_| running(200, 3), &status, None).unwrap_err();
+        assert_eq!(error.code, "SERVICE_NOT_STABLE");
+    }
+
+    #[test]
+    fn a_restart_waits_for_a_process_other_than_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = written(dir.path(), 200, true);
+        let error = wait(|_| running(200, 3), &status, Some(200)).unwrap_err();
+        assert_eq!(error.code, "SERVICE_NOT_STABLE");
+    }
+
+    #[test]
+    fn a_process_replaced_while_natwg_read_its_status_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = written(dir.path(), 200, true);
+        let replaced = |call| match call {
+            1 => running(200, 3),
+            _ => running(200 + call, 3 + call),
+        };
+        let error = wait(replaced, &status, None).unwrap_err();
+        assert_eq!(error.code, "SERVICE_NOT_STABLE");
+    }
 }

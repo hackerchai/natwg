@@ -656,6 +656,7 @@ async fn natwg_doctor(
 fn status_with(mapping: Option<SocketAddrV4>) -> Status {
     Status {
         updated: 1,
+        pid: 1,
         iface: LOOPBACK.into(),
         listen_port: 0,
         tun: None,

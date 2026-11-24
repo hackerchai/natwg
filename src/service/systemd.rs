@@ -75,7 +75,7 @@ pub fn state(name: &str) -> Result<State> {
     let shown = manage_ok(&[
         "systemctl",
         "show",
-        "--property=LoadState,ActiveState,SubState,MainPID",
+        "--property=LoadState,ActiveState,SubState,MainPID,NRestarts",
         name,
     ])?;
     let shown = String::from_utf8_lossy(&shown.stdout).into_owned();
@@ -89,10 +89,35 @@ pub fn state(name: &str) -> Result<State> {
         return Ok(State::Missing);
     }
     let (active, sub) = (field("ActiveState"), field("SubState"));
+    let runs = field("NRestarts").parse().unwrap_or(0);
     match field("MainPID").parse() {
-        Ok(pid) if active == "active" && pid > 0 => Ok(State::Running(pid)),
+        Ok(pid) if active == "active" && pid > 0 => Ok(State::Running { pid, runs }),
         _ => Ok(State::Stopped(format!("{active} ({sub})"))),
     }
+}
+
+/// The last `lines` lines that the servers of `instance` printed.
+pub fn recent_log(instance: &Instance, lines: usize) -> String {
+    let lines = lines.to_string();
+    let unit = name(instance);
+    let argv = [
+        "journalctl",
+        "-u",
+        &unit,
+        "-n",
+        &lines,
+        "--no-pager",
+        "-o",
+        "cat",
+    ];
+    manage(&argv).map_or_else(
+        |error| error.to_string(),
+        |output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_owned()
+        },
+    )
 }
 
 /// Load the unit, enable it for boot and start it.

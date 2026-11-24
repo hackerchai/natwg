@@ -22,6 +22,8 @@ pub const DEFAULT_PATH: &str = "/run/natwg/status.json";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub updated: u64,
+    /// The process ID of the server that wrote the status.
+    pub pid: u32,
     pub iface: String,
     pub listen_port: u16,
     /// The TUN of the running tunnel, or none while natwg rebuilds it.
