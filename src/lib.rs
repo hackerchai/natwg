@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod keys;
 pub mod nat;
 pub mod netcfg;
+pub mod peer;
 pub mod server;
 pub mod service;
 pub mod status;
