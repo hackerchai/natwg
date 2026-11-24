@@ -258,6 +258,17 @@ impl Config {
         Ok(())
     }
 
+    /// The server role, which the server and the doctor commands need.
+    pub fn server(&self) -> Result<&ServerConfig> {
+        match &self.role {
+            Role::Server(server) => Ok(server),
+            Role::Client(_) => Err(Error::new(
+                "ROLE_MISMATCH",
+                "the config has the client role, and this command needs the server role",
+            )),
+        }
+    }
+
     /// The config as JSON for people to read. Every secret reads `"<redacted>"`,
     /// and `public_key` holds the public half of `private_key`.
     pub fn redacted(&self) -> String {
