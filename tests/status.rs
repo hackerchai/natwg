@@ -9,6 +9,7 @@ use std::{
 fn fixture(updated: u64) -> Status {
     Status {
         updated,
+        pid: 4242,
         iface: "en6".into(),
         listen_port: 51831,
         tun: Some("utun12".into()),
@@ -38,6 +39,7 @@ fn the_status_file_has_the_documented_fields() {
     let status = fixture(1_000_000);
     let expected = json!({
         "updated": 1_000_000,
+        "pid": 4242,
         "iface": "en6",
         "listen_port": 51831,
         "tun": "utun12",
@@ -171,4 +173,83 @@ fn natwg_status_without_a_status_file_exits_1_and_names_the_file() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.starts_with("STATUS_UNREADABLE: "), "{error}");
     assert!(error.contains("missing.json"), "{error}");
+}
+
+fn server(instance: &str, status_file: Option<&str>) -> natwg::config::ServerConfig {
+    serde_json::from_value(json!({
+        "instance": instance,
+        "iface": "en6",
+        "listen_port": 51831,
+        "lan": "10.73.0.0/24",
+        "stun": {"servers": [], "fallback": [], "dns_server": "223.5.5.5"},
+        "cloudflare": {"zone": "example.com", "record": "_wg.example.com", "token": "t"},
+        "status_file": status_file,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn each_instance_has_its_own_default_status_file() {
+    let default = std::path::Path::new(natwg::status::DEFAULT_PATH);
+    assert_eq!(natwg::status::path(&server("natwg", None)), default);
+    assert_eq!(
+        natwg::status::path(&server("natwg_fix5", None)),
+        default.with_file_name("natwg_fix5.status.json")
+    );
+    assert_eq!(
+        natwg::status::path(&server("natwg_fix5", Some("/srv/natwg/status.json"))),
+        std::path::Path::new("/srv/natwg/status.json"),
+        "a status_file in the config wins"
+    );
+}
+
+type Change = fn(&mut Status);
+
+#[test]
+fn natwg_status_exits_1_and_names_each_problem_it_shows() {
+    let cases: [(&str, Change); 6] = [
+        ("the status is ", |status| status.updated -= 120),
+        ("no tunnel runs", |status| {
+            status.tun = None;
+            status.nat_ok = None;
+        }),
+        ("NAT is not ok", |status| status.nat_ok = Some(false)),
+        ("no public mapping", |status| status.mapping = None),
+        ("the TXT publish failed", |status| {
+            status.publish_error = Some("CLOUDFLARE_HTTP: connection refused".into());
+        }),
+        ("UPnP failed", |status| status.upnp_ok = Some(false)),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    for (problem, change) in cases {
+        let mut status = fixture(now());
+        change(&mut status);
+        status.write(&path).unwrap();
+        for format in [&[][..], &["--json"]] {
+            let mut args = format.to_vec();
+            args.extend(["--status-file", path.to_str().unwrap()]);
+            let output = natwg_status(&args);
+            assert_eq!(output.status.code(), Some(1), "{problem}: {output:?}");
+            assert!(
+                !output.stdout.is_empty(),
+                "{problem}: the status still prints"
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let expected = format!("SERVER_UNHEALTHY: {problem}");
+            assert!(stderr.starts_with(&expected), "{problem}: {stderr}");
+        }
+    }
+}
+
+#[test]
+fn natwg_status_exits_0_when_upnp_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let mut status = fixture(now());
+    status.upnp_ok = None;
+    status.upnp_at = None;
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
 }

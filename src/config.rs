@@ -10,7 +10,7 @@ use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU64,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -111,7 +111,7 @@ pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upnp: Option<UpnpConfig>,
     pub cloudflare: CloudflareConfig,
-    /// Where the server writes its status (default: `status::DEFAULT_PATH`).
+    /// Where the server writes its status (default: `status::path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,6 +240,15 @@ impl Config {
                 ),
             ));
         }
+        if acl::present(&file).map_err(unreadable)? {
+            return Err(Error::new(
+                "CONFIG_UNSAFE",
+                format!(
+                    "{}: the file carries an ACL, which can grant access that its mode does not show; remove it with chmod -N",
+                    path.display()
+                ),
+            ));
+        }
         let mut text = String::new();
         file.read_to_string(&mut text).map_err(unreadable)?;
         let invalid = |e: String| Error::new("CONFIG_INVALID", format!("{}: {e}", path.display()));
@@ -307,7 +316,18 @@ impl Config {
     }
 
     /// Atomically replace `path` with this config, readable only by its owner.
+    /// A directory that `path` needs is created readable only by its owner.
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.write(path, true)
+    }
+
+    /// Write this config as [`Config::save`] does, but refuse a `path` that
+    /// exists.
+    pub fn create(&self, path: &Path) -> Result<()> {
+        self.write(path, false)
+    }
+
+    fn write(&self, path: &Path, replace: bool) -> Result<()> {
         let storage =
             |e: std::io::Error| Error::new("CONFIG_STORAGE", format!("{}: {e}", path.display()));
         let mut text = keys::exposing(|| serde_json::to_string_pretty(self))
@@ -317,7 +337,11 @@ impl Config {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        std::fs::create_dir_all(dir).map_err(storage)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(storage)?;
         let mut stage = tempfile::NamedTempFile::new_in(dir).map_err(storage)?;
         stage
             .as_file()
@@ -327,8 +351,69 @@ impl Config {
             .write_all(text.as_bytes())
             .and_then(|()| stage.as_file().sync_all())
             .map_err(storage)?;
-        stage.persist(path).map_err(|e| storage(e.error))?;
+        let persisted = if replace {
+            stage.persist(path)
+        } else {
+            stage.persist_noclobber(path)
+        };
+        persisted.map_err(|e| match e.error.kind() {
+            std::io::ErrorKind::AlreadyExists => Error::new(
+                "CONFIG_EXISTS",
+                format!(
+                    "{} exists already, and import-legacy replaces a config only with --force",
+                    path.display()
+                ),
+            ),
+            _ => storage(e.error),
+        })?;
         Ok(())
+    }
+
+    /// Give the server a doctor with a fresh key, at the highest host of the
+    /// tunnel subnet that is neither the server's address nor inside a
+    /// peer's allowed IPs. A doctor that is there already stays unless
+    /// `replace` is set.
+    pub fn add_doctor(&mut self, replace: bool) -> Result<DoctorConfig> {
+        if self.server()?.doctor.is_some() && !replace {
+            return Err(Error::new(
+                "DOCTOR_EXISTS",
+                "role.server.doctor exists already; --force replaces it",
+            ));
+        }
+        let address = self.free_host().ok_or_else(|| {
+            Error::new(
+                "DOCTOR_NO_ADDRESS",
+                format!(
+                    "every host of the tunnel subnet of interface.address {} is the server's or a peer's",
+                    self.interface.address
+                ),
+            )
+        })?;
+        let doctor = DoctorConfig {
+            private_key: Key::generate()?,
+            address,
+        };
+        if let Role::Server(server) = &mut self.role {
+            server.doctor = Some(doctor.clone());
+        }
+        Ok(doctor)
+    }
+
+    fn free_host(&self) -> Option<Ipv4Addr> {
+        let address = self.interface.address;
+        let first = u32::from(address.network()) + 1;
+        let last = u32::from(address.broadcast()).checked_sub(1)?;
+        let taken = |host| {
+            host == address.ip()
+                || self
+                    .peers
+                    .iter()
+                    .any(|peer| peer.allowed_ips.iter().any(|net| net.contains(host)))
+        };
+        (first..=last)
+            .rev()
+            .map(Ipv4Addr::from)
+            .find(|&host| !taken(host))
     }
 
     /// The server role, which the server and the doctor commands need.
@@ -366,6 +451,104 @@ fn is_iface_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Make `dir` a directory that only the effective user can use: create it
+/// if it is missing, then set mode 0700 and remove its ACL, whose
+/// inheritable entries a config written into it would get.
+pub fn make_private_dir(dir: &Path) -> Result<()> {
+    let storage =
+        |e: std::io::Error| Error::new("CONFIG_STORAGE", format!("{}: {e}", dir.display()));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(storage)?;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .map_err(storage)?;
+    let owner = handle.metadata().map_err(storage)?.uid();
+    let euid = unsafe { libc::geteuid() };
+    if owner != euid {
+        return Err(Error::new(
+            "CONFIG_UNSAFE",
+            format!(
+                "{}: owner uid {owner}; natwg keeps a config only in a directory owned by uid {euid}",
+                dir.display()
+            ),
+        ));
+    }
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(storage)?;
+    acl::remove(&handle).map_err(storage)
+}
+
+/// The extended ACL of a file. A macOS ACL entry can grant access that the
+/// mode bits do not show.
+#[cfg(target_os = "macos")]
+mod acl {
+    use std::{
+        fs::File,
+        io,
+        os::fd::AsRawFd,
+        os::raw::{c_int, c_void},
+    };
+
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+
+    unsafe extern "C" {
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: c_int, acl: *mut c_void, kind: c_int) -> c_int;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_free(object: *mut c_void) -> c_int;
+    }
+
+    pub fn present(file: &File) -> io::Result<bool> {
+        let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(false),
+                _ => Err(error),
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        let found = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
+        unsafe { acl_free(acl) };
+        Ok(found)
+    }
+
+    pub fn remove(file: &File) -> io::Result<()> {
+        let empty = unsafe { acl_init(0) };
+        if empty.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let set = unsafe { acl_set_fd_np(file.as_raw_fd(), empty, ACL_TYPE_EXTENDED) };
+        let error = io::Error::last_os_error();
+        unsafe { acl_free(empty) };
+        if set == 0 { Ok(()) } else { Err(error) }
+    }
+}
+
+/// A Linux ACL entry takes effect only through the ACL mask, and the mode
+/// shows the mask as the group bits, so the mode check and the chmod to
+/// 0700 already cover it.
+#[cfg(not(target_os = "macos"))]
+mod acl {
+    use std::{fs::File, io};
+
+    pub fn present(_: &File) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    pub fn remove(_: &File) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn default_mtu() -> u16 {

@@ -398,8 +398,8 @@ fn legacy_import_twice_writes_identical_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("config.json");
     let mut runs = Vec::new();
-    for _ in 0..2 {
-        let output = import_fixture(&out, &[]);
+    for extra in [&[][..], &["--force"]] {
+        let output = import_fixture(&out, extra);
         assert!(output.status.success(), "{output:?}");
         runs.push(fs::read(&out).unwrap());
     }
@@ -621,4 +621,139 @@ fn a_fifo_at_the_config_path_is_refused_without_blocking() {
     );
     fs::set_permissions(&fifo, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(Config::load(&fifo).unwrap_err().code, "CONFIG_UNSAFE");
+}
+
+#[test]
+fn import_legacy_replaces_a_config_only_with_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("config.json");
+    write_private(&out, "the config of someone else\n");
+
+    let output = import_fixture(&out, &[]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("CONFIG_EXISTS: "), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "the config of someone else\n"
+    );
+    let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(left.len(), 1, "a refused import leaves no temporary file");
+
+    let output = import_fixture(&out, &["--force"]);
+    assert!(output.status.success(), "{output:?}");
+    let imported = Config::load(&out).unwrap();
+    assert_eq!(imported.private_key.public_key().to_string(), SERVER_PUBLIC);
+}
+
+#[test]
+fn save_creates_missing_directories_readable_only_by_their_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("etc/natwg");
+    let config = load_value(&server_json()).unwrap();
+    config.save(&nested.join("config.json")).unwrap();
+    assert_eq!(mode(&dir.path().join("etc")), 0o700);
+    assert_eq!(mode(&nested), 0o700);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_config_that_carries_an_acl_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    load_value(&server_json()).unwrap().save(&path).unwrap();
+    let chmod = |args: &[&str]| {
+        let status = Command::new("/bin/chmod")
+            .args(args)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "chmod {args:?}");
+    };
+
+    chmod(&["+a", "everyone allow read"]);
+    assert_eq!(mode(&path), 0o600, "the ACL leaves the mode as it was");
+    let error = Config::load(&path).unwrap_err();
+    assert_eq!(error.code, "CONFIG_UNSAFE");
+    assert!(error.message.contains("ACL"), "{}", error.message);
+
+    chmod(&["-N"]);
+    Config::load(&path).unwrap();
+}
+
+fn doctor_of(path: &Path) -> Option<DoctorConfig> {
+    let Role::Server(server) = Config::load(path).unwrap().role else {
+        panic!("a server config")
+    };
+    server.doctor
+}
+
+#[test]
+fn config_doctor_adds_a_doctor_at_the_highest_free_host_and_replaces_it_only_with_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let mut value = server_json();
+    value["role"]["server"]
+        .as_object_mut()
+        .unwrap()
+        .remove("doctor");
+    value["peers"].as_array_mut().unwrap().push(json!({
+        "name": "phone", "public_key": DOCTOR_PUBLIC, "allowed_ips": ["10.66.66.252/30"]
+    }));
+    write_private(&path, &value.to_string());
+    let doctor = |extra: &[&str]| {
+        natwg()
+            .arg("--config")
+            .arg(&path)
+            .args(["config", "doctor"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let output = doctor(&[]);
+    assert!(output.status.success(), "{output:?}");
+    let first = doctor_of(&path).unwrap();
+    let expected: std::net::Ipv4Addr = "10.66.66.251".parse().unwrap();
+    assert_eq!(first.address, expected, ".252 to .255 belong to the phone");
+    assert_eq!(mode(&path), 0o600);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let public = first.private_key.public_key().to_string();
+    assert_eq!(stdout, format!("doctor {expected} public key {public}\n"));
+
+    let before = fs::read(&path).unwrap();
+    let output = doctor(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("DOCTOR_EXISTS: "), "{stderr}");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "a refused run writes nothing"
+    );
+
+    let output = doctor(&["--force"]);
+    assert!(output.status.success(), "{output:?}");
+    let second = doctor_of(&path).unwrap();
+    assert_eq!(second.address, expected);
+    assert_ne!(second.private_key, first.private_key, "a fresh key");
+    let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(left.len(), 1, "the write leaves no temporary file");
+}
+
+#[test]
+fn the_doctor_never_takes_the_address_of_the_server() {
+    let mut value = server_json();
+    value["role"]["server"]
+        .as_object_mut()
+        .unwrap()
+        .remove("doctor");
+    value["interface"]["address"] = json!("10.66.66.254/24");
+    let mut config = load_value(&value).unwrap();
+    let doctor = config.add_doctor(false).unwrap();
+    assert_eq!(
+        doctor.address,
+        "10.66.66.253".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+    config.validate().unwrap();
 }

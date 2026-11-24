@@ -3,10 +3,9 @@
 
 use crate::config::{Instance, ServerConfig};
 use crate::server::error_chain;
-use crate::{Error, Result};
+use crate::{Error, Result, netcfg};
 use std::{
     convert::Infallible,
-    ffi::CStr,
     net::Ipv4Addr,
     time::{Duration, SystemTime},
 };
@@ -143,25 +142,8 @@ impl Upnp {
 }
 
 fn ipv4_address(iface: &str) -> Option<Ipv4Addr> {
-    let mut list = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return None;
-    }
-    let mut found = None;
-    let mut entry = list;
-    while let Some(current) = unsafe { entry.as_ref() } {
-        entry = current.ifa_next;
-        let address = current.ifa_addr;
-        if address.is_null() || i32::from(unsafe { (*address).sa_family }) != libc::AF_INET {
-            continue;
-        }
-        if unsafe { CStr::from_ptr(current.ifa_name) }.to_bytes() != iface.as_bytes() {
-            continue;
-        }
-        let address = unsafe { &*address.cast::<libc::sockaddr_in>() };
-        found = Some(Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)));
-        break;
-    }
-    unsafe { libc::freeifaddrs(list) };
-    found
+    let addresses = netcfg::ipv4_addresses().ok()?;
+    addresses
+        .into_iter()
+        .find_map(|(name, address)| (name == iface).then_some(address))
 }
