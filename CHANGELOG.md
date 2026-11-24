@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.0](https://github.com/hackerchai/natwg/compare/v0.1.0...v0.2.0) (2026-11-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** `natwg config import-legacy` is gone. Write the config by hand or keep using the one the cutover produced.
+
+### Features
+
+* **client:** run natwg as a WireGuard client that follows the TXT record ([1f871db](https://github.com/hackerchai/natwg/commit/1f871dbbcb3757cba105a09d088a6352ee4563ba))
+* **config:** import a wg-quick client config with its keys ([507bd43](https://github.com/hackerchai/natwg/commit/507bd43b8eede2d2d107822ccc014ffe8c429cec))
+* **peer:** add, list and remove the clients of a server ([7820fda](https://github.com/hackerchai/natwg/commit/7820fdac48b9879e7329b4af75cced932bd1e8b0))
+* **service:** install natwg client as its own service ([bd006d8](https://github.com/hackerchai/natwg/commit/bd006d8bf9f4f01e5137de5307d05120633ef4c7))
+
+
+### Bug Fixes
+
+* **client:** judge a stale handshake by the session lifetime and keepalive ([31442cd](https://github.com/hackerchai/natwg/commit/31442cd7e40f2bfbb539391f212917bf10b2a114))
+* **client:** leave the LAN the host sits on out of the tunnel routes ([3404012](https://github.com/hackerchai/natwg/commit/340401278b51002be1ff8023aa540750b68e1b93))
+
+
+### Code Refactoring
+
+* **config:** remove config import-legacy ([bc072f8](https://github.com/hackerchai/natwg/commit/bc072f85d03b5b477bcb635d98b1d41ac748dd70))
+
 ## 0.1.0 (2026-11-24)
 
 
