@@ -55,6 +55,7 @@ impl Tunnel {
     /// NAT rule that it made.
     pub async fn start(config: &Config) -> Result<(Self, StunPort)> {
         let server = config.server()?;
+        netcfg::require_free_address(config.interface.address.ip())?;
         let subnet = subnet(config.interface.address);
         let rule = Rule::new(&server.instance, &server.iface, subnet, server.lan);
         let nat = rule.clone().check()?;

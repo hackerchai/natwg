@@ -13,7 +13,9 @@ pub use macos::plan;
 
 use crate::{Error, Result};
 use std::{
+    ffi::CStr,
     io::Write,
+    net::Ipv4Addr,
     process::{Command, Stdio},
 };
 
@@ -178,6 +180,48 @@ pub fn run(argv: &[String], stdin: Option<&str>) -> Result<Output> {
 /// What a command that only reads state printed on standard output.
 pub fn read(argv: &[&str]) -> Result<String> {
     Ok(run(&owned(argv), None)?.stdout)
+}
+
+/// Every IPv4 address of every interface, with the name of the interface.
+pub fn ipv4_addresses() -> std::io::Result<Vec<(String, Ipv4Addr)>> {
+    let mut list = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut found = Vec::new();
+    let mut entry = list;
+    while let Some(current) = unsafe { entry.as_ref() } {
+        entry = current.ifa_next;
+        let address = current.ifa_addr;
+        if address.is_null() || i32::from(unsafe { (*address).sa_family }) != libc::AF_INET {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(current.ifa_name) };
+        let address = unsafe { &*address.cast::<libc::sockaddr_in>() };
+        found.push((
+            name.to_string_lossy().into_owned(),
+            Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)),
+        ));
+    }
+    unsafe { libc::freeifaddrs(list) };
+    Ok(found)
+}
+
+/// Refuse a tunnel address that an interface holds already, such as the
+/// utun of a tunnel that `wg-quick down` left behind. That interface would
+/// keep the tunnel's traffic.
+pub fn require_free_address(address: Ipv4Addr) -> Result<()> {
+    let addresses =
+        ipv4_addresses().map_err(|e| Error::new("INTERFACES_UNREADABLE", e.to_string()))?;
+    let Some((holder, _)) = addresses.iter().find(|(_, held)| *held == address) else {
+        return Ok(());
+    };
+    Err(Error::new(
+        "ADDRESS_IN_USE",
+        format!(
+            "{holder} holds the tunnel address {address} already and would keep the tunnel's traffic; take {holder} down or change interface.address"
+        ),
+    ))
 }
 
 fn owned(argv: &[&str]) -> Vec<String> {

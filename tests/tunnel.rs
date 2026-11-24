@@ -4,7 +4,7 @@ use natwg::config::{Config, Role};
 use natwg::doctor::{self, Echo, EchoKind, Probe};
 use natwg::keys::Key;
 use natwg::status::Status;
-use natwg::tunnel::Detached;
+use natwg::tunnel::{Detached, Tunnel};
 use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
@@ -276,6 +276,19 @@ async fn a_server_without_a_peer_or_a_doctor_does_not_start() {
     let config = config(server_json(&key()));
     let error = Detached::server(&config).await.err().unwrap();
     assert_eq!(error.code, "TUNNEL_NO_PEERS");
+}
+
+#[tokio::test]
+async fn a_tunnel_address_that_an_interface_holds_is_refused_before_anything_changes() {
+    let mut value = server_json(&key());
+    value["interface"]["address"] = json!("127.0.0.1/24");
+    let error = Tunnel::start(&config(value)).await.err().unwrap();
+    assert_eq!(error.code, "ADDRESS_IN_USE", "{}", error.message);
+    assert!(
+        error.message.starts_with(&format!("{LOOPBACK} holds ")),
+        "{}",
+        error.message
+    );
 }
 
 fn peer_json(name: &str, public_key: &str, address: &str) -> Value {
