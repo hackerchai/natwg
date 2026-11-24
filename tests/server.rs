@@ -761,6 +761,43 @@ async fn a_run_of_unanswered_stun_requests_rebuilds_the_tunnel() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_new_mapping_reaches_the_status_before_the_next_tick() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let (stun_server, _seen) = blocking_stun_server(vec![Some(addr("203.0.113.5:6785"))]);
+    let (config, _) = supervised(&path, stun_server, 25);
+    let (_kill, kills) = watch::channel(0);
+    let build = async |config: &Config| {
+        let (device, stun) = Detached::server(config).await?;
+        let kills = kills.clone();
+        let device = Killable {
+            device,
+            kills,
+            generation: 0,
+        };
+        Ok((device, stun))
+    };
+    let (stop, stopped) = oneshot::channel::<()>();
+    let check = async {
+        status_until(&path, |_| true).await;
+        let first_written = Instant::now();
+        let written = status_until(&path, |status| status.mapping.is_some()).await;
+        assert_eq!(written.mapping, Some(addr("203.0.113.5:6785")));
+        let waited = first_written.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "{waited:?}: the mapping waited for the 10 s tick"
+        );
+        stop.send(()).unwrap();
+    };
+    let stop = async {
+        let _ = stopped.await;
+    };
+    let (served, ()) = tokio::join!(server::run(&config, NO_API, build, stop), check);
+    served.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn rebuilds_that_fail_wait_twice_as_long_each_time_up_to_60_s() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("status.json");
