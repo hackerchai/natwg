@@ -132,6 +132,25 @@ fn linux_leaves_the_route_for_the_address_subnet_to_the_kernel() {
 }
 
 #[test]
+fn a_route_for_the_tunnel_subnet_that_leaves_through_another_device_is_found() {
+    fn foreign(listing: &str) -> Option<&str> {
+        netcfg::linux::foreign_route(listing, "natwg_fix")
+    }
+    let own = "10.66.70.0/24 dev natwg_fix proto kernel scope link src 10.66.70.1 \n";
+    assert_eq!(foreign(""), None);
+    assert_eq!(foreign(own), None);
+    for other in [
+        "10.66.70.0/24 dev dmy70 scope link",
+        "10.66.70.0/24 dev natwg_fix2 scope link",
+        "10.66.70.0/24 via 192.168.139.1 dev eth0",
+        "blackhole 10.66.70.0/24",
+    ] {
+        assert_eq!(foreign(&format!("{other} \n")), Some(other));
+        assert_eq!(foreign(&format!("{own}{other} \n")), Some(other));
+    }
+}
+
+#[test]
 fn apply_runs_the_steps_in_order_and_stops_at_the_first_failure() {
     let dir = tempfile::tempdir().unwrap();
     let file = |name: &str| dir.path().join(name).display().to_string();

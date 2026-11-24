@@ -40,6 +40,10 @@ impl Tunnel {
         let server = config.server()?;
         let subnet = subnet(config.interface.address);
         let nat = Rule::new(&server.instance, &server.iface, subnet, server.lan).check()?;
+        // macOS needs no such check. The route step of its plan fails with
+        // COMMAND_NO_EFFECT for a subnet that has a route.
+        #[cfg(not(target_os = "macos"))]
+        netcfg::linux::require_free_route(requested_tun(&server.instance), subnet)?;
         let iface = BoundInterface::lookup(&server.iface)?;
         let unavailable =
             |e: gotatun::tun::tun_async_device::Error| Error::new("TUN_UNAVAILABLE", e.to_string());
