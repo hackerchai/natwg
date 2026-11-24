@@ -29,6 +29,11 @@ pub fn definition_path(instance: &Instance) -> PathBuf {
     Path::new(DAEMONS).join(format!("{}.plist", name(instance)))
 }
 
+/// The directory of the logs, which launchd opens as root.
+pub fn log_dir() -> Option<&'static Path> {
+    Some(Path::new(LOG_DIR))
+}
+
 /// Where launchd writes what the server prints.
 pub fn log(instance: &Instance) -> String {
     let file = match instance.as_str() {
