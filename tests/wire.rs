@@ -552,3 +552,58 @@ async fn a_rebind_waits_for_the_previous_socket_to_free_the_port() {
     release.await.unwrap();
     assert!(bound.is_ok(), "{:?}", bound.err());
 }
+
+#[tokio::test]
+async fn resolve_reads_a_response_longer_than_512_bytes() {
+    let server = dns_server(|id| {
+        let mut response = id.to_vec();
+        response.extend([0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+        response.extend(b"\x03big\x07example\x00\x00\x10\x00\x01");
+        response.extend([0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0, 0, 0, 60]);
+        response.extend(804u16.to_be_bytes());
+        for _ in 0..4 {
+            response.push(200);
+            response.extend([b'x'; 200]);
+        }
+        assert!(response.len() > 512);
+        vec![response]
+    })
+    .await;
+    let records = dns::resolve(
+        &loopback(),
+        server,
+        "big.example",
+        RecordKind::Txt,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(records, vec![Record::Txt("x".repeat(800))]);
+}
+
+#[tokio::test]
+async fn a_dns_socket_error_names_the_server_and_the_name() {
+    let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = v4(closed.local_addr().unwrap());
+    drop(closed);
+    let error = dns::resolve(
+        &loopback(),
+        server,
+        "stun.miwifi.com",
+        RecordKind::A,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "DNS_IO", "{}", error.message);
+    assert!(
+        error.message.contains("stun.miwifi.com"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains(&server.to_string()),
+        "{}",
+        error.message
+    );
+}

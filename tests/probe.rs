@@ -94,7 +94,15 @@ fn probe_stun_without_servers_tries_the_built_in_list() {
     ]);
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("stun.miwifi.com"), "{stderr}");
-    assert!(stderr.contains("111.206.174.3:3478"), "{stderr}");
+    for target in [
+        "stun.miwifi.com:3478",
+        "stun.chat.bilibili.com:3478",
+        "stun.hitv.com:3478",
+        "stun.cloudflare.com:3478",
+        "111.206.174.3:3478",
+        "111.206.174.2:3478",
+    ] {
+        assert!(stderr.contains(target), "{target} missing from {stderr}");
+    }
     assert!(!stderr.contains("STUN_NO_SERVER"), "{stderr}");
 }
