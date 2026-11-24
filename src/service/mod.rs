@@ -10,8 +10,8 @@ use launchd as manager;
 #[cfg(not(target_os = "macos"))]
 use systemd as manager;
 
-use crate::config::{self, Config, Instance};
-use crate::status::{self, Status};
+use crate::config::{self, Config, Instance, Role};
+use crate::status::{self, Report};
 use crate::{Error, Result};
 use std::{
     fmt::Write as _,
@@ -36,8 +36,8 @@ const SERVE_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(250);
 const LOG_LINES: usize = 8;
 
-/// The server of `instance` as the service manager runs it, reading
-/// `config`.
+/// The server of `instance`, or the client when `instance` is
+/// [`Instance::client`], as the service manager runs it, reading `config`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Service {
     pub instance: Instance,
@@ -57,7 +57,7 @@ pub enum State {
 }
 
 /// Copy this natwg to [`BINARY`], write the service definition for the
-/// server in `config`, and start it. A part that is already in place stays,
+/// server or the client in `config`, and start it. A part that is already in place stays,
 /// so a second run with nothing changed keeps the running server.
 pub fn install(config: &Path) -> Result<String> {
     require_root()?;
@@ -113,19 +113,18 @@ pub fn install(config: &Path) -> Result<String> {
     Ok(report)
 }
 
-/// Stop the service of the server in `config` and remove its definition
-/// and its status file. `purge` also deletes the config and, when no other
-/// natwg service is left, the binary.
+/// Stop the service of the server or the client in `config` and remove its
+/// definition and its status file. `purge` also deletes the config and, when
+/// no other natwg service is left, the binary.
 pub fn uninstall(config: &Path, purge: bool) -> Result<String> {
     require_root()?;
-    let parsed = Config::load(config)?;
-    let server = parsed.server()?;
+    let (instance, status) = identify(&Config::load(config)?);
     let files = Files {
         config,
-        status: status::path(server),
+        status,
         purge,
     };
-    remove_service(&server.instance, Some(files))
+    remove_service(&instance, Some(files))
 }
 
 /// Stop the service of `instance` and remove its definition without a
@@ -189,8 +188,8 @@ fn remove_service(instance: &Instance, files: Option<Files>) -> Result<String> {
     Ok(report.trim_end().to_owned())
 }
 
-/// Restart the service of the server in `config`, which then reads its
-/// config again.
+/// Restart the service of the server or the client in `config`, which then
+/// reads its config again.
 pub fn restart(config: &Path) -> Result<String> {
     require_root()?;
     let (service, status) = load(config)?;
@@ -231,14 +230,21 @@ impl std::fmt::Display for State {
     }
 }
 
-/// The service of the server in `config`, and where that server writes
-/// its status.
+/// The service of the server or the client in `config`, and where it
+/// writes its status.
 fn load(config: &Path) -> Result<(Service, PathBuf)> {
     let config = canonical(config)?;
-    let parsed = Config::load(&config)?;
-    let server = parsed.server()?;
-    let instance = server.instance.clone();
-    Ok((Service { instance, config }, status::path(server)))
+    let (instance, status) = identify(&Config::load(&config)?);
+    Ok((Service { instance, config }, status))
+}
+
+/// The instance that names the service of `config`, and its status file. A
+/// client takes the instance `client`, which no server can have.
+fn identify(config: &Config) -> (Instance, PathBuf) {
+    match &config.role {
+        Role::Server(server) => (server.instance.clone(), status::path(server)),
+        Role::Client(client) => (Instance::client(), status::client_path(client)),
+    }
 }
 
 /// Refuse `dir` unless root owns it and every directory above it, and no
@@ -364,8 +370,9 @@ fn until_serving(
     log: impl FnOnce() -> String,
 ) -> Result<u32> {
     let deadline = Instant::now() + wait;
-    let wrote_a_tunnel =
-        |pid| Status::read(status).is_ok_and(|written| written.pid == pid && written.tun.is_some());
+    let wrote_a_tunnel = |pid| {
+        Report::read(status).is_ok_and(|written| written.pid() == pid && written.has_tunnel())
+    };
     loop {
         let before = state()?;
         if let State::Running { pid, .. } = before

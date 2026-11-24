@@ -32,17 +32,22 @@ pub fn log(instance: &Instance) -> String {
     format!("journalctl -u {}", name(instance))
 }
 
-/// The unit. A first build that fails ends the server, as when the uplink
-/// is not up yet at boot, so systemd starts it again after 10 s. systemd
-/// sends SIGTERM on stop, and the server then removes its TUN, route and
-/// NAT table within the 15 s before systemd kills it.
+/// The unit. A first build that fails ends the server or the client, as
+/// when the uplink is not up yet at boot, so systemd starts it again after
+/// 10 s. systemd sends SIGTERM on stop, and natwg then removes its TUN,
+/// routes and NAT table within the 15 s before systemd kills it.
 pub fn definition(service: &Service) -> Result<String> {
     let command = [BINARY, "--config", text(&service.config)?, "daemon"]
         .map(quote)
         .join(" ");
+    let role = if service.instance.is_client() {
+        "client".to_owned()
+    } else {
+        format!("server {}", service.instance)
+    };
     Ok(format!(
         "[Unit]
-Description=natwg WireGuard server {instance}
+Description=natwg WireGuard {role}
 Wants=network-online.target
 After=network-online.target
 
@@ -55,8 +60,7 @@ TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
-",
-        instance = service.instance,
+"
     ))
 }
 
