@@ -64,7 +64,8 @@ enum Action {
         #[command(subcommand)]
         action: ProbeAction,
     },
-    /// Run the WireGuard server: the tunnel interface, its route and LAN NAT.
+    /// Run the WireGuard server: the tunnel with its route and LAN NAT, the
+    /// STUN keepalive, the TXT record, the UPnP lease and the status file.
     Server {
         /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. natwg has no
         /// other way to run the server yet.
