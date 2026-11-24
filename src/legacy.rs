@@ -120,6 +120,10 @@ enum Section {
     Peer,
 }
 
+// "PersistentKeepalive" is the longest wg-quick key, and a 44-character
+// base64 key can be all letters, so a longer name is never echoed.
+const MAX_KEY_NAME: usize = 19;
+
 fn parse_wg_conf(text: &str) -> std::result::Result<WgServer, String> {
     let mut section = Section::Preamble;
     let mut private_key = None;
@@ -154,7 +158,10 @@ fn parse_wg_conf(text: &str) -> std::result::Result<WgServer, String> {
             .split_once('=')
             .ok_or_else(|| at(&"expected a section header or Key = Value"))?;
         let key = key.trim();
-        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphabetic()) {
+        if key.is_empty()
+            || key.len() > MAX_KEY_NAME
+            || !key.bytes().all(|b| b.is_ascii_alphabetic())
+        {
             return Err(at(&"expected a section header or Key = Value"));
         }
         let key = key.to_ascii_lowercase();

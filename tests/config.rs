@@ -362,27 +362,31 @@ fn a_client_config_cannot_carry_a_doctor() {
 #[test]
 fn a_malformed_legacy_key_line_never_echoes_the_key() {
     let dir = tempfile::tempdir().unwrap();
-    let conf = fs::read_to_string(fixture("wg-home.conf"))
-        .unwrap()
-        .replace("PrivateKey = ", "PrivateKey: ");
-    let wg_conf = dir.path().join("wg-home.conf");
-    fs::write(&wg_conf, conf).unwrap();
-    let output = natwg()
-        .args(["config", "import-legacy", "--dry-run", "--natwg-json"])
-        .arg(fixture("natwg.json"))
-        .arg("--wg-conf")
-        .arg(&wg_conf)
-        .arg("--cf-token")
-        .arg(fixture("cf_token"))
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap().to_lowercase();
-    assert!(stderr.contains("legacy_invalid"), "{stderr}");
-    assert!(
-        !stderr.contains(&SERVER_PRIVATE[..16].to_lowercase()),
-        "{stderr}"
-    );
+    let fixture_conf = fs::read_to_string(fixture("wg-home.conf")).unwrap();
+    let private_line = format!("PrivateKey = {SERVER_PRIVATE}");
+    assert!(fixture_conf.contains(&private_line));
+    let letters_key = "QWErtyUIOPasdfghJKLzxcvbnmQWERTYUIOPasdfghA=";
+    for (line, key) in [
+        (format!("PrivateKey: {SERVER_PRIVATE}"), SERVER_PRIVATE),
+        (format!("PrivateKey{letters_key}"), letters_key),
+        (letters_key.to_owned(), letters_key),
+    ] {
+        let wg_conf = dir.path().join("wg-home.conf");
+        fs::write(&wg_conf, fixture_conf.replace(&private_line, &line)).unwrap();
+        let output = natwg()
+            .args(["config", "import-legacy", "--dry-run", "--natwg-json"])
+            .arg(fixture("natwg.json"))
+            .arg("--wg-conf")
+            .arg(&wg_conf)
+            .arg("--cf-token")
+            .arg(fixture("cf_token"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{line}");
+        let stderr = String::from_utf8(output.stderr).unwrap().to_lowercase();
+        assert!(stderr.contains("legacy_invalid"), "{stderr}");
+        assert!(!stderr.contains(&key[..16].to_lowercase()), "{stderr}");
+    }
 }
 
 #[test]
