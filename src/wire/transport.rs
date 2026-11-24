@@ -12,19 +12,40 @@ use std::{
     fmt, io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU32,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, watch},
+    sync::{oneshot, watch},
 };
 
-const ANSWER_QUEUE: usize = 16;
 const REBIND_ATTEMPTS: u32 = 40;
 const REBIND_PAUSE: Duration = Duration::from_millis(5);
 
-type Answer = (TransactionId, SocketAddrV4);
+/// The Binding request that the [`StunPort`] waits for. Only the answer with
+/// its transaction id, from its server, reaches `reply`.
+struct Pending {
+    id: TransactionId,
+    server: SocketAddrV4,
+    reply: oneshot::Sender<SocketAddrV4>,
+}
+
+#[derive(Clone, Default)]
+struct Slot(Arc<Mutex<Option<Pending>>>);
+
+impl Slot {
+    fn lock(&self) -> MutexGuard<'_, Option<Pending>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn answer(&self, id: TransactionId, source: SocketAddr, mapping: SocketAddrV4) {
+        let asked = |pending: &mut Pending| pending.id == id && source == pending.server.into();
+        if let Some(pending) = self.lock().take_if(asked) {
+            let _ = pending.reply.send(mapping);
+        }
+    }
+}
 
 /// A network interface that existed when it was looked up.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,32 +88,33 @@ pub fn bound_udp_socket(iface: &BoundInterface, port: u16) -> io::Result<std::ne
 }
 
 /// gotatun's UDP transport on one interface. Every socket it binds also carries
-/// STUN. Binding success responses go to the [`StunPort`] and everything else
-/// to gotatun.
+/// STUN. The answer to the pending Binding request goes to the [`StunPort`],
+/// other Binding success responses are dropped, and everything else goes to
+/// gotatun.
 pub struct BoundUdp {
     iface: BoundInterface,
     socket: watch::Sender<Weak<UdpSocket>>,
-    answers: mpsc::Sender<Answer>,
+    pending: Slot,
 }
 
 /// Sends STUN Binding requests on the socket [`BoundUdp`] bound last.
 pub struct StunPort {
     socket: watch::Receiver<Weak<UdpSocket>>,
-    answers: mpsc::Receiver<Answer>,
+    pending: Slot,
 }
 
 impl BoundUdp {
     pub fn new(iface: BoundInterface) -> (Self, StunPort) {
         let (socket_tx, socket_rx) = watch::channel(Weak::new());
-        let (answers_tx, answers_rx) = mpsc::channel(ANSWER_QUEUE);
+        let pending = Slot::default();
         let udp = Self {
             iface,
             socket: socket_tx,
-            answers: answers_tx,
+            pending: pending.clone(),
         };
         let stun = StunPort {
             socket: socket_rx,
-            answers: answers_rx,
+            pending,
         };
         (udp, stun)
     }
@@ -111,7 +133,7 @@ impl UdpTransportFactory for BoundUdp {
         self.socket.send_replace(Arc::downgrade(&socket));
         let recv = BoundRecv {
             socket: socket.clone(),
-            answers: self.answers.clone(),
+            pending: self.pending.clone(),
         };
         Ok((BoundSend(socket), recv))
     }
@@ -154,7 +176,7 @@ impl UdpSend for BoundSend {
 
 pub struct BoundRecv {
     socket: Arc<UdpSocket>,
-    answers: mpsc::Sender<Answer>,
+    pending: Slot,
 }
 
 impl UdpRecv for BoundRecv {
@@ -168,8 +190,8 @@ impl UdpRecv for BoundRecv {
             if !stun::is_stun_binding_success(&packet) {
                 return Ok((packet, source));
             }
-            if let Some(answer) = stun::parse_binding_success(&packet) {
-                let _ = self.answers.try_send(answer);
+            if let Some((id, mapping)) = stun::parse_binding_success(&packet) {
+                self.pending.answer(id, source, mapping);
             }
         }
     }
@@ -199,8 +221,18 @@ impl StunPort {
         Ok(stun)
     }
 
+    /// Wait until the shared socket is bound. gotatun binds it when the
+    /// device starts and again when it rebinds.
+    pub async fn wait_bound(&mut self) -> Result<()> {
+        self.socket
+            .wait_for(|socket| socket.strong_count() > 0)
+            .await
+            .map(drop)
+            .map_err(|_| Error::new("STUN_NO_SOCKET", "the WireGuard device stopped"))
+    }
+
     /// Ask `server` for the public mapping of the shared socket. Answers to
-    /// earlier requests are ignored.
+    /// earlier requests, and answers from any other address, are ignored.
     pub async fn binding(
         &mut self,
         server: SocketAddrV4,
@@ -211,29 +243,24 @@ impl StunPort {
             self.socket.borrow().upgrade().ok_or_else(|| {
                 Error::new("STUN_NO_SOCKET", "the shared UDP socket is not bound")
             })?;
-        socket
-            .send_to(&stun::binding_request(id), server)
-            .await
-            .map_err(|e| Error::new("STUN_SEND", format!("{server}: {e}")))?;
+        let (reply, answer) = oneshot::channel();
+        *self.pending.lock() = Some(Pending { id, server, reply });
+        let sent = socket.send_to(&stun::binding_request(id), server).await;
         // Holding the socket while waiting would stop gotatun from rebinding its port.
         drop(socket);
-        let answer = async {
-            while let Some((answer, mapping)) = self.answers.recv().await {
-                if answer == id {
-                    return Some(mapping);
-                }
+        let mapping = match sent {
+            Ok(_) => tokio::time::timeout(timeout, answer).await,
+            Err(e) => {
+                self.pending.lock().take();
+                return Err(Error::new("STUN_SEND", format!("{server}: {e}")));
             }
-            None
         };
-        tokio::time::timeout(timeout, answer)
-            .await
-            .ok()
-            .flatten()
-            .ok_or_else(|| {
-                Error::new(
-                    "STUN_TIMEOUT",
-                    format!("no answer from {server} within {} ms", timeout.as_millis()),
-                )
-            })
+        self.pending.lock().take();
+        mapping.ok().and_then(|reply| reply.ok()).ok_or_else(|| {
+            Error::new(
+                "STUN_TIMEOUT",
+                format!("no answer from {server} within {} ms", timeout.as_millis()),
+            )
+        })
     }
 }

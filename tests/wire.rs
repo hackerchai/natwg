@@ -295,6 +295,62 @@ async fn binding_ignores_a_stale_answer_and_times_out() {
 }
 
 #[tokio::test]
+async fn a_flood_of_answers_to_other_requests_never_hides_the_answer() {
+    let mut stun = StunPort::bind(loopback(), 0).await.unwrap();
+    let (server, server_address) = fake_stun_server().await;
+    let serve = async {
+        let (id, client) = next_request(&server).await;
+        for n in 0..100u8 {
+            let other = answer([n; 12], "198.51.100.1:1111");
+            server.send_to(&other, client).await.unwrap();
+        }
+        let right = answer(id, "203.0.113.9:7007");
+        server.send_to(&right, client).await.unwrap();
+    };
+    let (mapping, ()) = tokio::join!(stun.binding(server_address, Duration::from_secs(2)), serve);
+    assert_eq!(mapping.unwrap(), addr("203.0.113.9:7007"));
+}
+
+#[tokio::test]
+async fn an_answer_from_another_address_is_ignored() {
+    let mut stun = StunPort::bind(loopback(), 0).await.unwrap();
+    let (server, server_address) = fake_stun_server().await;
+    let (impostor, _) = fake_stun_server().await;
+    let serve = async {
+        let (id, client) = next_request(&server).await;
+        let forged = answer(id, "198.51.100.66:6666");
+        impostor.send_to(&forged, client).await.unwrap();
+        let right = answer(id, "203.0.113.9:7007");
+        server.send_to(&right, client).await.unwrap();
+    };
+    let (mapping, ()) = tokio::join!(stun.binding(server_address, Duration::from_secs(2)), serve);
+    assert_eq!(mapping.unwrap(), addr("203.0.113.9:7007"));
+}
+
+#[tokio::test]
+async fn wait_bound_returns_once_gotatun_binds_the_socket() {
+    let (mut udp, mut stun) = BoundUdp::new(loopback());
+    let mut waiting = std::pin::pin!(stun.wait_bound());
+    let early = tokio::time::timeout(Duration::from_millis(50), &mut waiting).await;
+    assert!(
+        early.is_err(),
+        "wait_bound returned before anything was bound"
+    );
+    let _bound = udp.bind(&params(0)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("wait_bound returns after the bind")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn wait_bound_fails_once_the_transport_is_gone() {
+    let (udp, mut stun) = BoundUdp::new(loopback());
+    drop(udp);
+    assert_eq!(stun.wait_bound().await.unwrap_err().code, "STUN_NO_SOCKET");
+}
+
+#[tokio::test]
 async fn gotatun_can_rebind_the_same_port_while_stun_waits() {
     let (mut udp, mut stun) = BoundUdp::new(loopback());
     let (server, server_address) = fake_stun_server().await;
