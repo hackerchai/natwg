@@ -172,3 +172,31 @@ fn natwg_status_without_a_status_file_exits_1_and_names_the_file() {
     assert!(error.starts_with("STATUS_UNREADABLE: "), "{error}");
     assert!(error.contains("missing.json"), "{error}");
 }
+
+fn server(instance: &str, status_file: Option<&str>) -> natwg::config::ServerConfig {
+    serde_json::from_value(json!({
+        "instance": instance,
+        "iface": "en6",
+        "listen_port": 51831,
+        "lan": "10.73.0.0/24",
+        "stun": {"servers": [], "fallback": [], "dns_server": "223.5.5.5"},
+        "cloudflare": {"zone": "example.com", "record": "_wg.example.com", "token": "t"},
+        "status_file": status_file,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn each_instance_has_its_own_default_status_file() {
+    let default = std::path::Path::new(natwg::status::DEFAULT_PATH);
+    assert_eq!(natwg::status::path(&server("natwg", None)), default);
+    assert_eq!(
+        natwg::status::path(&server("natwg_fix5", None)),
+        default.with_file_name("natwg_fix5.status.json")
+    );
+    assert_eq!(
+        natwg::status::path(&server("natwg_fix5", Some("/srv/natwg/status.json"))),
+        std::path::Path::new("/srv/natwg/status.json"),
+        "a status_file in the config wins"
+    );
+}

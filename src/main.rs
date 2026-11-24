@@ -77,8 +77,9 @@ enum Action {
         /// Print the status file as JSON.
         #[arg(long)]
         json: bool,
-        /// The status file of the server. Set it when the server config
-        /// names another one in role.server.status_file.
+        /// The status file of the server. A server of another instance than
+        /// natwg writes <instance>.status.json beside the default, and a
+        /// config can name its own in role.server.status_file.
         #[arg(long, value_name = "PATH", default_value = natwg::status::DEFAULT_PATH)]
         status_file: PathBuf,
     },
@@ -344,7 +345,7 @@ fn doctor_loopback(
         Some(endpoint) => endpoint,
         None => {
             let path = status::path(config.server()?);
-            Status::read(path)?.mapping.ok_or_else(|| {
+            Status::read(&path)?.mapping.ok_or_else(|| {
                 Error::new(
                     "DOCTOR_NO_ENDPOINT",
                     format!("{} holds no mapping yet; pass --endpoint", path.display()),

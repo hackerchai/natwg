@@ -111,7 +111,7 @@ pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upnp: Option<UpnpConfig>,
     pub cloudflare: CloudflareConfig,
-    /// Where the server writes its status (default: `status::DEFAULT_PATH`).
+    /// Where the server writes its status (default: `status::path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
