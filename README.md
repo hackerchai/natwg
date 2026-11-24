@@ -112,15 +112,24 @@ with the default keepalive.
 The client keeps its keys and its tunnel address, so the server needs no
 change.
 
+The wg-quick config is `/opt/homebrew/etc/wireguard/wg-home.conf` with
+Homebrew on macOS, and `/etc/wireguard/wg-home.conf` on Linux.
+
 ```sh
-sudo natwg config import-wg-quick /etc/wireguard/wg-home.conf \
+conf=/opt/homebrew/etc/wireguard/wg-home.conf
+sudo natwg config import-wg-quick "$conf" \
   --record _wg-home.example.com --dry-run          # check the redacted result
-sudo natwg config import-wg-quick /etc/wireguard/wg-home.conf \
+sudo natwg config import-wg-quick "$conf" \
   --record _wg-home.example.com                    # writes --config
-sudo wg-quick down wg-home                         # frees the address and routes
-sudo natwg service install
+# wg-quick down frees the address and the routes. If the install refuses,
+# wg-quick comes back up.
+sudo wg-quick down "$conf" && { sudo natwg service install || sudo wg-quick up "$conf"; }
 natwg status
 ```
+
+A client on one of the server's networks, such as a laptop at home on the
+LAN that the server routes, leaves that network out of its routes and reaches
+it directly. It routes the network again once the host leaves it.
 
 The import takes one `[Peer]`, reads wg-quick's `Endpoint = 0.0.0.0:0`
 placeholder as no endpoint, and refuses keys natwg does not run, such as `DNS`
