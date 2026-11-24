@@ -55,7 +55,11 @@ pub enum State {
 /// so a second run with nothing changed keeps the running server.
 pub fn install(config: &Path) -> Result<String> {
     require_root()?;
+    // Everything that can refuse the install runs before the host changes.
     let service = load(config)?;
+    let text = manager::definition(&service)?;
+    let name = manager::name(&service.instance);
+    let before = manager::state(&name)?;
     // Only natwg's own directory: the directory of a config elsewhere can
     // hold files that other software needs to read.
     let default_dir = Path::new(config::DEFAULT_PATH)
@@ -64,15 +68,9 @@ pub fn install(config: &Path) -> Result<String> {
     if let Some(dir) = default_dir.filter(|dir| service.config.parent() == Some(dir)) {
         config::make_private_dir(&dir)?;
     }
-    let name = manager::name(&service.instance);
-    let before = manager::state(&name)?;
     let binary = install_binary()?;
     let definition = manager::definition_path(&service.instance);
-    let defined = write_if_changed(
-        &definition,
-        manager::definition(&service)?.as_bytes(),
-        0o644,
-    )?;
+    let defined = write_if_changed(&definition, text.as_bytes(), 0o644)?;
     let action = match before {
         State::Missing => {
             manager::load(&service)?;
