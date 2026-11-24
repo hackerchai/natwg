@@ -181,6 +181,17 @@ enum ConfigAction {
         #[arg(long)]
         force: bool,
     },
+    /// Give the server config of --config a doctor, the client identity that
+    /// natwg doctor uses.
+    ///
+    /// The doctor gets a fresh key and the highest host of the tunnel subnet
+    /// that neither the server nor a peer uses. natwg replaces --config in
+    /// one step. Restart the server to load the doctor.
+    Doctor {
+        /// Replace a doctor that the config has already.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,6 +288,22 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 warn!("Wrote {}", out.display());
             }
+        }
+        Action::Config {
+            action: ConfigAction::Doctor { force },
+        } => {
+            let mut config = Config::load(&cli.config)?;
+            let doctor = config.add_doctor(force)?;
+            config.save(&cli.config)?;
+            say!(
+                "doctor {} public key {}",
+                doctor.address,
+                doctor.private_key.public_key()
+            );
+            warn!(
+                "Wrote {}; natwg service restart loads the doctor",
+                cli.config.display()
+            );
         }
         Action::Probe { action } => probe(action)?,
         Action::Server { foreground: _ } | Action::Daemon => server(&cli.config)?,
