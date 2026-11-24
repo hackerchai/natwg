@@ -95,7 +95,7 @@ async fn nothing_more(device: &mut Detached) {
 #[tokio::test]
 async fn the_doctor_reaches_the_server_and_the_server_answers() {
     let config = with_doctor();
-    let mut server = Detached::server(&config).await.unwrap();
+    let mut server = Detached::server(&config).await.unwrap().0;
     let mut doctor = dial_as_doctor(&config, &server).await;
 
     let request = packet(DOCTOR, SERVER, b"to the tunnel address");
@@ -108,9 +108,50 @@ async fn the_doctor_reaches_the_server_and_the_server_answers() {
 }
 
 #[tokio::test]
+async fn the_server_reports_each_peer_with_its_handshake_and_traffic() {
+    let config = with_doctor();
+    let mut server = Detached::server(&config).await.unwrap().0;
+    let doctor_key = config
+        .server()
+        .unwrap()
+        .doctor
+        .as_ref()
+        .unwrap()
+        .private_key
+        .public_key();
+    let [before] = &server.peers().await[..] else {
+        panic!("the doctor is the only peer");
+    };
+    assert_eq!(before.public_key, doctor_key);
+    assert_eq!(before.endpoint, None);
+    assert_eq!(before.last_handshake, None);
+    assert_eq!((before.rx_bytes, before.tx_bytes), (0, 0));
+
+    let mut doctor = dial_as_doctor(&config, &server).await;
+    let doctor_port = doctor.listen_port().await;
+    let request = packet(DOCTOR, SERVER, b"to the tunnel address");
+    doctor.send(&request).await.unwrap();
+    next(&mut server).await;
+    server.send(&packet(SERVER, DOCTOR, b"back")).await.unwrap();
+    next(&mut doctor).await;
+
+    let [after] = &server.peers().await[..] else {
+        panic!("the doctor is the only peer");
+    };
+    assert_eq!(after.public_key, doctor_key);
+    assert_eq!(after.endpoint.map(|e| e.port()), Some(doctor_port));
+    assert!(
+        after
+            .last_handshake
+            .is_some_and(|ago| ago < Duration::from_secs(5))
+    );
+    assert!(after.rx_bytes > 0 && after.tx_bytes > 0, "{after:?}");
+}
+
+#[tokio::test]
 async fn the_doctor_sends_the_lan_through_the_tunnel_and_nothing_else() {
     let config = with_doctor();
-    let mut server = Detached::server(&config).await.unwrap();
+    let mut server = Detached::server(&config).await.unwrap().0;
     let doctor = dial_as_doctor(&config, &server).await;
 
     let outside = packet(DOCTOR, Ipv4Addr::new(192, 0, 2, 1), b"not routed");
@@ -124,7 +165,7 @@ async fn the_doctor_sends_the_lan_through_the_tunnel_and_nothing_else() {
 #[tokio::test]
 async fn the_server_accepts_only_the_doctors_own_address_from_the_doctor() {
     let config = with_doctor();
-    let mut server = Detached::server(&config).await.unwrap();
+    let mut server = Detached::server(&config).await.unwrap().0;
     let doctor = dial_as_doctor(&config, &server).await;
 
     let spoofed = packet(Ipv4Addr::new(10, 66, 67, 9), SERVER, b"spoofed source");
@@ -158,14 +199,14 @@ fn pair(server_psk: &str, client_psk: &str) -> (Config, Config, Ipv4Addr) {
 
 async fn dial(server: &Detached, mut dialer: Config) -> Detached {
     dialer.peers[0].endpoint = Some(endpoint(server).await);
-    Detached::server(&dialer).await.unwrap()
+    Detached::server(&dialer).await.unwrap().0
 }
 
 #[tokio::test]
 async fn a_configured_peer_with_the_same_preshared_key_exchanges_packets() {
     let psk = key();
     let (server, dialer, client) = pair(&psk, &psk);
-    let mut server = Detached::server(&server).await.unwrap();
+    let mut server = Detached::server(&server).await.unwrap().0;
     let mut dialer = dial(&server, dialer).await;
 
     let request = packet(client, SERVER, b"from the laptop");
@@ -180,7 +221,7 @@ async fn a_configured_peer_with_the_same_preshared_key_exchanges_packets() {
 #[tokio::test]
 async fn peers_with_different_preshared_keys_exchange_nothing() {
     let (server, dialer, client) = pair(&key(), &key());
-    let mut server = Detached::server(&server).await.unwrap();
+    let mut server = Detached::server(&server).await.unwrap().0;
     let dialer = dial(&server, dialer).await;
 
     dialer
@@ -405,7 +446,7 @@ async fn doctor_run(
     attempts: u16,
 ) -> Vec<Probe> {
     let config = with_doctor();
-    let server = Detached::server(&config).await.unwrap();
+    let server = Detached::server(&config).await.unwrap().0;
     let endpoint = endpoint(&server).await;
     answering(server, replies);
     let attempts = NonZeroU16::new(attempts).unwrap();
@@ -528,7 +569,7 @@ async fn natwg_doctor(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.json");
     config.save(&path).unwrap();
-    let server = Detached::server(&config).await.unwrap();
+    let server = Detached::server(&config).await.unwrap().0;
     let endpoint = endpoint(&server).await.to_string();
     answering(server, replies);
     tokio::task::spawn_blocking(move || {

@@ -365,6 +365,17 @@ fn an_anchor_that_is_empty_or_holds_only_the_rule_of_this_config_is_free() {
 }
 
 #[test]
+fn an_anchor_holds_the_rule_only_when_pfctl_prints_it() {
+    let own = mac_rule();
+    let printed = "nat on en6 inet from 10.66.67.0/24 to 10.73.0.0/24 -> (en6) round-robin\n";
+    assert!(pf::holds(printed, &own));
+    assert!(pf::holds(&format!("\n{printed}"), &own));
+    for listing in ["", "\n", PYTHON_RULE] {
+        assert!(!pf::holds(listing, &own), "{listing:?}");
+    }
+}
+
+#[test]
 fn an_anchor_with_any_other_rule_is_in_use_and_the_rule_is_named() {
     let own = mac_rule();
     for other in [
@@ -415,6 +426,24 @@ const OWN_TABLE: &str = "table inet natwg_next {
 fn a_table_that_is_empty_or_holds_only_the_rule_of_this_config_is_free() {
     for listing in ["", "table inet natwg_next {\n}\n", OWN_TABLE] {
         assert_eq!(nft::foreign(listing, &linux_rule()), None, "{listing:?}");
+    }
+}
+
+#[test]
+fn a_table_holds_the_rule_only_when_nft_prints_all_of_it() {
+    assert!(nft::holds(OWN_TABLE, &linux_rule()));
+    let other_subnet = rule("natwg_next", "eth0", "10.66.68.0/24", "192.168.139.0/24");
+    let without_rule = OWN_TABLE.replace(
+        "\t\toifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 192.168.139.0/24 masquerade\n",
+        "",
+    );
+    for (listing, rule) in [
+        ("", linux_rule()),
+        ("table inet natwg_next {\n}\n", linux_rule()),
+        (without_rule.as_str(), linux_rule()),
+        (OWN_TABLE, other_subnet),
+    ] {
+        assert!(!nft::holds(listing, &rule), "{listing:?}");
     }
 }
 

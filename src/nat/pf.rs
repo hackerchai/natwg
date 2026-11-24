@@ -17,9 +17,13 @@ pub fn anchor(instance: &Instance) -> String {
 pub fn up(rule: &Rule) -> Vec<Step> {
     vec![
         Step::new(&["pfctl", "-a", &anchor(&rule.instance), "-f", "-"]).stdin(text(rule)),
-        Step::new(&["sysctl", "-w", "net.inet.ip.forwarding=1"])
-            .done_when(&["sysctl", "-n", "net.inet.ip.forwarding"], "1"),
+        forwarding(),
     ]
+}
+
+pub fn forwarding() -> Step {
+    Step::new(&["sysctl", "-w", "net.inet.ip.forwarding=1"])
+        .done_when(&["sysctl", "-n", "net.inet.ip.forwarding"], "1")
 }
 
 pub fn down(instance: &Instance) -> Vec<Step> {
@@ -45,6 +49,13 @@ pub fn foreign<'a>(listing: &'a str, rule: &Rule) -> Option<&'a str> {
         .find(|line| !words(line).eq(words(&own)))
 }
 
+/// Whether what `pfctl -s nat` prints for an anchor holds the rule [`up`]
+/// loads.
+pub fn holds(listing: &str, rule: &Rule) -> bool {
+    let own = text(rule);
+    listing.lines().any(|line| words(line).eq(words(&own)))
+}
+
 // pfctl prints `inet` whether or not the loaded rule had it, and it prints
 // the `round-robin` that the rule left to the default.
 fn words(rule: &str) -> impl Iterator<Item = &str> {
@@ -66,14 +77,17 @@ pub fn token(output: &str) -> Option<&str> {
 /// back, so pf goes off again once nothing else holds a reference.
 #[cfg(target_os = "macos")]
 pub(super) fn enable() -> Result<Option<Step>> {
-    if run(&argv(["pfctl", "-s", "info"]), None)?
-        .stdout
-        .contains("Status: Enabled")
-    {
+    if enabled()? {
         return Ok(None);
     }
     let output = run(&argv(["pfctl", "-E"]), None)?;
     Ok(token(&output.stderr).map(|token| Step::new(&["pfctl", "-X", token])))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn enabled() -> Result<bool> {
+    let info = run(&argv(["pfctl", "-s", "info"]), None)?;
+    Ok(info.stdout.contains("Status: Enabled"))
 }
 
 #[cfg(target_os = "macos")]
