@@ -3,7 +3,7 @@
 
 use crate::config::CloudflareConfig;
 use crate::keys::Secret;
-use crate::server::keepalive::Mapping;
+use crate::server::{error_chain, keepalive::Mapping};
 use crate::{Error, Result};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -78,7 +78,7 @@ impl Publisher {
             .timeout(TIMEOUT)
             .no_proxy()
             .build()
-            .map_err(|e| Error::new("HTTP_UNAVAILABLE", chain(&e)))?;
+            .map_err(|e| Error::new("HTTP_UNAVAILABLE", error_chain(&e)))?;
         Ok(Self {
             http,
             api: api.trim_end_matches('/').to_owned(),
@@ -206,7 +206,7 @@ impl Publisher {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let http = |e: reqwest::Error| Error::new("CLOUDFLARE_HTTP", chain(&e));
+        let http = |e: reqwest::Error| Error::new("CLOUDFLARE_HTTP", error_chain(&e));
         let response = request.send().await.map_err(http)?;
         let status = response.status();
         let mut reply: Value = response.json().await.map_err(http)?;
@@ -230,17 +230,4 @@ async fn changed(mapping: &mut watch::Receiver<Option<Mapping>>) {
     if mapping.changed().await.is_err() {
         std::future::pending().await
     }
-}
-
-/// An error with the errors that caused it, such as a refused connection
-/// behind reqwest's "error sending request".
-pub(crate) fn chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
 }
