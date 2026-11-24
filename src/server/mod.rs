@@ -280,7 +280,7 @@ impl Supervisor<'_> {
                 .collect(),
         };
         drop(publish);
-        if let Err(error) = status.write(status::path(self.server)) {
+        if let Err(error) = status.write(&status::path(self.server)) {
             tracing::warn!("{error}");
         }
     }

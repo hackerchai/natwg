@@ -126,8 +126,8 @@ pub fn uninstall(config: &Path, purge: bool) -> Result<String> {
         removed.push(definition);
     }
     let status = status::path(server);
-    if remove(status)? {
-        removed.push(status.to_owned());
+    if remove(&status)? {
+        removed.push(status);
     }
     if purge {
         if remove(config)? {

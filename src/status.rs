@@ -10,7 +10,7 @@ use std::{
     io::Write as _,
     net::{SocketAddr, SocketAddrV4},
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -56,12 +56,16 @@ pub struct PeerStatus {
 }
 
 /// Where the server writes its status: `role.server.status_file`, or
-/// [`DEFAULT_PATH`].
-pub fn path(server: &ServerConfig) -> &Path {
-    server
-        .status_file
-        .as_deref()
-        .unwrap_or(Path::new(DEFAULT_PATH))
+/// [`DEFAULT_PATH`] for the instance `natwg` and `<instance>.status.json`
+/// beside it for any other, so two servers never share one file.
+pub fn path(server: &ServerConfig) -> PathBuf {
+    if let Some(path) = &server.status_file {
+        return path.clone();
+    }
+    match server.instance.as_str() {
+        "natwg" => PathBuf::from(DEFAULT_PATH),
+        other => Path::new(DEFAULT_PATH).with_file_name(format!("{other}.status.json")),
+    }
 }
 
 pub fn unix(time: SystemTime) -> u64 {
