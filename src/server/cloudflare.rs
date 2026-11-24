@@ -40,6 +40,8 @@ pub enum Publish {
     Idle,
     Publishing {
         previous: Option<Record>,
+        /// Why the attempt before this one failed.
+        error: Option<String>,
     },
     Published(Record),
     Failed {
@@ -55,7 +57,16 @@ impl Publish {
         match self {
             Self::Idle => None,
             Self::Published(record) => Some(*record),
-            Self::Publishing { previous } | Self::Failed { previous, .. } => *previous,
+            Self::Publishing { previous, .. } | Self::Failed { previous, .. } => *previous,
+        }
+    }
+
+    /// Why the last attempt failed, until an attempt succeeds.
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Publishing { error, .. } => error.as_deref(),
+            Self::Failed { error, .. } => Some(error),
+            Self::Idle | Self::Published(_) => None,
         }
     }
 }
@@ -112,7 +123,8 @@ impl Publisher {
                     });
                 }
                 (Some(value), _) => {
-                    state.send_replace(Publish::Publishing { previous });
+                    let error = state.borrow().error().map(str::to_owned);
+                    state.send_replace(Publish::Publishing { previous, error });
                     match self.publish(value).await {
                         Ok(()) => {
                             tracing::info!("published TXT {} = \"{value}\"", self.record);

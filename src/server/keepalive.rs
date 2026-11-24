@@ -97,7 +97,7 @@ fn shuffle(items: &mut [SocketAddrV4]) {
 
 /// Ask the next STUN server for the mapping of the shared socket every
 /// `interval_secs`, starting now. A new address goes to `mapping`, and every
-/// answer or miss to `health`, whose run of misses starts at zero.
+/// answer or miss to `health`.
 pub async fn run(
     mut stun: StunPort,
     iface: &str,
@@ -105,7 +105,6 @@ pub async fn run(
     mapping: &watch::Sender<Option<Mapping>>,
     health: &watch::Sender<Health>,
 ) -> Infallible {
-    health.send_modify(|health| health.misses = 0);
     let mut targets = Targets::default();
     let mut resolved_at: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(config.interval_secs.get()));

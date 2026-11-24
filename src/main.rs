@@ -4,7 +4,8 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use clap::{Args, Parser, Subcommand};
-use natwg::config::{Config, ServerConfig};
+use natwg::config::Config;
+use natwg::server::{self, cloudflare};
 use natwg::status::{self, Status};
 use natwg::tunnel::Tunnel;
 use natwg::wire::dns::{self, Record, RecordKind};
@@ -181,7 +182,6 @@ struct Uplink {
 }
 
 const DNS_PORT: u16 = 53;
-const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn millis(text: &str) -> std::result::Result<Duration, std::num::ParseIntError> {
     text.parse().map(Duration::from_millis)
@@ -302,20 +302,19 @@ fn server(config: &Path) -> Result<()> {
         ));
     }
     let config = Config::load(config)?;
-    runtime(tokio::runtime::Builder::new_multi_thread())?.block_on(serve(&config))
-}
-
-async fn serve(config: &Config) -> Result<()> {
-    let server = config.server()?;
-    let mut stop = Stop::listen()?;
-    let (mut tunnel, mut stun) = Tunnel::start(config).await?;
-    say!("tun {}", tunnel.tun_name());
-    let served = tokio::select! {
-        failure = until_failure(&mut tunnel, &mut stun, server) => Err(failure),
-        () = stop.requested() => Ok(()),
-    };
-    let stopped = tunnel.stop().await;
-    served.and(stopped)
+    // A write error must not panic, because the server outlives the reader
+    // of its output.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .log_internal_errors(false)
+        .init();
+    runtime(tokio::runtime::Builder::new_multi_thread())?.block_on(async {
+        let mut stop = Stop::listen()?;
+        let stop = async move { stop.requested().await };
+        server::run(&config, cloudflare::API, Tunnel::start, stop).await
+    })
 }
 
 /// The signals that stop the server. SIGHUP is one of them, because a
@@ -345,44 +344,6 @@ impl Stop {
             _ = self.hangup.recv() => {}
         }
     }
-}
-
-/// Print the public mapping of the server's socket, then wait for the device
-/// to fail. A server that learns no mapping keeps its tunnel up.
-async fn until_failure(tunnel: &mut Tunnel, stun: &mut StunPort, server: &ServerConfig) -> Error {
-    match public_mapping(stun, server).await {
-        Ok(mapping) => say!("mapping {mapping}"),
-        Err(error) => warn!("{error}"),
-    }
-    tunnel.failed().await;
-    Error::new(
-        "TUNNEL_FAILED",
-        "the WireGuard device stopped, because its TUN or its UDP socket failed",
-    )
-}
-
-/// Ask the configured STUN servers, then the built-in ones.
-async fn public_mapping(stun: &mut StunPort, server: &ServerConfig) -> Result<SocketAddrV4> {
-    let iface = BoundInterface::lookup(&server.iface)?;
-    let dns = server.stun.dns_server;
-    let mut servers = Vec::new();
-    for entry in &server.stun.servers {
-        match stun::host_port(entry) {
-            Ok(server) => servers.push(server),
-            Err(error) => warn!("STUN_SERVER_INVALID: {entry:?}: {error}"),
-        }
-    }
-    let fallbacks = server.stun.fallback.clone();
-    let configured = first_mapping(stun, &iface, dns, STUN_TIMEOUT, servers, fallbacks).await;
-    let (mapping, _) = match configured {
-        Ok(found) => found,
-        Err(error) => {
-            warn!("{error}; trying the built-in STUN servers");
-            let (servers, fallbacks) = built_in_stun();
-            first_mapping(stun, &iface, dns, STUN_TIMEOUT, servers, fallbacks).await?
-        }
-    };
-    Ok(mapping)
 }
 
 fn built_in_stun() -> (Vec<(String, u16)>, Vec<SocketAddrV4>) {
