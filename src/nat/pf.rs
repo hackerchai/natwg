@@ -2,9 +2,9 @@
 //! The main ruleset that ships with macOS evaluates every `com.apple/*`
 //! anchor, so natwg never changes the main ruleset.
 
+use super::{Rule, printed};
 use crate::config::Instance;
 use crate::netcfg::Step;
-use ipnetwork::Ipv4Network;
 
 #[cfg(target_os = "macos")]
 use crate::{Error, Result, netcfg::run};
@@ -13,12 +13,10 @@ pub fn anchor(instance: &Instance) -> String {
     format!("com.apple/{instance}")
 }
 
-/// Load the rule that sends tunnel traffic for `lan` out of `iface` with the
-/// address of `iface`, then turn IP forwarding on.
-pub fn up(instance: &Instance, iface: &str, tunnel: Ipv4Network, lan: Ipv4Network) -> Vec<Step> {
-    let rule = format!("nat on {iface} inet from {tunnel} to {lan} -> ({iface})\n");
+/// Load the rule into the anchor of its instance, then turn IP forwarding on.
+pub fn up(rule: &Rule) -> Vec<Step> {
     vec![
-        Step::new(&["pfctl", "-a", &anchor(instance), "-f", "-"]).stdin(rule),
+        Step::new(&["pfctl", "-a", &anchor(&rule.instance), "-f", "-"]).stdin(text(rule)),
         Step::new(&["sysctl", "-w", "net.inet.ip.forwarding=1"])
             .done_when(&["sysctl", "-n", "net.inet.ip.forwarding"], "1"),
     ]
@@ -26,6 +24,32 @@ pub fn up(instance: &Instance, iface: &str, tunnel: Ipv4Network, lan: Ipv4Networ
 
 pub fn down(instance: &Instance) -> Vec<Step> {
     vec![Step::new(&["pfctl", "-a", &anchor(instance), "-F", "all"])]
+}
+
+fn text(rule: &Rule) -> String {
+    let Rule {
+        iface, tunnel, lan, ..
+    } = rule;
+    let (tunnel, lan) = (printed(*tunnel), printed(*lan));
+    format!("nat on {iface} inet from {tunnel} to {lan} -> ({iface})\n")
+}
+
+/// The first rule in what `pfctl -s nat` or `pfctl -s rules` prints for an
+/// anchor that is not the rule [`up`] loads.
+pub fn foreign<'a>(listing: &'a str, rule: &Rule) -> Option<&'a str> {
+    let own = text(rule);
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| !words(line).eq(words(&own)))
+}
+
+// pfctl prints `inet` whether or not the loaded rule had it, and it prints
+// the `round-robin` that the rule left to the default.
+fn words(rule: &str) -> impl Iterator<Item = &str> {
+    rule.split_whitespace()
+        .filter(|word| !matches!(*word, "inet" | "round-robin"))
 }
 
 /// The enable reference that `pfctl -E` prints as `Token : 123`.
