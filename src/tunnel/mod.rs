@@ -13,10 +13,11 @@ use channel::{ChannelRecv, ChannelSend};
 use gotatun::device::{Device, DeviceBuilder, DeviceTransports, Peer};
 use gotatun::packet::{Ip, Packet};
 use gotatun::tun::tun_async_device::TunDevice;
-use gotatun::tun::{IpRecv, IpSend};
+use gotatun::tun::{IpRecv, IpSend, tun};
 use gotatun::x25519;
 use ipnetwork::{IpNetwork, Ipv4Network};
 use std::net::{SocketAddr, SocketAddrV4};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -57,13 +58,11 @@ impl Tunnel {
         // macOS needs no such check. The route step of its plan fails with
         // COMMAND_NO_EFFECT for a subnet that has a route.
         #[cfg(not(target_os = "macos"))]
-        netcfg::linux::require_free_route(requested_tun(&server.instance), subnet)?;
+        netcfg::linux::require_free_route(server.instance.as_str(), subnet)?;
         let peers = server_peers(config, server)?;
         let iface = BoundInterface::lookup(&server.iface)?;
-        let unavailable =
-            |e: gotatun::tun::tun_async_device::Error| Error::new("TUN_UNAVAILABLE", e.to_string());
-        let tun = TunDevice::from_name(requested_tun(&server.instance)).map_err(unavailable)?;
-        let tun_name = tun.name().map_err(unavailable)?;
+        let tun = open_tun(&server.instance)?;
+        let tun_name = tun.name().map_err(tun_unavailable)?;
         let (device, stun) = device(
             &config.private_key,
             iface,
@@ -253,15 +252,37 @@ fn stopped() -> Error {
     Error::new("TUNNEL_STOPPED", "the WireGuard device stopped")
 }
 
-// gotatun opens a kernel-chosen utun for the name "utun".
+/// The TUN of `instance`, opened as gotatun's `TunDevice::from_name` opens
+/// it. The tun crate opens the macOS utun control socket without
+/// FD_CLOEXEC, so every command natwg runs would inherit the socket and could
+/// keep the utun alive after natwg exits.
+fn open_tun(instance: &Instance) -> Result<TunDevice> {
+    let tun = tun::create_as_async(&tun_config(instance)).map_err(tun_unavailable)?;
+    if unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(tun_unavailable(std::io::Error::last_os_error()));
+    }
+    TunDevice::from_tun_device(tun).map_err(tun_unavailable)
+}
+
+// macOS names a utun itself.
 #[cfg(target_os = "macos")]
-fn requested_tun(_: &Instance) -> &str {
-    "utun"
+fn tun_config(_: &Instance) -> tun::Configuration {
+    let mut config = tun::Configuration::default();
+    config.platform_config(|platform| {
+        platform.enable_routing(false);
+    });
+    config
 }
 
 #[cfg(not(target_os = "macos"))]
-fn requested_tun(instance: &Instance) -> &str {
-    instance.as_str()
+fn tun_config(instance: &Instance) -> tun::Configuration {
+    let mut config = tun::Configuration::default();
+    config.tun_name(instance.as_str());
+    config
+}
+
+fn tun_unavailable(error: impl std::fmt::Display) -> Error {
+    Error::new("TUN_UNAVAILABLE", error.to_string())
 }
 
 /// Every configured peer, and the doctor as a peer that owns only its
