@@ -30,6 +30,11 @@ impl Key {
     pub fn to_base64(&self) -> String {
         STANDARD.encode(self.0)
     }
+
+    /// The secret itself, as the 32 bytes a WireGuard device takes.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
 }
 
 impl FromStr for Key {
@@ -66,6 +71,12 @@ impl fmt::Debug for Key {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PublicKey([u8; 32]);
+
+impl PublicKey {
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+}
 
 impl FromStr for PublicKey {
     type Err = &'static str;
