@@ -240,7 +240,7 @@ impl Config {
                 ),
             ));
         }
-        if has_acl(&file).map_err(unreadable)? {
+        if acl::present(&file).map_err(unreadable)? {
             return Err(Error::new(
                 "CONFIG_UNSAFE",
                 format!(
@@ -406,38 +406,102 @@ fn is_iface_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Whether the file carries an extended ACL. A macOS ACL entry can grant
-/// access that the mode bits do not show.
+/// Make `dir` a directory that only the effective user can use: create it
+/// if it is missing, then set mode 0700 and remove its ACL, whose
+/// inheritable entries a config written into it would get.
+pub fn make_private_dir(dir: &Path) -> Result<()> {
+    let storage =
+        |e: std::io::Error| Error::new("CONFIG_STORAGE", format!("{}: {e}", dir.display()));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(storage)?;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .map_err(storage)?;
+    let owner = handle.metadata().map_err(storage)?.uid();
+    let euid = unsafe { libc::geteuid() };
+    if owner != euid {
+        return Err(Error::new(
+            "CONFIG_UNSAFE",
+            format!(
+                "{}: owner uid {owner}; natwg keeps a config only in a directory owned by uid {euid}",
+                dir.display()
+            ),
+        ));
+    }
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(storage)?;
+    acl::remove(&handle).map_err(storage)
+}
+
+/// The extended ACL of a file. A macOS ACL entry can grant access that the
+/// mode bits do not show.
 #[cfg(target_os = "macos")]
-fn has_acl(file: &std::fs::File) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    use std::os::raw::{c_int, c_void};
+mod acl {
+    use std::{
+        fs::File,
+        io,
+        os::fd::AsRawFd,
+        os::raw::{c_int, c_void},
+    };
+
     const ACL_TYPE_EXTENDED: c_int = 0x100;
     const ACL_FIRST_ENTRY: c_int = 0;
+
     unsafe extern "C" {
+        fn acl_init(count: c_int) -> *mut c_void;
         fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: c_int, acl: *mut c_void, kind: c_int) -> c_int;
         fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
         fn acl_free(object: *mut c_void) -> c_int;
     }
-    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = std::io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ENOENT) => Ok(false),
-            _ => Err(error),
-        };
+
+    pub fn present(file: &File) -> io::Result<bool> {
+        let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(false),
+                _ => Err(error),
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        let found = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
+        unsafe { acl_free(acl) };
+        Ok(found)
     }
-    let mut entry = std::ptr::null_mut();
-    let found = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
-    unsafe { acl_free(acl) };
-    Ok(found)
+
+    pub fn remove(file: &File) -> io::Result<()> {
+        let empty = unsafe { acl_init(0) };
+        if empty.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let set = unsafe { acl_set_fd_np(file.as_raw_fd(), empty, ACL_TYPE_EXTENDED) };
+        let error = io::Error::last_os_error();
+        unsafe { acl_free(empty) };
+        if set == 0 { Ok(()) } else { Err(error) }
+    }
 }
 
 /// A Linux ACL entry takes effect only through the ACL mask, and the mode
-/// shows the mask as the group bits, so the mode check already covers it.
+/// shows the mask as the group bits, so the mode check and the chmod to
+/// 0700 already cover it.
 #[cfg(not(target_os = "macos"))]
-fn has_acl(_: &std::fs::File) -> std::io::Result<bool> {
-    Ok(false)
+mod acl {
+    use std::{fs::File, io};
+
+    pub fn present(_: &File) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    pub fn remove(_: &File) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn default_mtu() -> u16 {

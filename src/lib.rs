@@ -5,6 +5,7 @@ pub mod legacy;
 pub mod nat;
 pub mod netcfg;
 pub mod server;
+pub mod service;
 pub mod status;
 pub mod tunnel;
 pub mod wire;
