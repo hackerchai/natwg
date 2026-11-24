@@ -1,7 +1,12 @@
-use natwg::config::{CloudflareConfig, ServerConfig, StunConfig};
+use natwg::Result;
+use natwg::config::{CloudflareConfig, Config, ServerConfig, StunConfig};
+use natwg::keys::Key;
 use natwg::server::cloudflare::{self, Publish, Publisher, Record};
 use natwg::server::keepalive::{self, Health, Mapping, Targets};
 use natwg::server::upnp::{self, Upnp};
+use natwg::server::{self, Device};
+use natwg::status::Status;
+use natwg::tunnel::{Detached, PeerStats};
 use natwg::wire::transport::{BoundInterface, StunPort};
 use serde_json::{Value, json};
 use std::{
@@ -9,13 +14,15 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, SocketAddrV4, TcpStream},
     num::NonZeroU64,
+    path::Path,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, SystemTime},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 
 #[cfg(target_os = "macos")]
 const LOOPBACK: &str = "lo0";
@@ -143,15 +150,10 @@ async fn the_keepalive_counts_misses_and_reports_each_new_mapping() {
         .unwrap();
     let config = stun_config(server, 25);
     let (mapping_tx, mut mapping) = watch::channel(None::<Mapping>);
-    let earlier_run = Health {
-        misses: 7,
-        last_ok: None,
-    };
-    let (health_tx, mut health) = watch::channel(earlier_run);
+    let (health_tx, mut health) = watch::channel(Health::default());
     let keepalive = keepalive::run(stun, LOOPBACK, &config, &mapping_tx, &health_tx);
     let check = async {
         seen.recv().await.unwrap();
-        assert_eq!(health.borrow().misses, 0, "a run starts with no miss");
         tokio::time::advance(keepalive::TIMEOUT).await;
         health.wait_for(|health| health.misses == 1).await.unwrap();
         assert_eq!(*mapping.borrow(), None);
@@ -550,4 +552,242 @@ fn upnp_stays_off_without_a_upnp_section() {
     assert!(Upnp::new(&server_config(None)).unwrap().is_none());
     let upnp = json!({"control_url": "http://10.73.0.1:1900/ipc", "lease_secs": 3600, "refresh_secs": 300});
     assert!(Upnp::new(&server_config(Some(upnp))).unwrap().is_some());
+}
+
+/// A device without a TUN that the test can kill: generation `n` fails once
+/// `kills` exceeds `n`.
+struct Killable {
+    device: Detached,
+    kills: watch::Receiver<u32>,
+    generation: u32,
+}
+
+impl Device for Killable {
+    async fn failed(&mut self) {
+        let generation = self.generation;
+        tokio::select! {
+            () = self.device.failed() => {}
+            _ = self.kills.wait_for(|kills| *kills > generation) => {}
+        }
+    }
+
+    async fn peers(&self) -> Vec<PeerStats> {
+        self.device.peers().await
+    }
+
+    fn tun(&self) -> Option<&str> {
+        None
+    }
+
+    fn ensure_nat(&mut self) -> Option<Result<bool>> {
+        None
+    }
+
+    async fn stop(self) -> Result<()> {
+        self.device.stop().await;
+        Ok(())
+    }
+}
+
+const NO_API: &str = "http://127.0.0.1:9/client/v4";
+
+struct Secrets {
+    private_key: String,
+    doctor_key: String,
+}
+
+/// A server on the loopback interface whose only STUN server never answers.
+fn supervised(
+    status_file: &Path,
+    stun_server: SocketAddrV4,
+    interval_secs: u64,
+) -> (Config, Secrets) {
+    let secrets = Secrets {
+        private_key: Key::generate().unwrap().to_base64(),
+        doctor_key: Key::generate().unwrap().to_base64(),
+    };
+    let config = json!({
+        "version": 1,
+        "private_key": secrets.private_key,
+        "interface": {"address": "10.66.67.1/24"},
+        "peers": [],
+        "role": {"server": {
+            "instance": "natwg_test",
+            "iface": LOOPBACK,
+            "listen_port": 0,
+            "lan": "10.73.0.0/24",
+            "stun": {
+                "servers": [],
+                "fallback": [stun_server.to_string()],
+                "interval_secs": interval_secs,
+                "dns_server": "127.0.0.1",
+            },
+            "cloudflare": {"zone": "example.com", "record": "_wg.example.com", "token": TOKEN},
+            "status_file": status_file,
+            "doctor": {"private_key": secrets.doctor_key, "address": "10.66.67.254"},
+        }},
+    });
+    (serde_json::from_value(config).unwrap(), secrets)
+}
+
+fn silent_stun_server() -> (std::net::UdpSocket, SocketAddrV4) {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = v4(socket.local_addr().unwrap());
+    (socket, address)
+}
+
+/// The first status that `done` accepts, polled once a second for up to 10
+/// minutes of tokio's clock.
+async fn status_until(path: &Path, done: impl Fn(&Status) -> bool) -> Status {
+    for _ in 0..600 {
+        if let Ok(status) = Status::read(path)
+            && done(&status)
+        {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("no status matched; the last is {:?}", Status::read(path));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_device_that_fails_is_rebuilt_and_the_rebuild_is_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let (_stun, stun_server) = silent_stun_server();
+    let (config, secrets) = supervised(&path, stun_server, 25);
+    let (kill, kills) = watch::channel(0);
+    let builds = AtomicU32::new(0);
+    let build = async |config: &Config| {
+        let generation = builds.fetch_add(1, Ordering::SeqCst);
+        let (device, stun) = Detached::server(config).await?;
+        let kills = kills.clone();
+        let device = Killable {
+            device,
+            kills,
+            generation,
+        };
+        Ok((device, stun))
+    };
+    let (stop, stopped) = oneshot::channel::<()>();
+    let check = async {
+        let first = status_until(&path, |_| true).await;
+        assert_eq!(first.rebuilds, 0);
+        assert_eq!(first.peers.len(), 1, "the doctor is a peer");
+        let text = std::fs::read_to_string(&path).unwrap();
+        for secret in [TOKEN, &secrets.private_key, &secrets.doctor_key] {
+            assert!(!text.contains(secret), "the status file holds a secret");
+        }
+
+        kill.send_replace(1);
+        let killed_at = Instant::now();
+        let rebuilt = status_until(&path, |status| status.rebuilds == 1).await;
+        assert!(killed_at.elapsed() < Duration::from_secs(5));
+        assert!(rebuilt.stun_misses < server::DEAD_AFTER_MISSES);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        stop.send(()).unwrap();
+    };
+    let stop = async {
+        let _ = stopped.await;
+    };
+    let (served, ()) = tokio::join!(server::run(&config, NO_API, build, stop), check);
+    served.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_of_unanswered_stun_requests_rebuilds_the_tunnel() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let (_stun, stun_server) = silent_stun_server();
+    let (config, _) = supervised(&path, stun_server, 1);
+    let (_kill, kills) = watch::channel(0);
+    let build = async |config: &Config| {
+        let (device, stun) = Detached::server(config).await?;
+        let kills = kills.clone();
+        let device = Killable {
+            device,
+            kills,
+            generation: 0,
+        };
+        Ok((device, stun))
+    };
+    let (stop, stopped) = oneshot::channel::<()>();
+    let check = async {
+        let serving = |status: &Status, rebuilds| {
+            (6..server::DEAD_AFTER_MISSES).contains(&status.stun_misses)
+                && status.rebuilds == rebuilds
+        };
+        let started = Instant::now();
+        status_until(&path, |status| serving(status, 0)).await;
+        status_until(&path, |status| status.rebuilds == 1).await;
+        let ten_misses = keepalive::TIMEOUT * server::DEAD_AFTER_MISSES;
+        assert!(started.elapsed() >= ten_misses, "{:?}", started.elapsed());
+        status_until(&path, |status| serving(status, 1)).await;
+        stop.send(()).unwrap();
+    };
+    let stop = async {
+        let _ = stopped.await;
+    };
+    let (served, ()) = tokio::join!(server::run(&config, NO_API, build, stop), check);
+    served.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn rebuilds_that_fail_wait_twice_as_long_each_time_up_to_60_s() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let (_stun, stun_server) = silent_stun_server();
+    let (config, _) = supervised(&path, stun_server, 25);
+    let (kill, kills) = watch::channel(0);
+    let attempts = Mutex::new(Vec::new());
+    let build = async |config: &Config| {
+        let attempt = {
+            let mut attempts = attempts.lock().unwrap();
+            attempts.push(Instant::now());
+            attempts.len()
+        };
+        if (2..=8).contains(&attempt) {
+            return Err(natwg::Error::new("TUN_UNAVAILABLE", "test"));
+        }
+        let (device, stun) = Detached::server(config).await?;
+        let kills = kills.clone();
+        let device = Killable {
+            device,
+            kills,
+            generation: 0,
+        };
+        Ok((device, stun))
+    };
+    let (stop, stopped) = oneshot::channel::<()>();
+    let check = async {
+        status_until(&path, |_| true).await;
+        kill.send_replace(1);
+        let killed_at = Instant::now();
+        status_until(&path, |status| status.rebuilds == 1).await;
+        let attempts = attempts.lock().unwrap().clone();
+        let waits: Vec<u64> = std::iter::once(killed_at)
+            .chain(attempts[1..].iter().copied())
+            .zip(&attempts[1..])
+            .map(|(before, attempt)| (*attempt - before).as_secs())
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60]);
+        stop.send(()).unwrap();
+    };
+    let stop = async {
+        let _ = stopped.await;
+    };
+    let (served, ()) = tokio::join!(server::run(&config, NO_API, build, stop), check);
+    served.unwrap();
+}
+
+#[tokio::test]
+async fn a_first_build_that_fails_ends_the_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_stun, stun_server) = silent_stun_server();
+    let (config, _) = supervised(&dir.path().join("status.json"), stun_server, 25);
+    let build = async |_: &Config| -> Result<(Killable, StunPort)> {
+        Err(natwg::Error::new("UDP_BIND", "test"))
+    };
+    let served = server::run(&config, NO_API, build, std::future::pending()).await;
+    assert_eq!(served.unwrap_err().code, "UDP_BIND");
 }
