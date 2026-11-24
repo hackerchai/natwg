@@ -215,16 +215,36 @@ fn service_commands_that_change_the_host_need_root() {
     if is_root() {
         return;
     }
-    for action in ["install", "uninstall", "restart"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_natwg"))
-            .args(["service", action, "--config", "/nonexistent/config.json"])
-            .env_remove("NATWG_CONFIG")
-            .output()
-            .unwrap();
-        assert!(!output.status.success(), "{action}");
+    for action in [
+        &["install"][..],
+        &["uninstall"],
+        &["uninstall", "--instance", "natwg_gone"],
+        &["restart"],
+    ] {
+        let output = natwg_service(action);
+        assert!(!output.status.success(), "{action:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.starts_with("NOT_ROOT: "), "{action}: {stderr}");
+        assert!(stderr.starts_with("NOT_ROOT: "), "{action:?}: {stderr}");
     }
+}
+
+fn natwg_service(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_natwg"))
+        .args(["--config", "/nonexistent/config.json", "service"])
+        .args(args)
+        .env_remove("NATWG_CONFIG")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn uninstall_by_instance_takes_a_valid_name_and_never_purges() {
+    let output = natwg_service(&["uninstall", "--instance", "Natwg-1"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("expected an instance name"), "{stderr}");
+    let output = natwg_service(&["uninstall", "--instance", "natwg_gone", "--purge"]);
+    assert_eq!(output.status.code(), Some(2), "--purge needs the config");
 }
 
 fn is_root() -> bool {

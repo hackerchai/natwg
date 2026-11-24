@@ -4,7 +4,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use clap::{Args, Parser, Subcommand};
-use natwg::config::Config;
+use natwg::config::{Config, Instance};
 use natwg::server::{self, cloudflare};
 use natwg::status::{self, Status};
 use natwg::tunnel::Tunnel;
@@ -107,7 +107,7 @@ enum ServiceAction {
     /// runs that copy. A part that is in place already stays, so a second
     /// run with nothing changed keeps the running server.
     Install,
-    /// Stop the service of --config and remove it.
+    /// Stop the service of --config, or of --instance, and remove it.
     ///
     /// The definition and the status file go. The binary and the config
     /// stay unless --purge is given.
@@ -116,6 +116,10 @@ enum ServiceAction {
         /// binary.
         #[arg(long)]
         purge: bool,
+        /// Remove the service of this instance without reading --config, as
+        /// when the config is broken or gone. Its status file stays.
+        #[arg(long, value_name = "NAME", conflicts_with = "purge")]
+        instance: Option<Instance>,
     },
     /// Restart the service of --config, which then reads the config again.
     Restart,
@@ -303,7 +307,14 @@ fn run(cli: Cli) -> Result<()> {
 fn service_action(config: &Path, action: ServiceAction) -> Result<()> {
     let report = match action {
         ServiceAction::Install => service::install(config)?,
-        ServiceAction::Uninstall { purge } => service::uninstall(config, purge)?,
+        ServiceAction::Uninstall {
+            instance: Some(instance),
+            ..
+        } => service::uninstall_instance(&instance)?,
+        ServiceAction::Uninstall {
+            purge,
+            instance: None,
+        } => service::uninstall(config, purge)?,
         ServiceAction::Restart => service::restart(config)?,
         ServiceAction::Status => {
             let services = service::status()?;
