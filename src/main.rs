@@ -4,10 +4,11 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use clap::{Args, Parser, Subcommand};
-use natwg::config::{Config, Instance};
+use natwg::client::{self, uplink};
+use natwg::config::{Config, Instance, Role};
 use natwg::server::{self, cloudflare};
-use natwg::status::{self, Status};
-use natwg::tunnel::Tunnel;
+use natwg::status::{self, Report, Status};
+use natwg::tunnel::{self, Tunnel};
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
@@ -72,19 +73,31 @@ enum Action {
         #[arg(long, required = true)]
         foreground: bool,
     },
-    /// Show what the running server reported last. Needs no root.
+    /// Run the WireGuard client: the tunnel to the server with a route for
+    /// each of its allowed IPs, the TXT lookup that follows the server's
+    /// endpoint, and the status file.
+    Client {
+        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP.
+        #[arg(long, required = true)]
+        foreground: bool,
+    },
+    /// Show what the running server or client reported last. Needs no root.
     ///
-    /// natwg exits 1 when the status is older than 60 s, or shows no tunnel,
-    /// no public mapping, a failed TXT publish, or failed NAT or UPnP.
+    /// natwg exits 1 when the status is older than 60 s or shows a problem:
+    /// for a server no tunnel, no public mapping, a failed TXT publish, or
+    /// failed NAT or UPnP; for a client no tunnel, no endpoint, a failed TXT
+    /// lookup, or no handshake within 180 s.
     Status {
         /// Print the status file as JSON.
         #[arg(long)]
         json: bool,
-        /// The status file of the server. A server of another instance than
-        /// natwg writes <instance>.status.json beside the default, and a
-        /// config can name its own in role.server.status_file.
-        #[arg(long, value_name = "PATH", default_value = natwg::status::DEFAULT_PATH)]
-        status_file: PathBuf,
+        /// The status file (default: the server's, else the client's when
+        /// only that exists). A server of another instance than natwg writes
+        /// <instance>.status.json beside the default, the client writes
+        /// client.status.json there, and a config can name its own in
+        /// status_file.
+        #[arg(long, value_name = "PATH")]
+        status_file: Option<PathBuf>,
     },
     /// Test a running server from this host.
     Doctor {
@@ -97,7 +110,8 @@ enum Action {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Run the server for a service manager, as `server --foreground` does.
+    /// Run the server or the client of --config for a service manager, as
+    /// `server --foreground` and `client --foreground` do.
     #[command(hide = true)]
     Daemon,
 }
@@ -195,6 +209,9 @@ enum ProbeAction {
     Dns(Lookup),
     /// Print the TXT records of a name, one per line.
     Txt(Lookup),
+    /// Print the uplink natwg client picks: the physical interface of the
+    /// default route that has an IPv4 address, skipping VPN tunnels.
+    Uplink,
 }
 
 #[derive(Args)]
@@ -262,9 +279,11 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
         Action::Probe { action } => probe(action)?,
-        Action::Server { foreground: _ } | Action::Daemon => server(&cli.config)?,
+        Action::Server { foreground: _ } => daemon(&cli.config, Some(Want::Server))?,
+        Action::Client { foreground: _ } => daemon(&cli.config, Some(Want::Client))?,
+        Action::Daemon => daemon(&cli.config, None)?,
         Action::Status { json, status_file } => {
-            let status = Status::read(&status_file)?;
+            let status = Report::read(&status_file.unwrap_or_else(status::default_path))?;
             let now = status::unix(SystemTime::now());
             if json {
                 say!(
@@ -276,7 +295,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let problems = status.problems(now);
             if !problems.is_empty() {
-                return Err(Error::new("SERVER_UNHEALTHY", problems.join(", ")));
+                return Err(Error::new(status.unhealthy(), problems.join(", ")));
             }
         }
         Action::Doctor {
@@ -383,15 +402,35 @@ fn runtime(mut builder: tokio::runtime::Builder) -> Result<tokio::runtime::Runti
         .map_err(|e| Error::new("RUNTIME_UNAVAILABLE", e.to_string()))
 }
 
-fn server(config: &Path) -> Result<()> {
+/// The role a command needs of the config.
+#[derive(Clone, Copy)]
+enum Want {
+    Server,
+    Client,
+}
+
+/// Run the server or the client of `config` until a signal stops it. With
+/// `want`, the config must have that role.
+fn daemon(config: &Path, want: Option<Want>) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        return Err(Error::new(
-            "NOT_ROOT",
-            "natwg server opens a TUN and loads NAT rules; run it as root",
-        ));
+        let what = match want {
+            Some(Want::Server) => "natwg server opens a TUN and loads NAT rules",
+            Some(Want::Client) => "natwg client opens a TUN and adds routes",
+            None => "natwg daemon opens a TUN",
+        };
+        return Err(Error::new("NOT_ROOT", format!("{what}; run it as root")));
     }
     let config = Config::load(config)?;
-    // A write error must not panic, because the server outlives the reader
+    match want {
+        Some(Want::Server) => {
+            config.server()?;
+        }
+        Some(Want::Client) => {
+            config.client()?;
+        }
+        None => {}
+    }
+    // A write error must not panic, because the daemon outlives the reader
     // of its output.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -402,11 +441,20 @@ fn server(config: &Path) -> Result<()> {
     runtime(tokio::runtime::Builder::new_multi_thread())?.block_on(async {
         let mut stop = Stop::listen()?;
         let stop = async move { stop.requested().await };
-        server::run(&config, cloudflare::API, Tunnel::start, stop).await
+        match &config.role {
+            Role::Server(_) => server::run(&config, cloudflare::API, Tunnel::start, stop).await,
+            Role::Client(_) => {
+                let build = async |config: &Config, uplink: &uplink::Uplink, endpoint| {
+                    tunnel::Client::start(config, &uplink.iface, endpoint).await
+                };
+                let options = client::Options::default();
+                client::run(&config, &options, uplink::find, build, stop).await
+            }
+        }
     })
 }
 
-/// The signals that stop the server. SIGHUP is one of them, because a
+/// The signals that stop the server or the client. SIGHUP is one of them, because a
 /// terminal that closes sends it, and its default action ends the process
 /// with the NAT rule still loaded.
 struct Stop {
@@ -451,6 +499,10 @@ fn probe(action: ProbeAction) -> Result<()> {
             } => probe_stun(uplink, port, servers, fallbacks).await,
             ProbeAction::Dns(lookup) => probe_records(lookup, RecordKind::A).await,
             ProbeAction::Txt(lookup) => probe_records(lookup, RecordKind::Txt).await,
+            ProbeAction::Uplink => {
+                say!("{}", uplink::find(None)?);
+                Ok(())
+            }
         }
     })
 }

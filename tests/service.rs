@@ -190,8 +190,12 @@ fn an_open_config_directory_becomes_private_and_passes_no_acl_to_a_new_config() 
     let config: Config = serde_json::from_value(serde_json::json!({
         "version": 1,
         "private_key": natwg::keys::Key::generate().unwrap().to_base64(),
-        "interface": { "address": "10.66.67.1/24" },
-        "peers": [],
+        "interface": { "address": "10.66.67.2/32" },
+        "peers": [{
+            "name": "server",
+            "public_key": natwg::keys::Key::generate().unwrap().public_key(),
+            "allowed_ips": ["10.66.67.0/24"]
+        }],
         "role": { "client": { "record": "_wg.example.com", "resolvers": ["223.5.5.5"] } }
     }))
     .unwrap();

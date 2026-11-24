@@ -129,6 +129,7 @@ fn an_instance_name_must_be_1_to_15_characters_from_a_z_0_9_and_underscore() {
         "natwg/next",
         "natwg\"",
         "a234567890123456",
+        "client",
     ] {
         let mut value = server_json();
         value["role"]["server"]["instance"] = json!(name);
@@ -249,6 +250,75 @@ fn a_client_config_needs_a_valid_address_and_mtu_too() {
     client(|_| {}).unwrap();
     assert!(client(|config| config["interface"]["mtu"] = json!(100)).is_err());
     assert!(client(|config| config["interface"]["address"] = json!("10.0.0.2/8")).is_err());
+}
+
+/// What `Config::validate` says about `client_json` after `change`.
+fn client_validated(change: impl FnOnce(&mut Value)) -> Result<(), String> {
+    let mut value = client_json();
+    change(&mut value);
+    serde_json::from_value::<Config>(value).unwrap().validate()
+}
+
+fn client_refused(needle: &str, change: impl FnOnce(&mut Value)) {
+    let error = client_validated(change).unwrap_err();
+    assert!(error.contains(needle), "expected {needle:?} in {error}");
+}
+
+#[test]
+fn a_client_has_exactly_one_peer_the_server() {
+    client_refused("exactly one peer", |config| config["peers"] = json!([]));
+    client_refused("exactly one peer", |config| {
+        let server = config["peers"][0].clone();
+        config["peers"] = json!([server.clone(), server]);
+    });
+    client_refused("peers[0].allowed_ips is empty", |config| {
+        config["peers"][0]["allowed_ips"] = json!([]);
+    });
+    client_refused("default route", |config| {
+        config["peers"][0]["allowed_ips"] = json!(["10.66.66.0/24", "0.0.0.0/0"]);
+    });
+}
+
+#[test]
+fn a_client_finds_the_server_by_its_record_or_at_its_endpoint() {
+    client_refused("role.client.record or peers[0].endpoint", |config| {
+        config["role"]["client"] = json!({});
+    });
+    client_validated(|config| {
+        config["role"]["client"] = json!({});
+        config["peers"][0]["endpoint"] = json!("192.0.2.7:51830");
+    })
+    .unwrap();
+    client_validated(|config| config["role"]["client"] = json!({ "record": "_wg.example.com" }))
+        .unwrap();
+    for record in ["", "a..b", "white space.example.com\n"] {
+        client_refused("role.client.record", |config| {
+            config["role"]["client"]["record"] = json!(record);
+        });
+    }
+}
+
+#[test]
+fn a_client_uplink_must_be_a_plain_interface_name() {
+    client_validated(|config| config["role"]["client"]["iface"] = json!("en0")).unwrap();
+    for name in ["", "en 0", "en0;", "a234567890123456"] {
+        client_refused("role.client.iface", |config| {
+            config["role"]["client"]["iface"] = json!(name);
+        });
+    }
+}
+
+#[test]
+fn a_client_config_rejects_unknown_fields_and_the_server_fields() {
+    for (key, value) in [
+        ("listen_port", json!(51830)),
+        ("instance", json!("natwg")),
+        ("endpoint", json!("192.0.2.7:51830")),
+    ] {
+        let mut config = client_json();
+        config["role"]["client"][key] = value;
+        assert_eq!(load_value(&config).unwrap_err().code, "CONFIG_INVALID");
+    }
 }
 
 #[test]

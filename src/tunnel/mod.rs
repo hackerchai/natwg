@@ -3,13 +3,14 @@
 
 mod channel;
 
-use crate::config::{Config, DoctorConfig, Instance, PeerConfig, ServerConfig};
+use crate::config::{Config, DoctorConfig, PeerConfig, ServerConfig};
 use crate::keys::{Key, PublicKey};
 use crate::nat::{Nat, Rule};
 use crate::netcfg;
 use crate::wire::transport::{BoundInterface, BoundUdp, StunPort};
 use crate::{Error, Result};
 use channel::{ChannelRecv, ChannelSend};
+use gotatun::device::configure::PeerMut;
 use gotatun::device::{Device, DeviceBuilder, DeviceTransports, Peer};
 use gotatun::packet::{Ip, Packet};
 use gotatun::tun::tun_async_device::TunDevice;
@@ -67,7 +68,7 @@ impl Tunnel {
         netcfg::linux::require_free_route(server.instance.as_str(), subnet)?;
         let peers = server_peers(config, server)?;
         let iface = BoundInterface::lookup(&server.iface)?;
-        let tun = open_tun(&server.instance)?;
+        let tun = open_tun(&tun_config(server.instance.as_str()))?;
         let tun_name = tun.name().map_err(tun_unavailable)?;
         let (device, stun) = device(
             &config.private_key,
@@ -133,6 +134,107 @@ impl Tunnel {
     }
 }
 
+/// The client's WireGuard device on a kernel TUN. Its one peer is the server,
+/// and the TUN has a route for each of the server's allowed IPs. Its UDP
+/// socket and port are its own, on the uplink it was started with.
+pub struct Client {
+    device: Device<(BoundUdp, TunDevice, TunDevice)>,
+    tun_name: String,
+    server: x25519::PublicKey,
+    handshakes: Handshakes,
+}
+
+/// The name of the client's TUN on Linux. No server takes it, because an
+/// instance name has no `-`.
+#[cfg(not(target_os = "macos"))]
+const CLIENT_TUN: &str = "natwg-client";
+#[cfg(target_os = "macos")]
+const CLIENT_TUN: &str = "";
+
+impl Client {
+    /// Start the client that `config` describes on `uplink`, pointed at
+    /// `endpoint`. The checks that can refuse the start run before anything
+    /// on the host changes. The kernel removes the address and the routes
+    /// with the TUN, when the client stops or exits.
+    pub async fn start(
+        config: &Config,
+        uplink: &BoundInterface,
+        endpoint: Option<SocketAddrV4>,
+    ) -> Result<Self> {
+        let (_, server) = config.client()?;
+        let routes: Vec<Ipv4Network> = server.allowed_ips.iter().copied().map(subnet).collect();
+        netcfg::require_free_address(config.interface.address.ip())?;
+        #[cfg(target_os = "macos")]
+        netcfg::macos::require_free_routes(&routes)?;
+        #[cfg(not(target_os = "macos"))]
+        for route in &routes {
+            netcfg::linux::require_free_route(CLIENT_TUN, *route)?;
+        }
+        let tun = open_tun(&tun_config(CLIENT_TUN))?;
+        let tun_name = tun.name().map_err(tun_unavailable)?;
+        let peer = client_peer(server, endpoint);
+        let (device, _) = device(
+            &config.private_key,
+            uplink.clone(),
+            0,
+            vec![peer],
+            tun.clone(),
+            tun,
+        )
+        .await?;
+        let plan = netcfg::plan(
+            &tun_name,
+            config.interface.address,
+            config.interface.mtu,
+            &routes,
+        );
+        if let Err(error) = netcfg::apply(&plan) {
+            device.stop().await;
+            return Err(error);
+        }
+        Ok(Self {
+            device,
+            tun_name,
+            server: public(server.public_key),
+            handshakes: Handshakes::default(),
+        })
+    }
+
+    /// The name of the TUN, which the kernel chooses on macOS.
+    pub fn tun_name(&self) -> &str {
+        &self.tun_name
+    }
+
+    /// Wait until the device can carry no more traffic, which happens when
+    /// its TUN or its UDP socket fails.
+    pub async fn failed(&mut self) {
+        self.device.wait().await;
+    }
+
+    /// What the device knows about the server.
+    pub async fn server(&self) -> Option<PeerStats> {
+        peer_stats(&self.device, &self.handshakes).await.pop()
+    }
+
+    /// Send the server's traffic to `endpoint` from now on, with a fresh
+    /// handshake.
+    pub async fn point(&self, endpoint: SocketAddrV4) -> Result<()> {
+        point(&self.device, &self.server, endpoint).await
+    }
+
+    /// Bind the UDP socket again on the same interface and port, and start
+    /// a fresh handshake, as after the uplink's address changed.
+    pub async fn rebind(&self) -> Result<()> {
+        rebind(&self.device).await
+    }
+
+    /// Stop the device. The TUN closes with it, and the kernel then removes
+    /// its address and its routes.
+    pub async fn stop(self) {
+        self.device.stop().await;
+    }
+}
+
 /// A WireGuard device with no TUN. The caller writes the IP packets that go
 /// into the tunnel and reads the ones that come out of it.
 pub struct Detached {
@@ -183,6 +285,20 @@ impl Detached {
         Ok(client)
     }
 
+    /// The device of [`Client::start`] without its TUN and its routes, on a
+    /// free port of `iface`.
+    pub async fn client(
+        config: &Config,
+        iface: BoundInterface,
+        endpoint: Option<SocketAddrV4>,
+    ) -> Result<Self> {
+        let (_, server) = config.client()?;
+        let peer = client_peer(server, endpoint);
+        let (key, mtu) = (&config.private_key, config.interface.mtu);
+        let (client, _) = Self::start(key, iface, 0, vec![peer], mtu).await?;
+        Ok(client)
+    }
+
     async fn start(
         key: &Key,
         iface: BoundInterface,
@@ -219,6 +335,17 @@ impl Detached {
 
     pub async fn stop(self) {
         self.device.stop().await;
+    }
+
+    /// Send the traffic of the peer `key` to `endpoint` from now on, with a
+    /// fresh handshake.
+    pub async fn point(&self, key: PublicKey, endpoint: SocketAddrV4) -> Result<()> {
+        point(&self.device, &public(key), endpoint).await
+    }
+
+    /// Bind the UDP socket again and start a fresh handshake with every peer.
+    pub async fn rebind(&self) -> Result<()> {
+        rebind(&self.device).await
     }
 
     /// The UDP port the device listens on. The kernel chose it when the
@@ -264,6 +391,34 @@ async fn peer_stats<T: DeviceTransports>(
         .collect()
 }
 
+async fn point<T: DeviceTransports>(
+    device: &Device<T>,
+    key: &x25519::PublicKey,
+    endpoint: SocketAddrV4,
+) -> Result<()> {
+    let set = |peer: &mut PeerMut| peer.set_endpoint(Some(endpoint.into()));
+    let found = device
+        .write(async |device| device.modify_peer(key, set).await)
+        .await
+        .map_err(|e| Error::new("TUNNEL_FAILED", e.to_string()))?;
+    if !found {
+        return Err(Error::new("TUNNEL_FAILED", "the device lost its peer"));
+    }
+    // The session with the old endpoint stays valid for minutes, and data
+    // sent on it to the new endpoint goes nowhere until it expires.
+    rebind(device).await
+}
+
+/// gotatun drops every session when it resumes, so a peer with a persistent
+/// keepalive starts a handshake at once.
+async fn rebind<T: DeviceTransports>(device: &Device<T>) -> Result<()> {
+    device.suspend().await;
+    device
+        .resume()
+        .await
+        .map_err(|e| Error::new("TUNNEL_FAILED", format!("rebinding the UDP socket: {e}")))
+}
+
 /// When each peer of a device last completed a handshake. gotatun 0.10.3 is
 /// wrong in two cases. Its timer loop skips a peer that has no endpoint, so
 /// it dates the first handshake of a peer without a configured endpoint
@@ -298,12 +453,12 @@ fn stopped() -> Error {
     Error::new("TUNNEL_STOPPED", "the WireGuard device stopped")
 }
 
-/// The TUN of `instance`, opened as gotatun's `TunDevice::from_name` opens
-/// it. The tun crate opens the macOS utun control socket without
-/// FD_CLOEXEC, so every command natwg runs would inherit the socket and could
-/// keep the utun alive after natwg exits.
-fn open_tun(instance: &Instance) -> Result<TunDevice> {
-    let tun = tun::create_as_async(&tun_config(instance)).map_err(tun_unavailable)?;
+/// A TUN opened as gotatun's `TunDevice::from_name` opens it. The tun crate
+/// opens the macOS utun control socket without FD_CLOEXEC, so every command
+/// natwg runs would inherit the socket and could keep the utun alive after
+/// natwg exits.
+fn open_tun(config: &tun::Configuration) -> Result<TunDevice> {
+    let tun = tun::create_as_async(config).map_err(tun_unavailable)?;
     if unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(tun_unavailable(std::io::Error::last_os_error()));
     }
@@ -312,7 +467,7 @@ fn open_tun(instance: &Instance) -> Result<TunDevice> {
 
 // macOS names a utun itself.
 #[cfg(target_os = "macos")]
-fn tun_config(_: &Instance) -> tun::Configuration {
+fn tun_config(_: &str) -> tun::Configuration {
     let mut config = tun::Configuration::default();
     config.platform_config(|platform| {
         platform.enable_routing(false);
@@ -321,9 +476,9 @@ fn tun_config(_: &Instance) -> tun::Configuration {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn tun_config(instance: &Instance) -> tun::Configuration {
+fn tun_config(name: &str) -> tun::Configuration {
     let mut config = tun::Configuration::default();
-    config.tun_name(instance.as_str());
+    config.tun_name(name);
     config
 }
 
@@ -371,6 +526,23 @@ fn allowed_ips(config: &Config, server: &ServerConfig) -> Vec<Ipv4Network> {
         .iter()
         .flat_map(|peer| peer.allowed_ips.clone());
     peers.chain(doctor).collect()
+}
+
+/// The client's one peer, the server, at `endpoint`. A client keeps its
+/// session alive every [`CLIENT_KEEPALIVE`] seconds unless its config says
+/// otherwise, so the server can reach it behind its NAT.
+fn client_peer(server: &PeerConfig, endpoint: Option<SocketAddrV4>) -> Peer {
+    let mut peer = peer(server);
+    peer.endpoint = endpoint.map(Into::into);
+    peer.keepalive = Some(client_keepalive(server));
+    peer
+}
+
+/// The keepalive of a client's session in seconds: 0 turns it off.
+pub const CLIENT_KEEPALIVE: u16 = 25;
+
+pub fn client_keepalive(server: &PeerConfig) -> u16 {
+    server.keepalive.unwrap_or(CLIENT_KEEPALIVE)
 }
 
 fn peer(config: &PeerConfig) -> Peer {

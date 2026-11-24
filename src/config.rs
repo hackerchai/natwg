@@ -2,6 +2,7 @@
 //! the keys, the peers, and either the server or the client role.
 
 use crate::keys::{self, Key, PublicKey, Secret};
+use crate::wire::dns::{self, RecordKind};
 use crate::{Error, Result};
 use ipnetwork::Ipv4Network;
 use serde::{Deserialize, Serialize};
@@ -119,15 +120,27 @@ pub struct ServerConfig {
 }
 
 /// The name of one natwg server on a host. It names the pf anchor, the nftables
-/// table and the Linux TUN device, so two servers with different names can run
-/// side by side.
+/// table, the Linux TUN device, the service and the status file, so two
+/// servers with different names can run side by side. The client takes the
+/// name `client` for its service and status file, and no server may take it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Instance(String);
 
+const CLIENT: &str = "client";
+
 impl Instance {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The name of the client's service and status file.
+    pub fn client() -> Self {
+        Self(CLIENT.to_owned())
+    }
+
+    pub fn is_client(&self) -> bool {
+        self.0 == CLIENT
     }
 }
 
@@ -148,6 +161,9 @@ impl TryFrom<String> for Instance {
                 .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'));
         if !valid {
             return Err("expected an instance name of 1 to 15 characters from a-z, 0-9 and _");
+        }
+        if name == CLIENT {
+            return Err("the instance name client belongs to natwg client");
         }
         Ok(Self(name))
     }
@@ -200,11 +216,26 @@ pub struct CloudflareConfig {
     pub token: Secret,
 }
 
+/// The client of one natwg server, the only peer of its config. It finds the
+/// server through the TXT `record`, or at the peer's `endpoint` when there is
+/// no record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    pub record: String,
+    /// The TXT record that holds the server's endpoint as `"ip:port"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+    /// The DNS servers asked for `record`, in order (default:
+    /// `client::resolve::DEFAULT_RESOLVERS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolvers: Vec<Ipv4Addr>,
+    /// The uplink the WireGuard and DNS traffic leaves through (default: the
+    /// physical interface of the default route, followed as it changes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    /// Where the client writes its status (default: `status::client_path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_file: Option<PathBuf>,
 }
 
 /// A client identity the server also loads as a peer, so `natwg doctor` can
@@ -274,8 +305,9 @@ impl Config {
                 MTU.end()
             ));
         }
-        let Role::Server(server) = &self.role else {
-            return Ok(());
+        let server = match &self.role {
+            Role::Server(server) => server,
+            Role::Client(client) => return self.validate_client(client),
         };
         if !is_iface_name(&server.iface) {
             return Err(format!(
@@ -315,6 +347,44 @@ impl Config {
         Ok(())
     }
 
+    fn validate_client(&self, client: &ClientConfig) -> std::result::Result<(), String> {
+        let [server] = &self.peers[..] else {
+            return Err(format!(
+                "a client config has exactly one peer, the server, and this one has {}",
+                self.peers.len()
+            ));
+        };
+        if server.allowed_ips.is_empty() {
+            return Err(
+                "peers[0].allowed_ips is empty, so nothing would go through the tunnel".to_owned(),
+            );
+        }
+        if let Some(net) = server.allowed_ips.iter().find(|net| net.prefix() == 0) {
+            return Err(format!(
+                "peers[0].allowed_ips {net} is a default route, which natwg client does not take; name the networks to reach"
+            ));
+        }
+        if client.record.is_none() && server.endpoint.is_none() {
+            return Err(
+                "the client needs role.client.record or peers[0].endpoint to find the server"
+                    .to_owned(),
+            );
+        }
+        if let Some(record) = &client.record
+            && !is_dns_name(record)
+        {
+            return Err(format!("role.client.record {record:?} is not a DNS name"));
+        }
+        if let Some(iface) = &client.iface
+            && !is_iface_name(iface)
+        {
+            return Err(format!(
+                "role.client.iface {iface:?} is not an interface name of 1 to {IFACE_NAME_MAX} characters from A-Z, a-z, 0-9, '.', '_' and '-'"
+            ));
+        }
+        Ok(())
+    }
+
     /// Atomically replace `path` with this config, readable only by its owner.
     /// A directory that `path` needs is created readable only by its owner.
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -330,8 +400,7 @@ impl Config {
     fn write(&self, path: &Path, replace: bool) -> Result<()> {
         let storage =
             |e: std::io::Error| Error::new("CONFIG_STORAGE", format!("{}: {e}", path.display()));
-        let mut text = keys::exposing(|| serde_json::to_string_pretty(self))
-            .expect("a config always serializes");
+        let mut text = self.exposed();
         text.push('\n');
         let dir = path
             .parent()
@@ -424,6 +493,26 @@ impl Config {
         }
     }
 
+    /// The client role and its one peer, the server, which the client needs.
+    pub fn client(&self) -> Result<(&ClientConfig, &PeerConfig)> {
+        match (&self.role, &self.peers[..]) {
+            (Role::Client(client), [server]) => Ok((client, server)),
+            (Role::Client(_), _) => Err(Error::new(
+                "CONFIG_INVALID",
+                "a client config has exactly one peer, the server",
+            )),
+            (Role::Server(_), _) => Err(Error::new(
+                "ROLE_MISMATCH",
+                "the config has the server role, and this command needs the client role",
+            )),
+        }
+    }
+
+    /// The config as the JSON of its file, secrets and all.
+    pub fn exposed(&self) -> String {
+        keys::exposing(|| serde_json::to_string_pretty(self)).expect("a config always serializes")
+    }
+
     /// The config as JSON for people to read. Every secret reads `"<redacted>"`,
     /// and `public_key` holds the public half of `private_key`.
     pub fn redacted(&self) -> String {
@@ -439,6 +528,14 @@ impl Config {
         };
         serde_json::to_string_pretty(&view).expect("a config always serializes")
     }
+}
+
+/// A name of labels from A-Z, a-z, 0-9, '-' and '_' that fits a DNS query.
+fn is_dns_name(name: &str) -> bool {
+    let plain = name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    plain && dns::query(0, name, RecordKind::Txt).is_ok()
 }
 
 // The name goes into the pf and the nftables rule as text, so a character
