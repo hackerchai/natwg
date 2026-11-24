@@ -104,7 +104,8 @@ natwg status                     # endpoint, handshake age, traffic
 ```
 
 `natwg status` exits 1 when the client has no tunnel, no endpoint, a failing
-TXT lookup, or no handshake within 180 seconds.
+TXT lookup, or no handshake for longer than a session can live, 235 seconds
+with the default keepalive.
 
 ### Move a wg-quick client to natwg
 

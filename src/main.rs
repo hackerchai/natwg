@@ -95,7 +95,8 @@ enum Action {
     /// natwg exits 1 when the status is older than 60 s or shows a problem:
     /// for a server no tunnel, no public mapping, a failed TXT publish, or
     /// failed NAT or UPnP; for a client no tunnel, no endpoint, a failed TXT
-    /// lookup, or no handshake within 180 s.
+    /// lookup, or, with a keepalive, no handshake yet or none for 210 s plus
+    /// the keepalive.
     Status {
         /// Print the status file as JSON.
         #[arg(long)]
