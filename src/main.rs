@@ -5,6 +5,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use natwg::config::{Config, ServerConfig};
+use natwg::status::{self, Status};
 use natwg::tunnel::Tunnel;
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
@@ -14,7 +15,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
@@ -68,6 +69,16 @@ enum Action {
         /// other way to run the server yet.
         #[arg(long, required = true)]
         foreground: bool,
+    },
+    /// Show what the running server reported last. Needs no root.
+    Status {
+        /// Print the status file as JSON.
+        #[arg(long)]
+        json: bool,
+        /// The status file of the server. Set it when the server config
+        /// names another one in role.server.status_file.
+        #[arg(long, value_name = "PATH", default_value = natwg::status::DEFAULT_PATH)]
+        status_file: PathBuf,
     },
     /// Test a running server from this host.
     Doctor {
@@ -227,6 +238,20 @@ fn run(cli: Cli) -> Result<()> {
         }
         Action::Probe { action } => probe(action)?,
         Action::Server { foreground: _ } => server(&cli.config)?,
+        Action::Status { json, status_file } => {
+            let status = Status::read(&status_file)?;
+            if json {
+                say!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).expect("a status always serializes")
+                );
+            } else {
+                say!(
+                    "{}",
+                    status.render(status::unix(SystemTime::now())).trim_end()
+                );
+            }
+        }
         Action::Doctor {
             action:
                 DoctorAction::Loopback {
