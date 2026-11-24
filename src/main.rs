@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 #[derive(Parser)]
 #[command(
@@ -44,8 +44,8 @@ enum Action {
     },
     /// Run the WireGuard server: the tunnel interface, its route and LAN NAT.
     Server {
-        /// Stay in the foreground until SIGINT or SIGTERM. natwg has no other
-        /// way to run the server yet.
+        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. natwg has no
+        /// other way to run the server yet.
         #[arg(long, required = true)]
         foreground: bool,
     },
@@ -269,18 +269,44 @@ fn server(config: &Path) -> Result<()> {
 
 async fn serve(config: &Config) -> Result<()> {
     let server = config.server()?;
-    let listen = |kind| signal(kind).map_err(|e| Error::new("SIGNAL_UNAVAILABLE", e.to_string()));
-    let mut interrupt = listen(SignalKind::interrupt())?;
-    let mut terminate = listen(SignalKind::terminate())?;
+    let mut stop = Stop::listen()?;
     let mut tunnel = Tunnel::start(config).await?;
     println!("tun {}", tunnel.tun_name());
     let served = tokio::select! {
         failure = until_failure(&mut tunnel, server) => Err(failure),
-        _ = interrupt.recv() => Ok(()),
-        _ = terminate.recv() => Ok(()),
+        () = stop.requested() => Ok(()),
     };
     let stopped = tunnel.stop().await;
     served.and(stopped)
+}
+
+/// The signals that stop the server. SIGHUP is one of them, because a
+/// terminal that closes sends it, and its default action ends the process
+/// with the NAT rule still loaded.
+struct Stop {
+    interrupt: Signal,
+    terminate: Signal,
+    hangup: Signal,
+}
+
+impl Stop {
+    fn listen() -> Result<Self> {
+        let listen =
+            |kind| signal(kind).map_err(|e| Error::new("SIGNAL_UNAVAILABLE", e.to_string()));
+        Ok(Self {
+            interrupt: listen(SignalKind::interrupt())?,
+            terminate: listen(SignalKind::terminate())?,
+            hangup: listen(SignalKind::hangup())?,
+        })
+    }
+
+    async fn requested(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+            _ = self.hangup.recv() => {}
+        }
+    }
 }
 
 /// Print the public mapping of the server's socket, then wait for the device
@@ -411,4 +437,27 @@ async fn first_mapping(
         Some(code) => Error::new(code, "no STUN server answered"),
         None => Error::new("STUN_NO_SERVER", "no STUN server address to try"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stop;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sigint_sigterm_and_sighup_each_stop_the_server() {
+        let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+        // A signal that nothing listens for is ignored from here on, so a
+        // missing listener fails this test and does not kill the test run.
+        for signal in signals {
+            unsafe { libc::signal(signal, libc::SIG_IGN) };
+        }
+        let mut stop = Stop::listen().unwrap();
+        for signal in signals {
+            unsafe { libc::kill(libc::getpid(), signal) };
+            tokio::time::timeout(Duration::from_secs(5), stop.requested())
+                .await
+                .unwrap_or_else(|_| panic!("signal {signal} did not stop the server"));
+        }
+    }
 }
