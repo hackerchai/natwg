@@ -5,6 +5,7 @@
 
 pub mod resolve;
 pub mod uplink;
+pub mod wg_quick;
 
 use crate::Result;
 use crate::config::{ClientConfig, Config};
