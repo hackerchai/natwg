@@ -385,6 +385,7 @@ fn legacy_import_maps_every_field() {
                 record: "_wg-home.example.com".into(),
                 token: TOKEN.parse().unwrap(),
             },
+            status_file: None,
             doctor: None,
         }),
     };
