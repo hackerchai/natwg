@@ -54,7 +54,7 @@ enum Action {
         #[command(subcommand)]
         action: KeysAction,
     },
-    /// Show the configuration or import it from the Python natwg install.
+    /// Show the configuration, or give a server config a doctor.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -161,26 +161,6 @@ enum KeysAction {
 enum ConfigAction {
     /// Print the configuration with secrets redacted and the public key added.
     Show,
-    /// Convert the Python natwg install into a configuration file.
-    ImportLegacy {
-        #[arg(long, default_value = natwg::legacy::DEFAULT_NATWG_JSON)]
-        natwg_json: PathBuf,
-        /// The WireGuard server config (default: wg_conf in natwg.json).
-        #[arg(long)]
-        wg_conf: Option<PathBuf>,
-        /// The Cloudflare token file (default: cf_token_file in natwg.json).
-        #[arg(long)]
-        cf_token: Option<PathBuf>,
-        /// Where to write the configuration (default: --config).
-        #[arg(long)]
-        out: Option<PathBuf>,
-        /// Print the redacted configuration without writing it.
-        #[arg(long)]
-        dry_run: bool,
-        /// Replace a configuration that exists already.
-        #[arg(long)]
-        force: bool,
-    },
     /// Give the server config of --config a doctor, the client identity that
     /// natwg doctor uses.
     ///
@@ -265,30 +245,6 @@ fn run(cli: Cli) -> Result<()> {
         Action::Config {
             action: ConfigAction::Show,
         } => say!("{}", Config::load(&cli.config)?.redacted()),
-        Action::Config {
-            action:
-                ConfigAction::ImportLegacy {
-                    natwg_json,
-                    wg_conf,
-                    cf_token,
-                    out,
-                    dry_run,
-                    force,
-                },
-        } => {
-            let config =
-                natwg::legacy::import(&natwg_json, wg_conf.as_deref(), cf_token.as_deref())?;
-            say!("{}", config.redacted());
-            if !dry_run {
-                let out = out.unwrap_or(cli.config);
-                if force {
-                    config.save(&out)?;
-                } else {
-                    config.create(&out)?;
-                }
-                warn!("Wrote {}", out.display());
-            }
-        }
         Action::Config {
             action: ConfigAction::Doctor { force },
         } => {

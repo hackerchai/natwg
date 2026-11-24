@@ -359,10 +359,7 @@ impl Config {
         persisted.map_err(|e| match e.error.kind() {
             std::io::ErrorKind::AlreadyExists => Error::new(
                 "CONFIG_EXISTS",
-                format!(
-                    "{} exists already, and import-legacy replaces a config only with --force",
-                    path.display()
-                ),
+                format!("{} exists already; --force replaces it", path.display()),
             ),
             _ => storage(e.error),
         })?;

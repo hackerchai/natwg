@@ -1,16 +1,7 @@
-use natwg::config::{
-    CloudflareConfig, Config, DoctorConfig, Instance, Interface, PeerConfig, Role, ServerConfig,
-    StunConfig, UpnpConfig, Version1,
-};
+use natwg::config::{Config, DoctorConfig, Role};
 use natwg::keys::Key;
 use serde_json::{Value, json};
-use std::{
-    fs,
-    num::NonZeroU64,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-    process::{Command, Output},
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 const SERVER_PRIVATE: &str = "OBVOyBiR+AQljDndwhkOOOvLPVQUogKaqG9unoAN+nw=";
 const SERVER_PUBLIC: &str = "y8ocWNQCQNyN5iT1HmIcsFMbw7Khqm3029s2xAGJjDQ=";
@@ -77,31 +68,10 @@ fn load_value(value: &Value) -> natwg::Result<Config> {
     Config::load(&path)
 }
 
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/legacy")
-        .join(name)
-}
-
 fn natwg() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_natwg"));
     command.env_remove("NATWG_CONFIG");
     command
-}
-
-fn import_fixture(out: &Path, extra: &[&str]) -> Output {
-    natwg()
-        .args(["config", "import-legacy", "--natwg-json"])
-        .arg(fixture("natwg.json"))
-        .arg("--wg-conf")
-        .arg(fixture("wg-home.conf"))
-        .arg("--cf-token")
-        .arg(fixture("cf_token"))
-        .arg("--out")
-        .arg(out)
-        .args(extra)
-        .output()
-        .unwrap()
 }
 
 fn mode(path: &Path) -> u32 {
@@ -334,144 +304,10 @@ fn group_or_other_permissions_are_rejected() {
 }
 
 #[test]
-fn legacy_import_maps_every_field() {
-    let config = natwg::legacy::import(
-        &fixture("natwg.json"),
-        Some(&fixture("wg-home.conf")),
-        Some(&fixture("cf_token")),
-    )
-    .unwrap();
-    let expected = Config {
-        version: Version1,
-        private_key: SERVER_PRIVATE.parse().unwrap(),
-        interface: Interface {
-            address: "10.66.66.1/24".parse().unwrap(),
-            mtu: 1420,
-        },
-        peers: vec![PeerConfig {
-            name: "laptop".into(),
-            public_key: LAPTOP_PUBLIC.parse().unwrap(),
-            preshared_key: Some(PRESHARED.parse().unwrap()),
-            allowed_ips: vec!["10.66.66.2/32".parse().unwrap()],
-            endpoint: None,
-            keepalive: None,
-        }],
-        role: Role::Server(ServerConfig {
-            instance: Instance::default(),
-            iface: "en6".into(),
-            listen_port: 51830,
-            lan: "10.73.0.0/24".parse().unwrap(),
-            stun: StunConfig {
-                servers: vec![
-                    "stun.miwifi.com:3478".into(),
-                    "stun.chat.bilibili.com:3478".into(),
-                    "stun.hitv.com:3478".into(),
-                    "stun.cloudflare.com:3478".into(),
-                ],
-                fallback: vec![
-                    "111.206.174.3:3478".parse().unwrap(),
-                    "111.206.174.2:3478".parse().unwrap(),
-                ],
-                interval_secs: NonZeroU64::new(17).unwrap(),
-                dns_server: "223.5.5.5".parse().unwrap(),
-            },
-            upnp: Some(UpnpConfig {
-                control_url: "http://10.73.0.1:1900/ipc".into(),
-                lease_secs: 3600,
-                refresh_secs: NonZeroU64::new(300).unwrap(),
-            }),
-            cloudflare: CloudflareConfig {
-                zone: "example.com".into(),
-                record: "_wg-home.example.com".into(),
-                token: TOKEN.parse().unwrap(),
-            },
-            status_file: None,
-            doctor: None,
-        }),
-    };
-    assert_eq!(config, expected);
-    assert_eq!(config.private_key.public_key().to_string(), SERVER_PUBLIC);
-}
-
-#[test]
-fn legacy_import_twice_writes_identical_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("config.json");
-    let mut runs = Vec::new();
-    for extra in [&[][..], &["--force"]] {
-        let output = import_fixture(&out, extra);
-        assert!(output.status.success(), "{output:?}");
-        runs.push(fs::read(&out).unwrap());
-    }
-    assert_eq!(runs[0], runs[1]);
-    assert_eq!(mode(&out), 0o600);
-    let Role::Server(server) = Config::load(&out).unwrap().role else {
-        panic!("legacy import is a server config")
-    };
-    assert_eq!(server.doctor, None);
-}
-
-#[test]
-fn legacy_import_without_cf_token_writes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let token = dir.path().join("cf_token");
-    let mut legacy: Value =
-        serde_json::from_str(&fs::read_to_string(fixture("natwg.json")).unwrap()).unwrap();
-    legacy["wg_conf"] = json!(fixture("wg-home.conf"));
-    legacy["cf_token_file"] = json!(token);
-    let natwg_json = dir.path().join("natwg.json");
-    fs::write(&natwg_json, legacy.to_string()).unwrap();
-    let out = dir.path().join("config.json");
-    let import = || {
-        natwg()
-            .args(["config", "import-legacy", "--natwg-json"])
-            .arg(&natwg_json)
-            .arg("--out")
-            .arg(&out)
-            .output()
-            .unwrap()
-    };
-
-    let output = import();
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains(&token.display().to_string()), "{stderr}");
-    assert!(!out.exists(), "a failed import writes no config");
-
-    fs::copy(fixture("cf_token"), &token).unwrap();
-    let output = import();
-    assert!(output.status.success(), "{output:?}");
-    assert!(out.exists(), "paths default to the ones natwg.json names");
-}
-
-#[test]
-fn dry_run_prints_the_server_public_key_and_writes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("config.json");
-    let output = import_fixture(&out, &["--dry-run"]);
-    assert!(output.status.success(), "{output:?}");
-    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(shown["public_key"], SERVER_PUBLIC);
-    assert!(!out.exists());
-}
-
-#[test]
 fn show_and_debug_never_print_a_secret() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.json");
-    let mut config = natwg::legacy::import(
-        &fixture("natwg.json"),
-        Some(&fixture("wg-home.conf")),
-        Some(&fixture("cf_token")),
-    )
-    .unwrap();
-    let Role::Server(server) = &mut config.role else {
-        panic!("legacy import is a server config")
-    };
-    server.doctor = Some(DoctorConfig {
-        private_key: DOCTOR_PRIVATE.parse().unwrap(),
-        address: "10.66.66.3".parse().unwrap(),
-    });
+    let config = load_value(&server_json()).unwrap();
 
     let debug = format!("{config:?}");
     let redacted = config.redacted();
@@ -559,56 +395,6 @@ fn a_client_config_cannot_carry_a_doctor() {
 }
 
 #[test]
-fn a_malformed_legacy_key_line_never_echoes_the_key() {
-    let dir = tempfile::tempdir().unwrap();
-    let fixture_conf = fs::read_to_string(fixture("wg-home.conf")).unwrap();
-    let private_line = format!("PrivateKey = {SERVER_PRIVATE}");
-    assert!(fixture_conf.contains(&private_line));
-    let letters_key = "QWErtyUIOPasdfghJKLzxcvbnmQWERTYUIOPasdfghA=";
-    for (line, key) in [
-        (format!("PrivateKey: {SERVER_PRIVATE}"), SERVER_PRIVATE),
-        (format!("PrivateKey{letters_key}"), letters_key),
-        (letters_key.to_owned(), letters_key),
-    ] {
-        let wg_conf = dir.path().join("wg-home.conf");
-        fs::write(&wg_conf, fixture_conf.replace(&private_line, &line)).unwrap();
-        let output = natwg()
-            .args(["config", "import-legacy", "--dry-run", "--natwg-json"])
-            .arg(fixture("natwg.json"))
-            .arg("--wg-conf")
-            .arg(&wg_conf)
-            .arg("--cf-token")
-            .arg(fixture("cf_token"))
-            .output()
-            .unwrap();
-        assert!(!output.status.success(), "{line}");
-        let stderr = String::from_utf8(output.stderr).unwrap().to_lowercase();
-        assert!(stderr.contains("legacy_invalid"), "{stderr}");
-        assert!(!stderr.contains(&key[..16].to_lowercase()), "{stderr}");
-    }
-}
-
-#[test]
-fn an_empty_upnp_control_url_imports_as_upnp_off() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut legacy: Value =
-        serde_json::from_str(&fs::read_to_string(fixture("natwg.json")).unwrap()).unwrap();
-    legacy["upnp_control_url"] = json!("");
-    let natwg_json = dir.path().join("natwg.json");
-    fs::write(&natwg_json, legacy.to_string()).unwrap();
-    let config = natwg::legacy::import(
-        &natwg_json,
-        Some(&fixture("wg-home.conf")),
-        Some(&fixture("cf_token")),
-    )
-    .unwrap();
-    let Role::Server(server) = config.role else {
-        panic!("legacy import is a server config")
-    };
-    assert_eq!(server.upnp, None);
-}
-
-#[test]
 fn a_fifo_at_the_config_path_is_refused_without_blocking() {
     let dir = tempfile::tempdir().unwrap();
     let fifo = dir.path().join("config.json");
@@ -621,29 +407,6 @@ fn a_fifo_at_the_config_path_is_refused_without_blocking() {
     );
     fs::set_permissions(&fifo, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(Config::load(&fifo).unwrap_err().code, "CONFIG_UNSAFE");
-}
-
-#[test]
-fn import_legacy_replaces_a_config_only_with_force() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("config.json");
-    write_private(&out, "the config of someone else\n");
-
-    let output = import_fixture(&out, &[]);
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.starts_with("CONFIG_EXISTS: "), "{stderr}");
-    assert_eq!(
-        fs::read_to_string(&out).unwrap(),
-        "the config of someone else\n"
-    );
-    let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
-    assert_eq!(left.len(), 1, "a refused import leaves no temporary file");
-
-    let output = import_fixture(&out, &["--force"]);
-    assert!(output.status.success(), "{output:?}");
-    let imported = Config::load(&out).unwrap();
-    assert_eq!(imported.private_key.public_key().to_string(), SERVER_PUBLIC);
 }
 
 #[test]
