@@ -129,9 +129,9 @@ pub async fn resolve(
 ) -> Result<Vec<Record>> {
     let id = u16::from_be_bytes(super::random()?);
     let message = query(id, name, kind)?;
-    let failed = |e: io::Error| Error::new("DNS_IO", format!("{server}: {e}"));
-    let socket =
-        bound_udp_socket(iface, 0).map_err(|e| Error::new("UDP_BIND", format!("{iface}: {e}")))?;
+    let failed = |e: io::Error| Error::new("DNS_IO", format!("{server} for {name}: {e}"));
+    let socket = bound_udp_socket(iface, 0)
+        .map_err(|e| Error::new("UDP_BIND", format!("{iface} for {name}: {e}")))?;
     let socket = UdpSocket::from_std(socket).map_err(failed)?;
     let exchange = async {
         socket.connect(server).await.map_err(failed)?;
