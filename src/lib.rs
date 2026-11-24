@@ -1,6 +1,7 @@
 pub mod config;
 pub mod keys;
 pub mod legacy;
+pub mod netcfg;
 pub mod wire;
 
 #[derive(Debug)]
