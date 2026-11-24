@@ -25,7 +25,7 @@ const COMMENT: &str = "natwg: WireGuard public endpoint, auto-updated";
 const TIMEOUT: Duration = Duration::from_secs(15);
 const REDACTED: &str = "<redacted>";
 
-/// A value natwg wrote to the TXT record.
+/// A value the TXT record holds, and when natwg wrote it or found it there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
     pub value: SocketAddrV4,
@@ -126,8 +126,13 @@ impl Publisher {
                     let error = state.borrow().error().map(str::to_owned);
                     state.send_replace(Publish::Publishing { previous, error });
                     match self.publish(value).await {
-                        Ok(()) => {
-                            tracing::info!("published TXT {} = \"{value}\"", self.record);
+                        Ok(wrote) => {
+                            let record = &self.record;
+                            if wrote {
+                                tracing::info!("published TXT {record} = \"{value}\"");
+                            } else {
+                                tracing::info!("TXT {record} holds \"{value}\" already");
+                            }
                             let at = SystemTime::now();
                             state.send_replace(Publish::Published(Record { value, at }));
                         }
@@ -154,7 +159,11 @@ impl Publisher {
         }
     }
 
-    async fn publish(&mut self, value: SocketAddrV4) -> Result<()> {
+    /// Make the record hold `value`, and return whether that took a write.
+    /// The lookup of the record ID, after a start or a failed write, reads
+    /// what the record holds too, so a server that restarts on the same
+    /// mapping finds it published.
+    async fn publish(&mut self, value: SocketAddrV4) -> Result<bool> {
         let zone_id = match &self.zone_id {
             Some(id) => id.clone(),
             None => {
@@ -172,7 +181,12 @@ impl Publisher {
         let records = format!("/zones/{zone_id}/dns_records");
         if self.record_id.is_none() {
             let query = [("type", "TXT"), ("name", &self.record)];
-            self.record_id = first_id(&self.call(Method::GET, &records, &query, None).await?);
+            let found = self.call(Method::GET, &records, &query, None).await?;
+            self.record_id = first_id(&found);
+            let content = found[0]["content"].as_str().unwrap_or_default();
+            if content.trim_matches('"') == value.to_string() {
+                return Ok(false);
+            }
         }
         let body = json!({
             "type": "TXT",
@@ -189,7 +203,7 @@ impl Publisher {
                 if put.is_err() {
                     self.record_id = None;
                 }
-                put.map(drop)
+                put.map(|_| true)
             }
             None => {
                 let created = self.call(Method::POST, &records, &[], Some(&body)).await?;
@@ -197,7 +211,7 @@ impl Publisher {
                     .as_str()
                     .ok_or_else(|| Error::new("CLOUDFLARE_API", "the created record has no id"))?;
                 self.record_id = Some(id.to_owned());
-                Ok(())
+                Ok(true)
             }
         }
     }

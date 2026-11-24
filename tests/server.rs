@@ -455,6 +455,34 @@ async fn an_existing_record_is_updated_and_a_value_already_published_is_skipped(
     }
 }
 
+#[tokio::test]
+async fn a_record_that_holds_the_mapping_already_is_published_without_a_write() {
+    let mut api =
+        MockApi::start(
+            |request| match (request.method.as_str(), request.target.as_str()) {
+                ("GET", ZONES) => ok(json!([{"id": "zone1"}])),
+                ("GET", LOOKUP) => ok(json!([{"id": "rec1", "content": "\"203.0.113.9:7007\""}])),
+                ("PUT", RECORD) => ok(json!({"id": "rec1"})),
+                _ => unknown(),
+            },
+        );
+    let (mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let check = async {
+        published(&mut state, "203.0.113.9:7007").await;
+        assert_eq!(api.taken(), [get(ZONES), get(LOOKUP)]);
+
+        mapping_tx.send_replace(mapping("203.0.113.9:7008"));
+        published(&mut state, "203.0.113.9:7008").await;
+        assert_eq!(api.taken(), [put("203.0.113.9:7008")], "the ID is cached");
+    };
+    tokio::select! {
+        never = publisher.run(mapping_rx, state_tx) => match never {},
+        () = check => {}
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_api_error_is_reported_without_the_token_and_tried_again_after_60_s() {
     let mut api = MockApi::start(|_| {
