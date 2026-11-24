@@ -680,3 +680,80 @@ fn a_config_that_carries_an_acl_is_refused() {
     chmod(&["-N"]);
     Config::load(&path).unwrap();
 }
+
+fn doctor_of(path: &Path) -> Option<DoctorConfig> {
+    let Role::Server(server) = Config::load(path).unwrap().role else {
+        panic!("a server config")
+    };
+    server.doctor
+}
+
+#[test]
+fn config_doctor_adds_a_doctor_at_the_highest_free_host_and_replaces_it_only_with_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let mut value = server_json();
+    value["role"]["server"]
+        .as_object_mut()
+        .unwrap()
+        .remove("doctor");
+    value["peers"].as_array_mut().unwrap().push(json!({
+        "name": "phone", "public_key": DOCTOR_PUBLIC, "allowed_ips": ["10.66.66.252/30"]
+    }));
+    write_private(&path, &value.to_string());
+    let doctor = |extra: &[&str]| {
+        natwg()
+            .arg("--config")
+            .arg(&path)
+            .args(["config", "doctor"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let output = doctor(&[]);
+    assert!(output.status.success(), "{output:?}");
+    let first = doctor_of(&path).unwrap();
+    let expected: std::net::Ipv4Addr = "10.66.66.251".parse().unwrap();
+    assert_eq!(first.address, expected, ".252 to .255 belong to the phone");
+    assert_eq!(mode(&path), 0o600);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let public = first.private_key.public_key().to_string();
+    assert_eq!(stdout, format!("doctor {expected} public key {public}\n"));
+
+    let before = fs::read(&path).unwrap();
+    let output = doctor(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("DOCTOR_EXISTS: "), "{stderr}");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "a refused run writes nothing"
+    );
+
+    let output = doctor(&["--force"]);
+    assert!(output.status.success(), "{output:?}");
+    let second = doctor_of(&path).unwrap();
+    assert_eq!(second.address, expected);
+    assert_ne!(second.private_key, first.private_key, "a fresh key");
+    let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(left.len(), 1, "the write leaves no temporary file");
+}
+
+#[test]
+fn the_doctor_never_takes_the_address_of_the_server() {
+    let mut value = server_json();
+    value["role"]["server"]
+        .as_object_mut()
+        .unwrap()
+        .remove("doctor");
+    value["interface"]["address"] = json!("10.66.66.254/24");
+    let mut config = load_value(&value).unwrap();
+    let doctor = config.add_doctor(false).unwrap();
+    assert_eq!(
+        doctor.address,
+        "10.66.66.253".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+    config.validate().unwrap();
+}

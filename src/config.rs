@@ -369,6 +369,53 @@ impl Config {
         Ok(())
     }
 
+    /// Give the server a doctor with a fresh key, at the highest host of the
+    /// tunnel subnet that is neither the server's address nor inside a
+    /// peer's allowed IPs. A doctor that is there already stays unless
+    /// `replace` is set.
+    pub fn add_doctor(&mut self, replace: bool) -> Result<DoctorConfig> {
+        if self.server()?.doctor.is_some() && !replace {
+            return Err(Error::new(
+                "DOCTOR_EXISTS",
+                "role.server.doctor exists already; --force replaces it",
+            ));
+        }
+        let address = self.free_host().ok_or_else(|| {
+            Error::new(
+                "DOCTOR_NO_ADDRESS",
+                format!(
+                    "every host of the tunnel subnet of interface.address {} is the server's or a peer's",
+                    self.interface.address
+                ),
+            )
+        })?;
+        let doctor = DoctorConfig {
+            private_key: Key::generate()?,
+            address,
+        };
+        if let Role::Server(server) = &mut self.role {
+            server.doctor = Some(doctor.clone());
+        }
+        Ok(doctor)
+    }
+
+    fn free_host(&self) -> Option<Ipv4Addr> {
+        let address = self.interface.address;
+        let first = u32::from(address.network()) + 1;
+        let last = u32::from(address.broadcast()).checked_sub(1)?;
+        let taken = |host| {
+            host == address.ip()
+                || self
+                    .peers
+                    .iter()
+                    .any(|peer| peer.allowed_ips.iter().any(|net| net.contains(host)))
+        };
+        (first..=last)
+            .rev()
+            .map(Ipv4Addr::from)
+            .find(|&host| !taken(host))
+    }
+
     /// The server role, which the server and the doctor commands need.
     pub fn server(&self) -> Result<&ServerConfig> {
         match &self.role {
