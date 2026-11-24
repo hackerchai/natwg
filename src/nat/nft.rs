@@ -11,7 +11,9 @@ pub fn up(rule: &Rule) -> Vec<Step> {
     let load = format!("{}{}", delete(&rule.instance), table(rule));
     vec![
         Step::new(&["nft", "-f", "-"]).stdin(load),
-        Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"]),
+        // `sysctl -w` exits 0 when /proc/sys is read-only, as in a container.
+        Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"])
+            .done_when(&["sysctl", "-n", "net.ipv4.ip_forward"], "1"),
     ]
 }
 

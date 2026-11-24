@@ -294,7 +294,7 @@ fn the_pf_enable_token_is_read_from_the_output_of_pfctl() {
 }
 
 #[test]
-fn nft_replaces_the_instance_table_with_one_masquerade_rule() {
+fn nft_replaces_the_instance_table_with_one_masquerade_rule_and_checks_forwarding() {
     let table = "table inet natwg_next
 delete table inet natwg_next
 table inet natwg_next {
@@ -308,7 +308,8 @@ table inet natwg_next {
         nft::up(&linux_rule()),
         [
             Step::new(&["nft", "-f", "-"]).stdin(table),
-            Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"]),
+            Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"])
+                .done_when(&["sysctl", "-n", "net.ipv4.ip_forward"], "1"),
         ]
     );
 }
