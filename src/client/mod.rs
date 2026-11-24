@@ -9,10 +9,12 @@ pub mod wg_quick;
 
 use crate::Result;
 use crate::config::{ClientConfig, Config};
+use crate::netcfg;
 use crate::server::peer_status;
 use crate::status::{self, ClientRole, ClientStatus};
 use crate::tunnel::{self, PeerStats};
 use crate::wire::transport::BoundInterface;
+use ipnetwork::Ipv4Network;
 use std::{
     future::Future,
     net::SocketAddrV4,
@@ -178,6 +180,18 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         (self.find_uplink)(self.client.iface.as_deref())
     }
 
+    /// The server's networks that this host sits on, which the client
+    /// leaves out of its routes. A change means the routes need a rebuild.
+    fn local_networks(&self) -> Option<Vec<Ipv4Network>> {
+        let (_, server) = self.config.client().ok()?;
+        let routes: Vec<Ipv4Network> = server
+            .allowed_ips
+            .iter()
+            .filter_map(|net| Ipv4Network::new(net.network(), net.prefix()).ok())
+            .collect();
+        netcfg::host_local_networks(&routes).ok()
+    }
+
     fn endpoint(&self) -> Option<SocketAddrV4> {
         self.endpoint.as_ref().map(|endpoint| endpoint.addr)
     }
@@ -266,6 +280,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         let options = self.options;
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun} via {uplink}");
+        let local = self.local_networks();
         let mut lookup_at = Instant::now();
         let mut watch =
             tokio::time::interval_at(Instant::now() + options.watch_every, options.watch_every);
@@ -317,6 +332,11 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                     };
                     if now.iface != uplink.iface {
                         return Exit::Died(format!("the uplink moved from {uplink} to {now}"));
+                    }
+                    if let (Some(was), Some(now)) = (&local, self.local_networks())
+                        && *was != now
+                    {
+                        return Exit::Died("this host joined or left a network that the server routes; rebuilding the routes".to_owned());
                     }
                     let why = match clock.slept() {
                         Some(gap) => format!("woke after about {} s asleep", gap.as_secs()),

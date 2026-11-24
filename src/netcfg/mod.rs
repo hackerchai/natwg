@@ -12,6 +12,7 @@ pub use linux::plan;
 pub use macos::plan;
 
 use crate::{Error, Result};
+use ipnetwork::Ipv4Network;
 use std::{
     ffi::CStr,
     io::Write,
@@ -205,6 +206,35 @@ pub fn ipv4_addresses() -> std::io::Result<Vec<(String, Ipv4Addr)>> {
     }
     unsafe { libc::freeifaddrs(list) };
     Ok(found)
+}
+
+/// The networks among `routes` that hold an address of an interface that is
+/// not a tunnel, as the home LAN does while a laptop sits on it. A route for
+/// such a network into the tunnel would take the host's own LAN traffic, so
+/// the client leaves it out, as wg-quick does.
+pub fn local_networks(
+    routes: &[Ipv4Network],
+    addresses: &[(String, Ipv4Addr)],
+) -> Vec<Ipv4Network> {
+    const TUNNELS: [&str; 8] = ["utun", "tun", "natwg", "wg", "lo", "ipsec", "gif", "stf"];
+    routes
+        .iter()
+        .copied()
+        .filter(|route| {
+            addresses.iter().any(|(name, address)| {
+                !TUNNELS.iter().any(|tunnel| name.starts_with(tunnel))
+                    && !address.is_loopback()
+                    && route.contains(*address)
+            })
+        })
+        .collect()
+}
+
+/// [`local_networks`] for the interfaces of this host.
+pub fn host_local_networks(routes: &[Ipv4Network]) -> Result<Vec<Ipv4Network>> {
+    let addresses =
+        ipv4_addresses().map_err(|e| Error::new("INTERFACES_UNREADABLE", e.to_string()))?;
+    Ok(local_networks(routes, &addresses))
 }
 
 /// Refuse a tunnel address that an interface holds already, such as the

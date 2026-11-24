@@ -162,7 +162,12 @@ impl Client {
         endpoint: Option<SocketAddrV4>,
     ) -> Result<Self> {
         let (_, server) = config.client()?;
-        let routes: Vec<Ipv4Network> = server.allowed_ips.iter().copied().map(subnet).collect();
+        let mut routes: Vec<Ipv4Network> = server.allowed_ips.iter().copied().map(subnet).collect();
+        let local = netcfg::host_local_networks(&routes)?;
+        for network in &local {
+            tracing::info!("leaving {network} out of the tunnel while this host is on it");
+        }
+        routes.retain(|route| !local.contains(route));
         netcfg::require_free_address(config.interface.address.ip())?;
         #[cfg(target_os = "macos")]
         netcfg::macos::require_free_routes(&routes)?;
