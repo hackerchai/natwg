@@ -99,13 +99,22 @@ pub fn state(name: &str) -> Result<State> {
             .map(str::to_owned)
     };
     let state = field("state").unwrap_or_default();
+    let runs = field("runs")
+        .and_then(|runs| runs.parse().ok())
+        .unwrap_or(0);
     match field("pid").and_then(|pid| pid.parse().ok()) {
-        Some(pid) if state == "running" => Ok(State::Running(pid)),
+        Some(pid) if state == "running" => Ok(State::Running { pid, runs }),
         _ => Ok(State::Stopped(format!(
             "{state}, last exit code {}",
             field("last exit code").unwrap_or_default()
         ))),
     }
+}
+
+/// The last `lines` lines that the servers of `instance` printed.
+pub fn recent_log(instance: &Instance, lines: usize) -> String {
+    let text = fs::read_to_string(log(instance)).unwrap_or_default();
+    super::last_lines(&text, lines)
 }
 
 /// Load the plist, which starts the server. launchd opens the log before

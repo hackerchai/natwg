@@ -9,6 +9,7 @@ use std::{
 fn fixture(updated: u64) -> Status {
     Status {
         updated,
+        pid: 4242,
         iface: "en6".into(),
         listen_port: 51831,
         tun: Some("utun12".into()),
@@ -38,6 +39,7 @@ fn the_status_file_has_the_documented_fields() {
     let status = fixture(1_000_000);
     let expected = json!({
         "updated": 1_000_000,
+        "pid": 4242,
         "iface": "en6",
         "listen_port": 51831,
         "tun": "utun12",

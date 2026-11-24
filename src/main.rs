@@ -329,7 +329,7 @@ fn service_action(config: &Path, action: ServiceAction) -> Result<()> {
             }
             let stopped: Vec<&str> = services
                 .iter()
-                .filter(|(_, state)| !matches!(state, service::State::Running(_)))
+                .filter(|(_, state)| !matches!(state, service::State::Running { .. }))
                 .map(|(name, _)| name.as_str())
                 .collect();
             if stopped.is_empty() {
