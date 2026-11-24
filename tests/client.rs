@@ -1,19 +1,20 @@
-//! The client: its TXT lookup, its uplink, and a client and a server in
-//! memory over loopback UDP while the server moves.
+//! The client: its TXT lookup, its uplink, the wg-quick import, and a client
+//! and a server in memory over loopback UDP while the server moves.
 
 use natwg::client::uplink::{self, Uplink};
-use natwg::client::{self, Device, Options, resolve};
-use natwg::config::Config;
+use natwg::client::{self, Device, Options, resolve, wg_quick};
+use natwg::config::{Config, Role};
 use natwg::keys::{Key, PublicKey};
 use natwg::status::{ClientStatus, Report};
 use natwg::tunnel::{Detached, PeerStats};
 use natwg::wire::dns::Record;
 use natwg::wire::transport::BoundInterface;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
+    fs,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::Path,
-    process::Command,
+    process::{Command, Output},
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -236,10 +237,277 @@ fn key() -> Key {
     Key::generate().unwrap()
 }
 
+struct WgQuick {
+    client: Key,
+    server: PublicKey,
+    preshared: Key,
+}
+
+impl WgQuick {
+    fn new() -> Self {
+        Self {
+            client: key(),
+            server: key().public_key(),
+            preshared: key(),
+        }
+    }
+
+    /// A client config as the Python natwg install wrote it.
+    fn text(&self) -> String {
+        format!(
+            "# natwg client config. Endpoint is kept current by natwg-client-update.sh\n\
+             # (it reads the TXT record _wg-home.example.com).\n\
+             [Interface]\n\
+             PrivateKey = {}\n\
+             Address = 10.66.66.2/32\n\
+             MTU = 1420\n\
+             \n\
+             [Peer]\n\
+             PublicKey = {}\n\
+             PresharedKey = {}\n\
+             AllowedIPs = 10.66.66.0/24, 10.73.0.0/24\n\
+             Endpoint = 0.0.0.0:0\n\
+             PersistentKeepalive = 25\n",
+            self.client.to_base64(),
+            self.server,
+            self.preshared.to_base64()
+        )
+    }
+
+    fn secrets(&self) -> [String; 2] {
+        [self.client.to_base64(), self.preshared.to_base64()]
+    }
+}
+
+fn write(dir: &Path, text: &str) -> std::path::PathBuf {
+    let path = dir.join("wg-home.conf");
+    fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn a_wg_quick_client_keeps_its_keys_address_and_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = WgQuick::new();
+    let path = write(dir.path(), &conf.text());
+    let config = wg_quick::import(&path, Some(RECORD.into()), vec![]).unwrap();
+    let expected: Config = serde_json::from_value(json!({
+        "version": 1,
+        "private_key": conf.client.to_base64(),
+        "interface": { "address": "10.66.66.2/32", "mtu": 1420 },
+        "peers": [{
+            "name": "server",
+            "public_key": conf.server,
+            "preshared_key": conf.preshared.to_base64(),
+            "allowed_ips": ["10.66.66.0/24", "10.73.0.0/24"],
+            "keepalive": 25
+        }],
+        "role": { "client": {
+            "record": RECORD,
+            "resolvers": ["223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8"]
+        }}
+    }))
+    .unwrap();
+    assert_eq!(config, expected, "Endpoint = 0.0.0.0:0 is no endpoint");
+    config.validate().unwrap();
+}
+
+#[test]
+fn a_wg_quick_endpoint_stands_in_for_a_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = WgQuick::new()
+        .text()
+        .replace("0.0.0.0:0", "192.0.2.7:51830");
+    let path = write(dir.path(), &text);
+    let resolvers = vec![Ipv4Addr::new(9, 9, 9, 9)];
+    let config = wg_quick::import(&path, None, resolvers).unwrap();
+    assert_eq!(config.peers[0].endpoint, Some(addr("192.0.2.7:51830")));
+    let Role::Client(client) = &config.role else {
+        panic!("a wg-quick import is a client config")
+    };
+    assert_eq!(client.record, None);
+
+    let path = write(dir.path(), &WgQuick::new().text());
+    let error = wg_quick::import(&path, None, vec![]).unwrap_err();
+    assert_eq!(error.code, "WG_QUICK_INVALID");
+    assert!(
+        error
+            .message
+            .contains("role.client.record or peers[0].endpoint"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn a_wg_quick_config_that_natwg_cannot_run_is_refused_by_line_and_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = WgQuick::new().text();
+    let second_peer = format!(
+        "{base}\n[Peer]\nPublicKey = {}\nAllowedIPs = 10.9.0.0/24\n",
+        key().public_key()
+    );
+    for (text, expected) in [
+        (
+            base.replace("MTU = 1420", "DNS = 10.73.0.1"),
+            "line 6: natwg client does not support the [Interface] key DNS",
+        ),
+        (
+            base.replace("MTU = 1420", "PostUp = true"),
+            "line 6: natwg client does not support the [Interface] key PostUp",
+        ),
+        (
+            base.replace(
+                "Address = 10.66.66.2/32",
+                "Address = 10.66.66.2/32, fd00::2/128",
+            ),
+            "line 5: Address must be one IPv4 address",
+        ),
+        (
+            base.replace("10.73.0.0/24", "::/0"),
+            "line 11: AllowedIPs must be IPv4 networks",
+        ),
+        (
+            base.replace("0.0.0.0:0", "home.example.com:51830"),
+            "line 12: Endpoint must be an IPv4 address",
+        ),
+        (
+            base.replace("0.0.0.0:0", "0.0.0.0:0\nTable = off"),
+            "natwg client does not support the [Peer] key table",
+        ),
+        (
+            second_peer,
+            "exactly one [Peer], the server, and this one has 2",
+        ),
+        (
+            base.replace("10.66.66.0/24, 10.73.0.0/24", "0.0.0.0/0"),
+            "default route",
+        ),
+    ] {
+        let path = write(dir.path(), &text);
+        let error = wg_quick::import(&path, Some(RECORD.into()), vec![]).unwrap_err();
+        assert_eq!(error.code, "WG_QUICK_INVALID");
+        assert!(
+            error.message.contains(expected),
+            "{expected:?} in {}",
+            error.message
+        );
+    }
+}
+
 fn natwg() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_natwg"));
     command.env_remove("NATWG_CONFIG");
     command
+}
+
+fn import(path: &Path, extra: &[&str]) -> Output {
+    natwg()
+        .args(["config", "import-wg-quick"])
+        .arg(path)
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_malformed_wg_quick_line_never_echoes_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = WgQuick::new();
+    let text = conf.text();
+    let private = conf.client.to_base64();
+    let private_line = format!("PrivateKey = {private}");
+    let letters = "QWErtyUIOPasdfghJKLzxcvbnmQWERTYUIOPasdfghA=";
+    let cases = [
+        format!("PrivateKey: {private}"),
+        format!("PrivateKey{letters}"),
+        letters.to_owned(),
+        format!("PrivateKey = {}", &private[..40]),
+        format!("Address = {private}"),
+        format!("MTU = {private}"),
+        format!("{letters} = 1"),
+        format!("[{private}]"),
+    ];
+    for line in cases {
+        let path = write(dir.path(), &text.replace(&private_line, &line));
+        let output = import(&path, &["--dry-run", "--record", RECORD]);
+        assert!(!output.status.success(), "{line}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.starts_with("WG_QUICK_INVALID: "), "{stderr}");
+        let lower = stderr.to_lowercase();
+        for secret in conf.secrets().iter().map(String::as_str).chain([letters]) {
+            assert!(
+                !lower.contains(&secret[..16].to_lowercase()),
+                "{line}: {stderr}"
+            );
+        }
+    }
+    for (key, text) in [
+        (
+            "PublicKey",
+            text.replace(&conf.server.to_string(), &private),
+        ),
+        (
+            "PresharedKey",
+            text.replace(&conf.preshared.to_base64(), &format!("{private}x")),
+        ),
+    ] {
+        let path = write(dir.path(), &text);
+        let output = import(&path, &["--dry-run", "--record", RECORD]);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if key == "PresharedKey" {
+            assert!(
+                stderr.contains("PresharedKey is not a 32-byte key"),
+                "{stderr}"
+            );
+        }
+        assert!(!stderr.contains(&private[..16]), "{key}: {stderr}");
+    }
+}
+
+#[test]
+fn import_wg_quick_prints_the_redacted_config_and_writes_it_only_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = WgQuick::new();
+    let path = write(dir.path(), &conf.text());
+    let out = dir.path().join("etc/natwg/config.json");
+    let out_arg = out.to_str().unwrap();
+
+    let output = import(
+        &path,
+        &[
+            "--record",
+            RECORD,
+            "--resolver",
+            "1.1.1.1",
+            "--out",
+            out_arg,
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(shown["public_key"], conf.client.public_key().to_string());
+    assert_eq!(shown["private_key"], "<redacted>");
+    assert_eq!(shown["role"]["client"]["resolvers"], json!(["1.1.1.1"]));
+    let printed =
+        String::from_utf8(output.stdout).unwrap() + &String::from_utf8(output.stderr).unwrap();
+    for secret in conf.secrets() {
+        assert!(!printed.contains(&secret), "{secret} printed");
+    }
+    let saved = Config::load(&out).unwrap();
+    assert_eq!(saved.private_key, conf.client);
+    let mode = fs::metadata(&out).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+        0o600
+    );
+
+    let again = import(&path, &["--record", RECORD, "--out", out_arg]);
+    assert!(!again.status.success());
+    let stderr = String::from_utf8(again.stderr).unwrap();
+    assert!(stderr.starts_with("CONFIG_EXISTS: "), "{stderr}");
+    let forced = import(&path, &["--record", RECORD, "--out", out_arg, "--force"]);
+    assert!(forced.status.success(), "{forced:?}");
 }
 
 /// A server and its one client, which finds it through the TXT record at the

@@ -55,7 +55,7 @@ enum Action {
         #[command(subcommand)]
         action: KeysAction,
     },
-    /// Show the configuration, or give a server config a doctor.
+    /// Show the configuration, or import a wg-quick client config.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -179,6 +179,32 @@ enum KeysAction {
 enum ConfigAction {
     /// Print the configuration with secrets redacted and the public key added.
     Show,
+    /// Turn the wg-quick config of a client into a natwg client config that
+    /// keeps its keys and its tunnel address.
+    ///
+    /// The config must have one [Peer], the server. wg-quick's placeholder
+    /// `Endpoint = 0.0.0.0:0` counts as no endpoint.
+    ImportWgQuick {
+        /// The wg-quick config, such as /etc/wireguard/wg-home.conf.
+        wg_conf: PathBuf,
+        /// The TXT record that holds the server's endpoint as "ip:port".
+        /// Without it, the client dials the Endpoint of the [Peer].
+        #[arg(long, value_name = "NAME")]
+        record: Option<String>,
+        /// A DNS server to ask for --record, in order; repeat it for more
+        /// (default: 223.5.5.5, 119.29.29.29, 1.1.1.1 and 8.8.8.8).
+        #[arg(long = "resolver", value_name = "IP")]
+        resolvers: Vec<Ipv4Addr>,
+        /// Where to write the configuration (default: --config).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print the redacted configuration without writing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace a configuration that exists already.
+        #[arg(long)]
+        force: bool,
+    },
     /// Give the server config of --config a doctor, the client identity that
     /// natwg doctor uses.
     ///
@@ -274,6 +300,29 @@ fn run(cli: Cli) -> Result<()> {
         Action::Config {
             action: ConfigAction::Show,
         } => say!("{}", Config::load(&cli.config)?.redacted()),
+        Action::Config {
+            action:
+                ConfigAction::ImportWgQuick {
+                    wg_conf,
+                    record,
+                    resolvers,
+                    out,
+                    dry_run,
+                    force,
+                },
+        } => {
+            let config = client::wg_quick::import(&wg_conf, record, resolvers)?;
+            say!("{}", config.redacted());
+            if !dry_run {
+                let out = out.unwrap_or(cli.config);
+                if force {
+                    config.save(&out)?;
+                } else {
+                    config.create(&out)?;
+                }
+                warn!("Wrote {}", out.display());
+            }
+        }
         Action::Config {
             action: ConfigAction::Doctor { force },
         } => {
