@@ -4,14 +4,14 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use clap::{Args, Parser, Subcommand};
-use natwg::config::Config;
+use natwg::config::{Config, Instance};
 use natwg::server::{self, cloudflare};
 use natwg::status::{self, Status};
 use natwg::tunnel::Tunnel;
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
-use natwg::{Error, Result, doctor, keys::Key};
+use natwg::{Error, Result, doctor, keys::Key, service};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
@@ -67,18 +67,22 @@ enum Action {
     /// Run the WireGuard server: the tunnel with its route and LAN NAT, the
     /// STUN keepalive, the TXT record, the UPnP lease and the status file.
     Server {
-        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. natwg has no
-        /// other way to run the server yet.
+        /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. `natwg
+        /// service install` runs the server in the background.
         #[arg(long, required = true)]
         foreground: bool,
     },
     /// Show what the running server reported last. Needs no root.
+    ///
+    /// natwg exits 1 when the status is older than 60 s, or shows no tunnel,
+    /// no public mapping, a failed TXT publish, or failed NAT or UPnP.
     Status {
         /// Print the status file as JSON.
         #[arg(long)]
         json: bool,
-        /// The status file of the server. Set it when the server config
-        /// names another one in role.server.status_file.
+        /// The status file of the server. A server of another instance than
+        /// natwg writes <instance>.status.json beside the default, and a
+        /// config can name its own in role.server.status_file.
         #[arg(long, value_name = "PATH", default_value = natwg::status::DEFAULT_PATH)]
         status_file: PathBuf,
     },
@@ -87,6 +91,43 @@ enum Action {
         #[command(subcommand)]
         action: DoctorAction,
     },
+    /// Run the server as a system service: a LaunchDaemon on macOS, a
+    /// systemd unit on Linux.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Run the server for a service manager, as `server --foreground` does.
+    #[command(hide = true)]
+    Daemon,
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the server of --config as a service and start it.
+    ///
+    /// natwg copies itself to /usr/local/libexec/natwg/natwg, and the service
+    /// runs that copy. A part that is in place already stays, so a second
+    /// run with nothing changed keeps the running server.
+    Install,
+    /// Stop the service of --config, or of --instance, and remove it.
+    ///
+    /// The definition and the status file go. The binary and the config
+    /// stay unless --purge is given.
+    Uninstall {
+        /// Also delete the config and, once no natwg service is left, the
+        /// binary.
+        #[arg(long)]
+        purge: bool,
+        /// Remove the service of this instance without reading --config, as
+        /// when the config is broken or gone. Its status file stays.
+        #[arg(long, value_name = "NAME", conflicts_with = "purge")]
+        instance: Option<Instance>,
+    },
+    /// Restart the service of --config, which then reads the config again.
+    Restart,
+    /// Show every natwg service on this host. Needs no root.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -136,6 +177,20 @@ enum ConfigAction {
         /// Print the redacted configuration without writing it.
         #[arg(long)]
         dry_run: bool,
+        /// Replace a configuration that exists already.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Give the server config of --config a doctor, the client identity that
+    /// natwg doctor uses.
+    ///
+    /// The doctor gets a fresh key and the highest host of the tunnel subnet
+    /// that neither the server nor a peer uses. natwg replaces --config in
+    /// one step. Restart the server to load the doctor.
+    Doctor {
+        /// Replace a doctor that the config has already.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -218,6 +273,7 @@ fn run(cli: Cli) -> Result<()> {
                     cf_token,
                     out,
                     dry_run,
+                    force,
                 },
         } => {
             let config =
@@ -225,24 +281,46 @@ fn run(cli: Cli) -> Result<()> {
             say!("{}", config.redacted());
             if !dry_run {
                 let out = out.unwrap_or(cli.config);
-                config.save(&out)?;
+                if force {
+                    config.save(&out)?;
+                } else {
+                    config.create(&out)?;
+                }
                 warn!("Wrote {}", out.display());
             }
         }
+        Action::Config {
+            action: ConfigAction::Doctor { force },
+        } => {
+            let mut config = Config::load(&cli.config)?;
+            let doctor = config.add_doctor(force)?;
+            config.save(&cli.config)?;
+            say!(
+                "doctor {} public key {}",
+                doctor.address,
+                doctor.private_key.public_key()
+            );
+            warn!(
+                "Wrote {}; natwg service restart loads the doctor",
+                cli.config.display()
+            );
+        }
         Action::Probe { action } => probe(action)?,
-        Action::Server { foreground: _ } => server(&cli.config)?,
+        Action::Server { foreground: _ } | Action::Daemon => server(&cli.config)?,
         Action::Status { json, status_file } => {
             let status = Status::read(&status_file)?;
+            let now = status::unix(SystemTime::now());
             if json {
                 say!(
                     "{}",
                     serde_json::to_string_pretty(&status).expect("a status always serializes")
                 );
             } else {
-                say!(
-                    "{}",
-                    status.render(status::unix(SystemTime::now())).trim_end()
-                );
+                say!("{}", status.render(now).trim_end());
+            }
+            let problems = status.problems(now);
+            if !problems.is_empty() {
+                return Err(Error::new("SERVER_UNHEALTHY", problems.join(", ")));
             }
         }
         Action::Doctor {
@@ -253,7 +331,49 @@ fn run(cli: Cli) -> Result<()> {
                     attempts,
                 },
         } => doctor_loopback(&cli.config, iface.as_deref(), endpoint, attempts)?,
+        Action::Service { action } => service_action(&cli.config, action)?,
     }
+    Ok(())
+}
+
+fn service_action(config: &Path, action: ServiceAction) -> Result<()> {
+    let report = match action {
+        ServiceAction::Install => service::install(config)?,
+        ServiceAction::Uninstall {
+            instance: Some(instance),
+            ..
+        } => service::uninstall_instance(&instance)?,
+        ServiceAction::Uninstall {
+            purge,
+            instance: None,
+        } => service::uninstall(config, purge)?,
+        ServiceAction::Restart => service::restart(config)?,
+        ServiceAction::Status => {
+            let services = service::status()?;
+            if services.is_empty() {
+                return Err(Error::new(
+                    "SERVICE_NOT_INSTALLED",
+                    "no natwg service is installed; run natwg service install",
+                ));
+            }
+            for (name, state) in &services {
+                say!("{name} {state}");
+            }
+            let stopped: Vec<&str> = services
+                .iter()
+                .filter(|(_, state)| !matches!(state, service::State::Running { .. }))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if stopped.is_empty() {
+                return Ok(());
+            }
+            return Err(Error::new(
+                "SERVICE_STOPPED",
+                format!("{} does not run", stopped.join(" and ")),
+            ));
+        }
+    };
+    say!("{report}");
     Ok(())
 }
 
@@ -268,7 +388,7 @@ fn doctor_loopback(
         Some(endpoint) => endpoint,
         None => {
             let path = status::path(config.server()?);
-            Status::read(path)?.mapping.ok_or_else(|| {
+            Status::read(&path)?.mapping.ok_or_else(|| {
                 Error::new(
                     "DOCTOR_NO_ENDPOINT",
                     format!("{} holds no mapping yet; pass --endpoint", path.display()),

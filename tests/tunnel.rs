@@ -4,7 +4,7 @@ use natwg::config::{Config, Role};
 use natwg::doctor::{self, Echo, EchoKind, Probe};
 use natwg::keys::Key;
 use natwg::status::Status;
-use natwg::tunnel::Detached;
+use natwg::tunnel::{Detached, Tunnel};
 use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
@@ -149,6 +149,45 @@ async fn the_server_reports_each_peer_with_its_handshake_and_traffic() {
     assert!(after.rx_bytes > 0 && after.tx_bytes > 0, "{after:?}");
 }
 
+/// A server that ran for `age` before the doctor's first handshake, and what
+/// it reports for the doctor then. `look` reads the peers once before the
+/// handshake.
+async fn first_handshake_after(age: Duration, look: bool) -> Duration {
+    let config = with_doctor();
+    let mut server = Detached::server(&config).await.unwrap().0;
+    tokio::time::sleep(age).await;
+    if look {
+        assert_eq!(server.peers().await[0].last_handshake, None);
+    }
+    let doctor = dial_as_doctor(&config, &server).await;
+    doctor
+        .send(&packet(DOCTOR, SERVER, b"hello"))
+        .await
+        .unwrap();
+    next(&mut server).await;
+    let [peer] = &server.peers().await[..] else {
+        panic!("the doctor is the only peer");
+    };
+    peer.last_handshake
+        .expect("the doctor completed a handshake")
+}
+
+/// gotatun 0.10.3 skips a peer that has no endpoint in its timer loop, so
+/// the first handshake of such a peer is as old as the device. When this
+/// fails, gotatun dates it right, and `tunnel::Handshakes` can go.
+#[tokio::test]
+async fn gotatun_dates_a_first_handshake_from_the_device_start() {
+    let age = Duration::from_secs(2);
+    let reported = first_handshake_after(age, false).await;
+    assert!(reported >= age, "{reported:?}");
+}
+
+#[tokio::test]
+async fn a_first_handshake_is_dated_no_earlier_than_the_last_look_that_saw_none() {
+    let reported = first_handshake_after(Duration::from_secs(2), true).await;
+    assert!(reported < Duration::from_secs(1), "{reported:?}");
+}
+
 #[tokio::test]
 async fn the_doctor_sends_the_lan_through_the_tunnel_and_nothing_else() {
     let config = with_doctor();
@@ -237,6 +276,19 @@ async fn a_server_without_a_peer_or_a_doctor_does_not_start() {
     let config = config(server_json(&key()));
     let error = Detached::server(&config).await.err().unwrap();
     assert_eq!(error.code, "TUNNEL_NO_PEERS");
+}
+
+#[tokio::test]
+async fn a_tunnel_address_that_an_interface_holds_is_refused_before_anything_changes() {
+    let mut value = server_json(&key());
+    value["interface"]["address"] = json!("127.0.0.1/24");
+    let error = Tunnel::start(&config(value)).await.err().unwrap();
+    assert_eq!(error.code, "ADDRESS_IN_USE", "{}", error.message);
+    assert!(
+        error.message.starts_with(&format!("{LOOPBACK} holds ")),
+        "{}",
+        error.message
+    );
 }
 
 fn peer_json(name: &str, public_key: &str, address: &str) -> Value {
@@ -604,6 +656,7 @@ async fn natwg_doctor(
 fn status_with(mapping: Option<SocketAddrV4>) -> Status {
     Status {
         updated: 1,
+        pid: 1,
         iface: LOOPBACK.into(),
         listen_port: 0,
         tun: None,
@@ -734,12 +787,25 @@ fn natwg_server_needs_the_foreground_flag() {
 }
 
 #[test]
-fn natwg_server_without_root_exits_with_not_root() {
+fn natwg_server_and_natwg_daemon_without_root_exit_with_not_root() {
     // Root passes this check and would go on to start a server.
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    let output = natwg(&["server", "--foreground", "--config", "/natwg-none.json"]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stderr.starts_with(b"NOT_ROOT"), "{output:?}");
+    for args in [&["server", "--foreground"][..], &["daemon"]] {
+        let output = natwg(&[args, &["--config", "/natwg-none.json"]].concat());
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stderr.starts_with(b"NOT_ROOT"), "{output:?}");
+    }
+}
+
+#[test]
+fn natwg_daemon_is_left_out_of_the_help() {
+    let help = String::from_utf8(natwg(&["--help"]).stdout).unwrap();
+    let commands: Vec<&str> = help
+        .lines()
+        .filter_map(|line| line.strip_prefix("  ")?.split_whitespace().next())
+        .collect();
+    assert!(commands.contains(&"server"), "{help}");
+    assert!(!commands.contains(&"daemon"), "{help}");
 }

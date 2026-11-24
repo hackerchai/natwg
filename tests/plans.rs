@@ -150,6 +150,64 @@ fn a_route_for_the_tunnel_subnet_that_leaves_through_another_device_is_found() {
     }
 }
 
+// `netstat -rn -f inet` on a Mac where Surge owns the default route
+// through utun8, the live tunnel is utun11, and `wg-quick down` left utun12
+// behind.
+const MAC_ROUTES: &str = "Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            link#39            UCSg                utun8
+default            10.24.0.1          UGScIg                en6
+10.24/24           link#32            UCS                   en6      !
+10.66.66.1         10.66.66.1         UH                 utun11
+10.66.66.2/32      utun11             USc                utun11
+10.66.75.1         10.66.75.1         UH                 utun12
+10.66.75.2/32      utun12             USc                utun12
+10.66.76.2         link#39            UHWIig              utun8
+10.66.78/24        utun13             USc                utun13
+127                127.0.0.1          UCS                   lo0
+198.18.0.1         198.18.0.1         UH                  utun8
+";
+
+#[test]
+fn a_route_through_a_utun_within_the_allowed_ips_of_a_peer_is_found() {
+    let found = |allowed: &[&str]| {
+        let allowed: Vec<_> = allowed.iter().map(|text| net(text)).collect();
+        netcfg::macos::utun_route_within(MAC_ROUTES, &allowed)
+            .map(|(route, utun, within)| format!("{route} through {utun} within {within}"))
+    };
+    let found_as = |route: &str, utun: &str, within: &str| {
+        Some(format!("{route} through {utun} within {within}"))
+    };
+    assert_eq!(
+        found(&["10.66.75.2/32"]),
+        found_as("10.66.75.2/32", "utun12", "10.66.75.2/32")
+    );
+    assert_eq!(
+        found(&["10.66.77.0/24", "10.66.75.0/24"]),
+        found_as("10.66.75.1/32", "utun12", "10.66.75.0/24"),
+        "a host route counts"
+    );
+    assert_eq!(
+        found(&["10.66.78.0/23"]),
+        found_as("10.66.78.0/24", "utun13", "10.66.78.0/23"),
+        "netstat leaves the zero octets off a network"
+    );
+    for free in [
+        "10.66.76.2/32",
+        "10.66.78.5/32",
+        "10.24.0.0/24",
+        "127.0.0.1/32",
+    ] {
+        assert_eq!(
+            found(&[free]),
+            None,
+            "{free}: a cloned route, a wider route and a route through another interface do not count"
+        );
+    }
+}
+
 #[test]
 fn apply_runs_the_steps_in_order_and_stops_at_the_first_failure() {
     let dir = tempfile::tempdir().unwrap();

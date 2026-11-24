@@ -10,7 +10,7 @@ use std::{
     io::Write as _,
     net::{SocketAddr, SocketAddrV4},
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +22,8 @@ pub const DEFAULT_PATH: &str = "/run/natwg/status.json";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub updated: u64,
+    /// The process ID of the server that wrote the status.
+    pub pid: u32,
     pub iface: String,
     pub listen_port: u16,
     /// The TUN of the running tunnel, or none while natwg rebuilds it.
@@ -31,7 +33,7 @@ pub struct Status {
     pub last_stun_ok: Option<u64>,
     /// STUN requests in a row that got no answer.
     pub stun_misses: u32,
-    /// What the TXT record holds since natwg last wrote it.
+    /// What the TXT record holds, as natwg last wrote or found it.
     pub published: Option<SocketAddrV4>,
     pub published_at: Option<u64>,
     pub publish_error: Option<String>,
@@ -56,13 +58,21 @@ pub struct PeerStatus {
 }
 
 /// Where the server writes its status: `role.server.status_file`, or
-/// [`DEFAULT_PATH`].
-pub fn path(server: &ServerConfig) -> &Path {
-    server
-        .status_file
-        .as_deref()
-        .unwrap_or(Path::new(DEFAULT_PATH))
+/// [`DEFAULT_PATH`] for the instance `natwg` and `<instance>.status.json`
+/// beside it for any other, so two servers never share one file.
+pub fn path(server: &ServerConfig) -> PathBuf {
+    if let Some(path) = &server.status_file {
+        return path.clone();
+    }
+    match server.instance.as_str() {
+        "natwg" => PathBuf::from(DEFAULT_PATH),
+        other => Path::new(DEFAULT_PATH).with_file_name(format!("{other}.status.json")),
+    }
 }
+
+/// A status older than this many seconds means the server stopped writing
+/// it, which it does every 10 s.
+pub const STALE_AFTER: u64 = 60;
 
 pub fn unix(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
@@ -100,6 +110,32 @@ impl Status {
         })?;
         serde_json::from_str(&text)
             .map_err(|e| Error::new("STATUS_INVALID", format!("{}: {e}", path.display())))
+    }
+
+    /// What this status shows to be wrong at `now`, for people to read.
+    /// None of it holds while the server serves: the status is fresh, a
+    /// tunnel runs with its NAT rule, there is a public mapping, the last TXT
+    /// publish worked, and UPnP did not fail. UPnP that is off is fine.
+    pub fn problems(&self, now: u64) -> Vec<String> {
+        let age = now.saturating_sub(self.updated);
+        let tunnel = self.tun.is_some();
+        [
+            (age > STALE_AFTER, format!("the status is {age}s old")),
+            (!tunnel, "no tunnel runs".to_owned()),
+            (
+                tunnel && self.nat_ok != Some(true),
+                "NAT is not ok".to_owned(),
+            ),
+            (self.mapping.is_none(), "no public mapping".to_owned()),
+            (
+                self.publish_error.is_some(),
+                "the TXT publish failed".to_owned(),
+            ),
+            (self.upnp_ok == Some(false), "UPnP failed".to_owned()),
+        ]
+        .into_iter()
+        .filter_map(|(wrong, problem)| wrong.then_some(problem))
+        .collect()
     }
 
     /// The status for people to read, with times as their age at `now`.

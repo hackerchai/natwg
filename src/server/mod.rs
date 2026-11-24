@@ -198,11 +198,16 @@ impl Supervisor<'_> {
         );
         let mut keepalive = pin!(keepalive);
         let mut status_tick = tokio::time::interval(STATUS_EVERY);
-        let mut nat_tick = tokio::time::interval(NAT_EVERY);
+        // The first status already says whether NAT works.
+        let mut nat_ok = self.check_nat(device, None);
+        let mut nat_tick = tokio::time::interval_at(Instant::now() + NAT_EVERY, NAT_EVERY);
         for tick in [&mut status_tick, &mut nat_tick] {
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         }
-        let mut nat_ok = None;
+        // A new mapping, publish result or UPnP lease reaches the status at
+        // once instead of at the next tick.
+        let mut mapping = self.mapping.subscribe();
+        let (mut publish, mut lease) = (self.publish.clone(), self.lease.clone());
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun}, udp/{}", server.listen_port);
         loop {
@@ -216,6 +221,9 @@ impl Supervisor<'_> {
                 () = stop.as_mut() => return Exit::Stopped,
                 never = &mut keepalive => match never {},
                 _ = nat_tick.tick() => nat_ok = self.check_nat(device, nat_ok),
+                Ok(()) = mapping.changed() => status_tick.reset_immediately(),
+                Ok(()) = publish.changed() => status_tick.reset_immediately(),
+                Ok(()) = lease.changed() => status_tick.reset_immediately(),
                 _ = status_tick.tick() => {
                     if let Some(tun) = device.tun()
                         && BoundInterface::lookup(tun).is_err()
@@ -260,6 +268,7 @@ impl Supervisor<'_> {
         let record = publish.record();
         let status = Status {
             updated: status::unix(now),
+            pid: std::process::id(),
             iface: self.server.iface.clone(),
             listen_port: self.server.listen_port,
             tun: tun.map(str::to_owned),
@@ -280,7 +289,7 @@ impl Supervisor<'_> {
                 .collect(),
         };
         drop(publish);
-        if let Err(error) = status.write(status::path(self.server)) {
+        if let Err(error) = status.write(&status::path(self.server)) {
             tracing::warn!("{error}");
         }
     }
