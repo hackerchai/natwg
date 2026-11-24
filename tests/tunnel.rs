@@ -197,6 +197,47 @@ async fn a_server_without_a_peer_or_a_doctor_does_not_start() {
     assert_eq!(error.code, "TUNNEL_NO_PEERS");
 }
 
+fn peer_json(name: &str, public_key: &str, address: &str) -> Value {
+    json!({ "name": name, "public_key": public_key, "allowed_ips": [address] })
+}
+
+#[tokio::test]
+async fn two_peers_with_one_public_key_are_named_and_the_doctor_is_not() {
+    let shared = public(&key());
+    let mut value = server_json(&key());
+    value["peers"] = json!([
+        peer_json("tablet", &public(&key()), "10.66.67.3/32"),
+        peer_json("laptop", &shared, "10.66.67.2/32"),
+        peer_json("phone", &shared, "10.66.67.4/32"),
+    ]);
+    value["role"]["server"]["doctor"] = json!({ "private_key": key(), "address": DOCTOR });
+    let error = Detached::server(&config(value)).await.err().unwrap();
+    assert_eq!(error.code, "PEER_DUPLICATE");
+    for expected in ["\"laptop\"", "\"phone\""] {
+        assert!(error.message.contains(expected), "{}", error.message);
+    }
+    for unrelated in ["tablet", "doctor"] {
+        assert!(!error.message.contains(unrelated), "{}", error.message);
+    }
+}
+
+#[tokio::test]
+async fn a_peer_with_the_key_of_the_doctor_is_named_with_the_doctor() {
+    let doctor = key();
+    let mut value = server_json(&key());
+    value["peers"] = json!([
+        peer_json("tablet", &public(&key()), "10.66.67.3/32"),
+        peer_json("laptop", &public(&doctor), "10.66.67.2/32"),
+    ]);
+    value["role"]["server"]["doctor"] = json!({ "private_key": doctor, "address": DOCTOR });
+    let error = Detached::server(&config(value)).await.err().unwrap();
+    assert_eq!(error.code, "PEER_DUPLICATE");
+    for expected in ["\"laptop\"", "doctor"] {
+        assert!(error.message.contains(expected), "{}", error.message);
+    }
+    assert!(!error.message.contains("tablet"), "{}", error.message);
+}
+
 #[tokio::test]
 async fn a_client_config_is_not_a_server() {
     let mut value = server_json(&key());

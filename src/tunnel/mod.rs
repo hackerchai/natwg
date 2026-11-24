@@ -44,6 +44,7 @@ impl Tunnel {
         // COMMAND_NO_EFFECT for a subnet that has a route.
         #[cfg(not(target_os = "macos"))]
         netcfg::linux::require_free_route(requested_tun(&server.instance), subnet)?;
+        let peers = server_peers(config, server)?;
         let iface = BoundInterface::lookup(&server.iface)?;
         let unavailable =
             |e: gotatun::tun::tun_async_device::Error| Error::new("TUN_UNAVAILABLE", e.to_string());
@@ -53,7 +54,7 @@ impl Tunnel {
             &config.private_key,
             iface,
             server.listen_port,
-            server_peers(config, server),
+            peers,
             tun.clone(),
             tun,
         )
@@ -117,7 +118,7 @@ impl Detached {
     pub async fn server(config: &Config) -> Result<Self> {
         let server = config.server()?;
         let iface = BoundInterface::lookup(&server.iface)?;
-        let peers = server_peers(config, server);
+        let peers = server_peers(config, server)?;
         let (key, port, mtu) = (
             &config.private_key,
             server.listen_port,
@@ -209,13 +210,35 @@ fn requested_tun(instance: &Instance) -> &str {
     instance.as_str()
 }
 
-/// Every configured peer, and the doctor as a peer that owns only its address.
-fn server_peers(config: &Config, server: &ServerConfig) -> Vec<Peer> {
-    let doctor = server.doctor.as_ref().map(|doctor| {
-        Peer::new(public(doctor.private_key.public_key()))
-            .with_allowed_ip(Ipv4Network::from(doctor.address).into())
+/// Every configured peer, and the doctor as a peer that owns only its
+/// address. Two of them with one public key are an error that names both.
+fn server_peers(config: &Config, server: &ServerConfig) -> Result<Vec<Peer>> {
+    let duplicate = |message: String| Error::new("PEER_DUPLICATE", message);
+    for (index, peer) in config.peers.iter().enumerate() {
+        let earlier = &config.peers[..index];
+        if let Some(first) = earlier.iter().find(|p| p.public_key == peer.public_key) {
+            return Err(duplicate(format!(
+                "peers {:?} and {:?} have the same public key",
+                first.name, peer.name
+            )));
+        }
+    }
+    let doctor = server
+        .doctor
+        .as_ref()
+        .map(|doctor| (doctor.private_key.public_key(), doctor.address));
+    if let Some((key, _)) = doctor
+        && let Some(peer) = config.peers.iter().find(|peer| peer.public_key == key)
+    {
+        return Err(duplicate(format!(
+            "peer {:?} has the public key of role.server.doctor.private_key, and the doctor counts as a peer",
+            peer.name
+        )));
+    }
+    let doctor = doctor.map(|(key, address)| {
+        Peer::new(public(key)).with_allowed_ip(Ipv4Network::from(address).into())
     });
-    config.peers.iter().map(peer).chain(doctor).collect()
+    Ok(config.peers.iter().map(peer).chain(doctor).collect())
 }
 
 fn peer(config: &PeerConfig) -> Peer {
@@ -265,10 +288,6 @@ async fn device<Tx: IpSend, Rx: IpRecv>(
             gotatun::device::Error::Bind(error, _) => {
                 Error::new("UDP_BIND", format!("{name} udp/{port}: {error}"))
             }
-            gotatun::device::Error::DuplicatePeer => Error::new(
-                "PEER_DUPLICATE",
-                "two peers have the same public key, and the doctor counts as a peer",
-            ),
             error => Error::new("TUNNEL_FAILED", error.to_string()),
         })?;
     Ok((device, stun))
