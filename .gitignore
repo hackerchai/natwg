@@ -1,0 +1,7 @@
+/target/
+.DS_Store
+.env
+.env.*
+
+# Local agent guidance, decisions, plans and validation records
+/.local-docs/
