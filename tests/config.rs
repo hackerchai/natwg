@@ -1,6 +1,6 @@
 use natwg::config::{
-    CloudflareConfig, Config, DoctorConfig, Interface, PeerConfig, Role, ServerConfig, StunConfig,
-    UpnpConfig, Version1,
+    CloudflareConfig, Config, DoctorConfig, Instance, Interface, PeerConfig, Role, ServerConfig,
+    StunConfig, UpnpConfig, Version1,
 };
 use natwg::keys::Key;
 use serde_json::{Value, json};
@@ -122,6 +122,51 @@ fn saved_configs_load_back_unchanged() {
     assert_eq!(client.interface.mtu, 1380, "mtu defaults to 1380");
 }
 
+fn instance_of(config: &Config) -> &str {
+    let Role::Server(server) = &config.role else {
+        panic!("expected a server config")
+    };
+    server.instance.as_str()
+}
+
+#[test]
+fn the_instance_defaults_to_natwg_and_a_chosen_name_survives_a_save() {
+    let mut value = server_json();
+    assert_eq!(instance_of(&load_value(&value).unwrap()), "natwg");
+
+    value["role"]["server"]["instance"] = json!("natwg_next");
+    let config = load_value(&value).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("saved.json");
+    config.save(&path).unwrap();
+    let saved = Config::load(&path).unwrap();
+    assert_eq!(saved, config);
+    assert_eq!(instance_of(&saved), "natwg_next");
+}
+
+#[test]
+fn an_instance_name_must_be_1_to_15_characters_from_a_z_0_9_and_underscore() {
+    for name in ["a", "natwg_next", "wg0", "a23456789012345"] {
+        let mut value = server_json();
+        value["role"]["server"]["instance"] = json!(name);
+        assert_eq!(instance_of(&load_value(&value).unwrap()), name);
+    }
+    for name in [
+        "",
+        "Natwg",
+        "natwg-next",
+        "natwg next",
+        "natwg/next",
+        "natwg\"",
+        "a234567890123456",
+    ] {
+        let mut value = server_json();
+        value["role"]["server"]["instance"] = json!(name);
+        let error = load_value(&value).unwrap_err();
+        assert_eq!(error.code, "CONFIG_INVALID", "{name:?}");
+    }
+}
+
 #[test]
 fn unknown_fields_are_rejected_at_any_depth() {
     let mut top = server_json();
@@ -184,6 +229,7 @@ fn legacy_import_maps_every_field() {
             keepalive: None,
         }],
         role: Role::Server(ServerConfig {
+            instance: Instance::default(),
             iface: "en6".into(),
             listen_port: 51830,
             lan: "10.73.0.0/24".parse().unwrap(),
