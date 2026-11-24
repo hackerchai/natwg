@@ -1,4 +1,6 @@
 use ipnetwork::Ipv4Network;
+use natwg::config::Instance;
+use natwg::nat::{nft, pf};
 use natwg::netcfg::{self, Step};
 use std::fs;
 
@@ -8,6 +10,10 @@ fn argv(line: &str) -> Vec<String> {
 
 fn net(text: &str) -> Ipv4Network {
     text.parse().unwrap()
+}
+
+fn instance(name: &str) -> Instance {
+    name.parse().unwrap()
 }
 
 fn commands(plan: &[Step]) -> Vec<String> {
@@ -186,5 +192,98 @@ fn commands_run_with_the_system_path_and_without_the_callers_environment() {
             .iter()
             .any(|variable| variable.starts_with("CARGO_")),
         "{variables:?}"
+    );
+}
+
+#[test]
+fn pf_loads_one_nat_rule_into_the_instance_anchor_and_turns_forwarding_on() {
+    let plan = pf::up(
+        &instance("natwg_next"),
+        "en6",
+        net("10.66.67.0/24"),
+        net("10.24.0.0/24"),
+    );
+    assert_eq!(
+        plan,
+        [
+            Step::new(&["pfctl", "-a", "com.apple/natwg_next", "-f", "-"])
+                .stdin("nat on en6 inet from 10.66.67.0/24 to 10.24.0.0/24 -> (en6)\n"),
+            Step::new(&["sysctl", "-w", "net.inet.ip.forwarding=1"])
+                .done_when(&["sysctl", "-n", "net.inet.ip.forwarding"], "1"),
+        ]
+    );
+}
+
+#[test]
+fn the_default_instance_loads_the_rule_and_anchor_of_the_python_daemon() {
+    let plan = pf::up(
+        &Instance::default(),
+        "en6",
+        net("10.66.66.0/24"),
+        net("10.24.0.0/24"),
+    );
+    assert_eq!(plan[0].argv, argv("pfctl -a com.apple/natwg -f -"));
+    assert_eq!(
+        plan[0].stdin.as_deref(),
+        Some("nat on en6 inet from 10.66.66.0/24 to 10.24.0.0/24 -> (en6)\n")
+    );
+}
+
+#[test]
+fn pf_stop_flushes_only_the_instance_anchor() {
+    assert_eq!(
+        pf::down(&instance("natwg_next")),
+        [Step::new(&[
+            "pfctl",
+            "-a",
+            "com.apple/natwg_next",
+            "-F",
+            "all"
+        ])]
+    );
+}
+
+#[test]
+fn the_pf_enable_token_is_read_from_the_output_of_pfctl() {
+    let enabled = "No ALTQ support in kernel\nALTQ related functions disabled\npf enabled\nToken : 18446743524195463560\n";
+    assert_eq!(pf::token(enabled), Some("18446743524195463560"));
+    assert_eq!(pf::token("Token: 7\n"), Some("7"));
+    for output in ["", "pf enabled\n", "Token : \n", "Token : pf enabled\n"] {
+        assert_eq!(pf::token(output), None, "{output:?}");
+    }
+}
+
+#[test]
+fn nft_replaces_the_instance_table_with_one_masquerade_rule() {
+    let plan = nft::up(
+        &instance("natwg_next"),
+        "eth0",
+        net("10.66.67.0/24"),
+        net("192.168.139.0/24"),
+    );
+    let table = "table inet natwg_next
+delete table inet natwg_next
+table inet natwg_next {
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 192.168.139.0/24 masquerade
+	}
+}
+";
+    assert_eq!(
+        plan,
+        [
+            Step::new(&["nft", "-f", "-"]).stdin(table),
+            Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"]),
+        ]
+    );
+}
+
+#[test]
+fn nft_stop_deletes_the_instance_table_even_when_it_is_already_gone() {
+    assert_eq!(
+        nft::down(&instance("natwg_next")),
+        [Step::new(&["nft", "-f", "-"])
+            .stdin("table inet natwg_next\ndelete table inet natwg_next\n")]
     );
 }
