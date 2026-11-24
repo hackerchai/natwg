@@ -1,7 +1,7 @@
 use ipnetwork::Ipv4Network;
 use natwg::config::Instance;
 use natwg::nat::{Rule, nft, pf};
-use natwg::netcfg::{self, Step};
+use natwg::netcfg::{self, Step, Teardown};
 use std::fs;
 
 fn argv(line: &str) -> Vec<String> {
@@ -205,6 +205,44 @@ fn commands_run_with_the_system_path_and_without_the_callers_environment() {
             .any(|variable| variable.starts_with("CARGO_")),
         "{variables:?}"
     );
+}
+
+#[test]
+fn a_teardown_runs_every_step_and_returns_the_first_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let after = dir.path().join("after").display().to_string();
+    let teardown = Teardown::new(vec![
+        Step::new(&["false"]),
+        Step::new(&["touch", &after]),
+        Step::new(&["natwg-no-such-command"]),
+    ]);
+    let error = teardown.run().unwrap_err();
+    assert!(error.message.contains("`false`"), "{}", error.message);
+    assert!(dir.path().join("after").exists());
+}
+
+#[test]
+fn a_teardown_runs_its_steps_when_a_panic_unwinds_past_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let undone = dir.path().join("undone");
+    let path = undone.display().to_string();
+    let panicked = std::panic::catch_unwind(|| {
+        let mut teardown = Teardown::new(vec![]);
+        teardown.push(Step::new(&["touch", &path]));
+        panic!("the server panics with its plan applied");
+    });
+    assert!(panicked.is_err());
+    assert!(undone.exists());
+}
+
+#[test]
+fn a_teardown_that_ran_does_not_run_again_when_it_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log");
+    let path = log.display().to_string();
+    let teardown = Teardown::new(vec![Step::new(&["tee", "-a", &path]).stdin("ran\n")]);
+    teardown.run().unwrap();
+    assert_eq!(fs::read_to_string(&log).unwrap(), "ran\n");
 }
 
 #[test]

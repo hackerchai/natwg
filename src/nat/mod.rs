@@ -5,7 +5,7 @@ pub mod nft;
 pub mod pf;
 
 use crate::config::Instance;
-use crate::netcfg::{Step, apply, read};
+use crate::netcfg::{Step, Teardown, apply, read};
 use crate::{Error, Result};
 use ipnetwork::Ipv4Network;
 
@@ -81,35 +81,30 @@ impl Checked {
     /// Load the rule. A load that fails removes what it loaded.
     pub fn load(self) -> Result<Nat> {
         let mut nat = Nat {
-            down: down(&self.0.instance),
+            down: Teardown::new(down(&self.0.instance)),
         };
-        match nat.up(&self.0) {
-            Ok(()) => Ok(nat),
-            Err(error) => {
-                let _ = nat.stop();
-                Err(error)
-            }
-        }
+        nat.up(&self.0)?;
+        Ok(nat)
     }
 }
 
-/// The NAT rules of one instance, loaded until [`Nat::stop`].
+/// The NAT rules of one instance, loaded until [`Nat::stop`] or until the
+/// value drops, so a panic in the server removes them too.
 pub struct Nat {
-    down: Vec<Step>,
+    down: Teardown,
 }
 
 impl Nat {
     /// Remove the rules. Every step runs, and the first failure is returned.
     pub fn stop(self) -> Result<()> {
-        self.down
-            .iter()
-            .map(|step| apply(std::slice::from_ref(step)))
-            .fold(Ok(()), Result::and)
+        self.down.run()
     }
 
     #[cfg(target_os = "macos")]
     fn up(&mut self, rule: &Rule) -> Result<()> {
-        self.down.extend(pf::enable()?);
+        if let Some(disable) = pf::enable()? {
+            self.down.push(disable);
+        }
         pf::require_anchor_point()?;
         apply(&pf::up(rule))
     }

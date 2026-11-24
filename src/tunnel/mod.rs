@@ -24,10 +24,12 @@ const PACKET_QUEUE: usize = 64;
 /// The server's WireGuard device on a kernel TUN, with the address, the route
 /// and the NAT rules that let its peers reach the LAN.
 pub struct Tunnel {
+    // Fields drop in this order, so a panic removes the NAT rules before it
+    // reaches the device.
+    nat: Nat,
     device: Device<(BoundUdp, TunDevice, TunDevice)>,
     stun: StunPort,
     tun_name: String,
-    nat: Nat,
 }
 
 impl Tunnel {
@@ -61,10 +63,10 @@ impl Tunnel {
         let nat = netcfg::apply(&plan).and_then(|()| nat.load());
         match nat {
             Ok(nat) => Ok(Self {
+                nat,
                 device,
                 stun,
                 tun_name,
-                nat,
             }),
             Err(error) => {
                 device.stop().await;

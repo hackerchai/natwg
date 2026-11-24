@@ -1,6 +1,7 @@
 //! The commands that give the tunnel interface its address, MTU and routes.
 //! A plan is a list of [`Step`]s, and [`apply`] runs it. Applying the same
-//! plan again changes nothing. `nat` builds its plans from the same steps.
+//! plan again changes nothing. `nat` builds its plans from the same steps,
+//! and keeps the steps that undo them in a [`Teardown`].
 
 pub mod linux;
 pub mod macos;
@@ -99,6 +100,41 @@ pub fn apply(steps: &[Step]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The steps that undo a plan. They run once: in [`Teardown::run`], or when
+/// the value drops. A panic or an early return therefore still undoes the
+/// plan.
+#[derive(Debug)]
+pub struct Teardown(Vec<Step>);
+
+impl Teardown {
+    pub fn new(steps: Vec<Step>) -> Self {
+        Self(steps)
+    }
+
+    /// Add a step that runs after the ones already there.
+    pub fn push(&mut self, step: Step) {
+        self.0.push(step);
+    }
+
+    /// Run every step, also after one fails, and return the first failure.
+    pub fn run(mut self) -> Result<()> {
+        self.run_once()
+    }
+
+    fn run_once(&mut self) -> Result<()> {
+        std::mem::take(&mut self.0)
+            .iter()
+            .map(|step| apply(std::slice::from_ref(step)))
+            .fold(Ok(()), Result::and)
+    }
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        let _ = self.run_once();
+    }
 }
 
 /// Run one command with a fixed environment and return what it printed. A
