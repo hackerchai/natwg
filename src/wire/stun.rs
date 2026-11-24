@@ -26,6 +26,15 @@ pub const DEFAULT_FALLBACKS: [SocketAddrV4; 2] = [
     SocketAddrV4::new(Ipv4Addr::new(111, 206, 174, 2), 3478),
 ];
 
+/// A STUN server as `host:port`, the form the config and the command line use.
+pub fn host_port(text: &str) -> Result<(String, u16), String> {
+    let (host, port) = text.rsplit_once(':').ok_or("expected HOST:PORT")?;
+    let port = port
+        .parse()
+        .map_err(|_| format!("{port:?} is not a port number"))?;
+    Ok((host.to_owned(), port))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransactionId(pub [u8; 12]);
 

@@ -148,7 +148,7 @@ enum ProbeAction {
         port: u16,
         /// A STUN server, resolved through --dns. Servers are tried in order. With
         /// no --server and no --fallback, natwg uses its built-in list.
-        #[arg(long = "server", value_name = "HOST:PORT", value_parser = host_port)]
+        #[arg(long = "server", value_name = "HOST:PORT", value_parser = stun::host_port)]
         servers: Vec<(String, u16)>,
         /// A STUN server address, tried after every --server.
         #[arg(long = "fallback", value_name = "IP:PORT")]
@@ -182,14 +182,6 @@ struct Uplink {
 
 const DNS_PORT: u16 = 53;
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn host_port(text: &str) -> std::result::Result<(String, u16), String> {
-    let (host, port) = text.rsplit_once(':').ok_or("expected HOST:PORT")?;
-    let port = port
-        .parse()
-        .map_err(|_| format!("{port:?} is not a port number"))?;
-    Ok((host.to_owned(), port))
-}
 
 fn millis(text: &str) -> std::result::Result<Duration, std::num::ParseIntError> {
     text.parse().map(Duration::from_millis)
@@ -375,7 +367,7 @@ async fn public_mapping(stun: &mut StunPort, server: &ServerConfig) -> Result<So
     let dns = server.stun.dns_server;
     let mut servers = Vec::new();
     for entry in &server.stun.servers {
-        match host_port(entry) {
+        match stun::host_port(entry) {
             Ok(server) => servers.push(server),
             Err(error) => warn!("STUN_SERVER_INVALID: {entry:?}: {error}"),
         }
