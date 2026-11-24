@@ -114,29 +114,54 @@ pub fn uninstall(config: &Path, purge: bool) -> Result<String> {
     require_root()?;
     let parsed = Config::load(config)?;
     let server = parsed.server()?;
-    let name = manager::name(&server.instance);
+    let files = Files {
+        config,
+        status: status::path(server),
+        purge,
+    };
+    remove_service(&server.instance, Some(files))
+}
+
+/// Stop the service of `instance` and remove its definition without a
+/// config, as when the config is broken or gone. The status file stays,
+/// because only the config says where it is.
+pub fn uninstall_instance(instance: &Instance) -> Result<String> {
+    require_root()?;
+    remove_service(instance, None)
+}
+
+/// The files of a service that only its config names.
+struct Files<'a> {
+    config: &'a Path,
+    status: PathBuf,
+    purge: bool,
+}
+
+fn remove_service(instance: &Instance, files: Option<Files>) -> Result<String> {
+    let name = manager::name(instance);
     let mut report = String::new();
     let loaded = manager::state(&name)? != State::Missing;
     if loaded {
         manager::unload(&name)?;
         let _ = writeln!(report, "stopped {name}");
     }
-    let definition = manager::definition_path(&server.instance);
+    let definition = manager::definition_path(instance);
     let mut removed = Vec::new();
     if remove(&definition)? {
         manager::forget(&name)?;
         removed.push(definition);
     }
-    let status = status::path(server);
-    if remove(&status)? {
-        removed.push(status);
-    }
-    if purge {
-        if remove(config)? {
-            removed.push(config.to_owned());
+    if let Some(files) = &files {
+        if remove(&files.status)? {
+            removed.push(files.status.clone());
         }
-        if manager::installed()?.is_empty() && remove(Path::new(BINARY))? {
-            removed.push(BINARY.into());
+        if files.purge {
+            if remove(files.config)? {
+                removed.push(files.config.to_owned());
+            }
+            if manager::installed()?.is_empty() && remove(Path::new(BINARY))? {
+                removed.push(BINARY.into());
+            }
         }
     }
     if !loaded && removed.is_empty() {
@@ -145,12 +170,15 @@ pub fn uninstall(config: &Path, purge: bool) -> Result<String> {
     for path in &removed {
         let _ = writeln!(report, "removed {}", path.display());
     }
-    if !purge {
-        let _ = writeln!(
-            report,
-            "kept {BINARY} and {}; --purge deletes them",
-            config.display()
-        );
+    match files {
+        Some(files) if !files.purge => {
+            let config = files.config.display();
+            let _ = writeln!(report, "kept {BINARY} and {config}; --purge deletes them");
+        }
+        Some(_) => {}
+        None => {
+            let _ = writeln!(report, "kept {BINARY}, the config and the status file");
+        }
     }
     Ok(report.trim_end().to_owned())
 }
