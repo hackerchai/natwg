@@ -95,10 +95,10 @@ enum DoctorAction {
     /// of the server config. A reply time is that of the first echo that got
     /// an answer, so it includes the WireGuard handshake.
     Loopback {
-        /// Where the client dials the server, such as the mapping that natwg
-        /// server prints. Required, because natwg cannot look the mapping up yet.
+        /// Where the client dials the server (default: the mapping in the
+        /// status file of the server).
         #[arg(long, value_name = "IP:PORT")]
-        endpoint: SocketAddrV4,
+        endpoint: Option<SocketAddrV4>,
         /// The interface the client sends through (default: the server's interface).
         #[arg(long)]
         iface: Option<String>,
@@ -259,10 +259,22 @@ fn run(cli: Cli) -> Result<()> {
 fn doctor_loopback(
     config: &Path,
     iface: Option<&str>,
-    endpoint: SocketAddrV4,
+    endpoint: Option<SocketAddrV4>,
     attempts: NonZeroU16,
 ) -> Result<()> {
     let config = Config::load(config)?;
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint,
+        None => {
+            let path = status::path(config.server()?);
+            Status::read(path)?.mapping.ok_or_else(|| {
+                Error::new(
+                    "DOCTOR_NO_ENDPOINT",
+                    format!("{} holds no mapping yet; pass --endpoint", path.display()),
+                )
+            })?
+        }
+    };
     let probes = runtime(tokio::runtime::Builder::new_current_thread())?
         .block_on(doctor::loopback(&config, iface, endpoint, attempts))?;
     let mut silent = Vec::new();

@@ -1,8 +1,9 @@
 //! The WireGuard device and the doctor, run in memory over loopback UDP.
 
-use natwg::config::Config;
+use natwg::config::{Config, Role};
 use natwg::doctor::{self, Echo, EchoKind, Probe};
 use natwg::keys::Key;
+use natwg::status::Status;
 use natwg::tunnel::Detached;
 use serde_json::{Value, json};
 use std::{
@@ -560,27 +561,65 @@ fn natwg(args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// How `natwg doctor loopback` learns where the server is.
+enum Dial {
+    Endpoint,
+    StatusMapping,
+}
+
 /// Run `natwg doctor loopback` against a server in this process.
 async fn natwg_doctor(
     replies: impl Fn(Echo) -> Vec<Echo> + Send + 'static,
+    dial: Dial,
     extra: &'static [&'static str],
 ) -> Output {
-    let config = with_doctor();
+    let mut config = with_doctor();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.json");
+    let status_file = dir.path().join("status.json");
+    if let Role::Server(server) = &mut config.role {
+        server.status_file = Some(status_file.clone());
+    }
     config.save(&path).unwrap();
     let server = Detached::server(&config).await.unwrap().0;
-    let endpoint = endpoint(&server).await.to_string();
+    let endpoint = endpoint(&server).await;
     answering(server, replies);
+    let mut args = vec!["doctor".to_owned(), "loopback".to_owned()];
+    args.extend(["--config".to_owned(), path.to_str().unwrap().to_owned()]);
+    match dial {
+        Dial::Endpoint => args.extend(["--endpoint".to_owned(), endpoint.to_string()]),
+        Dial::StatusMapping => status_with(Some(endpoint)).write(&status_file).unwrap(),
+    }
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
     tokio::task::spawn_blocking(move || {
-        let path = path.to_str().unwrap();
-        let mut args = vec!["doctor", "loopback", "--config", path];
-        args.extend(["--endpoint", &endpoint]);
-        args.extend(extra);
-        natwg(&args)
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = natwg(&args);
+        drop(dir);
+        output
     })
     .await
     .unwrap()
+}
+
+fn status_with(mapping: Option<SocketAddrV4>) -> Status {
+    Status {
+        updated: 1,
+        iface: LOOPBACK.into(),
+        listen_port: 0,
+        tun: None,
+        mapping,
+        mapping_since: None,
+        last_stun_ok: None,
+        stun_misses: 0,
+        published: None,
+        published_at: None,
+        publish_error: None,
+        upnp_ok: None,
+        upnp_at: None,
+        nat_ok: None,
+        rebuilds: 0,
+        peers: vec![],
+    }
 }
 
 fn reply_time(line: &str, target: &str) -> f64 {
@@ -593,7 +632,7 @@ fn reply_time(line: &str, target: &str) -> f64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn natwg_doctor_loopback_prints_one_reply_line_for_each_target_and_exits_0() {
-    let output = natwg_doctor(|request| vec![pong(request)], &[]).await;
+    let output = natwg_doctor(|request| vec![pong(request)], Dial::Endpoint, &[]).await;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -614,7 +653,12 @@ async fn natwg_doctor_loopback_exits_1_and_names_the_target_that_stayed_silent()
             vec![]
         }
     };
-    let output = natwg_doctor(only_the_tunnel_address, &["--attempts", "2"]).await;
+    let output = natwg_doctor(
+        only_the_tunnel_address,
+        Dial::Endpoint,
+        &["--attempts", "2"],
+    )
+    .await;
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
@@ -627,12 +671,42 @@ async fn natwg_doctor_loopback_exits_1_and_names_the_target_that_stayed_silent()
     assert!(!stderr.contains("10.66.67.1"), "{stderr}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn natwg_doctor_loopback_without_an_endpoint_dials_the_mapping_in_the_status_file() {
+    let output = natwg_doctor(|request| vec![pong(request)], Dial::StatusMapping, &[]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    reply_time(lines[0], "10.66.67.1");
+    reply_time(lines[1], "10.73.0.1");
+}
+
 #[test]
-fn natwg_doctor_loopback_needs_an_endpoint() {
-    let output = natwg(&["doctor", "loopback"]);
-    assert_eq!(output.status.code(), Some(2));
+fn natwg_doctor_loopback_without_an_endpoint_or_a_mapping_names_the_status_file() {
+    let mut config = with_doctor();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let status_file = dir.path().join("status.json");
+    if let Role::Server(server) = &mut config.role {
+        server.status_file = Some(status_file.clone());
+    }
+    config.save(&path).unwrap();
+    let path = path.to_str().unwrap();
+
+    let output = natwg(&["doctor", "loopback", "--config", path]);
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("--endpoint"), "{stderr}");
+    assert!(stderr.starts_with("STATUS_UNREADABLE: "), "{stderr}");
+    assert!(stderr.contains("status.json"), "{stderr}");
+
+    status_with(None).write(&status_file).unwrap();
+    let output = natwg(&["doctor", "loopback", "--config", path]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("DOCTOR_NO_ENDPOINT: "), "{stderr}");
+    assert!(stderr.contains("status.json"), "{stderr}");
 }
 
 #[test]
