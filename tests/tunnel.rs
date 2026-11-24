@@ -773,12 +773,25 @@ fn natwg_server_needs_the_foreground_flag() {
 }
 
 #[test]
-fn natwg_server_without_root_exits_with_not_root() {
+fn natwg_server_and_natwg_daemon_without_root_exit_with_not_root() {
     // Root passes this check and would go on to start a server.
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    let output = natwg(&["server", "--foreground", "--config", "/natwg-none.json"]);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stderr.starts_with(b"NOT_ROOT"), "{output:?}");
+    for args in [&["server", "--foreground"][..], &["daemon"]] {
+        let output = natwg(&[args, &["--config", "/natwg-none.json"]].concat());
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stderr.starts_with(b"NOT_ROOT"), "{output:?}");
+    }
+}
+
+#[test]
+fn natwg_daemon_is_left_out_of_the_help() {
+    let help = String::from_utf8(natwg(&["--help"]).stdout).unwrap();
+    let commands: Vec<&str> = help
+        .lines()
+        .filter_map(|line| line.strip_prefix("  ")?.split_whitespace().next())
+        .collect();
+    assert!(commands.contains(&"server"), "{help}");
+    assert!(!commands.contains(&"daemon"), "{help}");
 }
