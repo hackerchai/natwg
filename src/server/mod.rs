@@ -19,7 +19,10 @@ use std::{
     pin::{Pin, pin},
     time::{Duration, SystemTime},
 };
-use tokio::{sync::watch, time::Instant};
+use tokio::{
+    sync::watch,
+    time::{Instant, MissedTickBehavior},
+};
 use upnp::{Lease, Upnp};
 
 /// A run of this many unanswered STUN requests counts as a dead tunnel. The
@@ -196,6 +199,9 @@ impl Supervisor<'_> {
         let mut keepalive = pin!(keepalive);
         let mut status_tick = tokio::time::interval(STATUS_EVERY);
         let mut nat_tick = tokio::time::interval(NAT_EVERY);
+        for tick in [&mut status_tick, &mut nat_tick] {
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        }
         let mut nat_ok = None;
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun}, udp/{}", server.listen_port);
