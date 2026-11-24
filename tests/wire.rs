@@ -1,7 +1,19 @@
+use gotatun::packet::PacketBufPool;
+use gotatun::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use natwg::wire::stun::{
     TransactionId, binding_request, is_stun_binding_success, parse_binding_success,
 };
-use std::net::{Ipv4Addr, SocketAddrV4};
+use natwg::wire::transport::{BoundInterface, BoundUdp, StunPort};
+use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    time::Duration,
+};
+use tokio::net::UdpSocket;
+
+#[cfg(target_os = "macos")]
+const LOOPBACK: &str = "lo0";
+#[cfg(target_os = "linux")]
+const LOOPBACK: &str = "lo";
 
 const COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 const MAPPED_ADDRESS: u16 = 0x0001;
@@ -163,4 +175,152 @@ fn no_wireguard_message_passes_the_stun_demux() {
         message[4..8].copy_from_slice(&COOKIE);
         assert!(!is_stun_binding_success(&message), "WireGuard type {kind}");
     }
+}
+
+fn loopback() -> BoundInterface {
+    BoundInterface::lookup(LOOPBACK).unwrap()
+}
+
+fn params(port: u16) -> UdpTransportFactoryParams {
+    UdpTransportFactoryParams {
+        addr: None,
+        port,
+        #[cfg(target_os = "linux")]
+        fwmark: None,
+    }
+}
+
+fn v4(address: SocketAddr) -> SocketAddrV4 {
+    match address {
+        SocketAddr::V4(address) => address,
+        SocketAddr::V6(address) => panic!("expected IPv4, got {address}"),
+    }
+}
+
+async fn fake_stun_server() -> (UdpSocket, SocketAddrV4) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = v4(socket.local_addr().unwrap());
+    (socket, address)
+}
+
+async fn next_request(server: &UdpSocket) -> ([u8; 12], SocketAddr) {
+    let mut request = [0; 64];
+    let (len, client) = server.recv_from(&mut request).await.unwrap();
+    assert_eq!(len, 20, "a Binding request is a bare header");
+    (request[8..20].try_into().unwrap(), client)
+}
+
+fn answer(id: [u8; 12], mapping: &str) -> Vec<u8> {
+    stun_response(id, &[(XOR_MAPPED_ADDRESS, xor_mapped(addr(mapping)))])
+}
+
+fn wireguard(kind: u8, len: usize) -> Vec<u8> {
+    let mut message = vec![0x5A; len];
+    message[..4].copy_from_slice(&[kind, 0, 0, 0]);
+    message
+}
+
+#[test]
+fn an_unknown_interface_is_iface_not_found() {
+    for name in ["natwg-none0", "en\0"] {
+        assert_eq!(
+            BoundInterface::lookup(name).unwrap_err().code,
+            "IFACE_NOT_FOUND"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_shared_socket_gives_stun_answers_to_the_stun_port_and_the_rest_to_gotatun() {
+    let (mut udp, mut stun) = BoundUdp::new(loopback());
+    let (_send, mut recv) = udp.bind(&params(0)).await.unwrap();
+    let (server, server_address) = fake_stun_server().await;
+    let others = vec![
+        wireguard(1, 148),
+        wireguard(2, 92),
+        wireguard(3, 64),
+        wireguard(4, 32),
+        b"not stun".to_vec(),
+    ];
+    let serve = async {
+        let (id, client) = next_request(&server).await;
+        let stale = answer([9; 12], "198.51.100.1:1111");
+        let right = answer(id, "203.0.113.9:7007");
+        for datagram in [
+            &others[0], &stale, &others[1], &others[2], &right, &others[3], &others[4],
+        ] {
+            server.send_to(datagram, client).await.unwrap();
+        }
+    };
+    let gotatun = async {
+        let mut pool = PacketBufPool::new(4);
+        let mut seen = Vec::new();
+        for _ in 0..others.len() {
+            seen.push(recv.recv_from(&mut pool).await.unwrap().0.to_vec());
+        }
+        seen
+    };
+    let (mapping, (), seen) = tokio::join!(
+        stun.binding(server_address, Duration::from_secs(2)),
+        serve,
+        gotatun
+    );
+    assert_eq!(mapping.unwrap(), addr("203.0.113.9:7007"));
+    assert_eq!(seen, others);
+}
+
+#[tokio::test]
+async fn binding_ignores_a_stale_answer_and_times_out() {
+    let mut stun = StunPort::bind(loopback(), 0).await.unwrap();
+    let (server, server_address) = fake_stun_server().await;
+    let serve = async {
+        let (_, client) = next_request(&server).await;
+        let stale = answer([9; 12], "198.51.100.1:1111");
+        server.send_to(&stale, client).await.unwrap();
+    };
+    let (mapping, ()) = tokio::join!(
+        stun.binding(server_address, Duration::from_millis(300)),
+        serve
+    );
+    assert_eq!(mapping.unwrap_err().code, "STUN_TIMEOUT");
+}
+
+#[tokio::test]
+async fn gotatun_can_rebind_the_same_port_while_stun_waits() {
+    let (mut udp, mut stun) = BoundUdp::new(loopback());
+    let (server, server_address) = fake_stun_server().await;
+    let unbound = stun.binding(server_address, Duration::from_millis(100));
+    assert_eq!(unbound.await.unwrap_err().code, "STUN_NO_SOCKET");
+
+    let (send, recv) = udp.bind(&params(0)).await.unwrap();
+    let port = send.local_addr().unwrap().unwrap().port();
+    let rebind = async {
+        next_request(&server).await;
+        drop((send, recv));
+        udp.bind(&params(port)).await
+    };
+    let (unanswered, rebound) = tokio::join!(
+        stun.binding(server_address, Duration::from_millis(300)),
+        rebind
+    );
+    assert_eq!(unanswered.unwrap_err().code, "STUN_TIMEOUT");
+    let (send, mut recv) = rebound.expect("the old socket released its port");
+    assert_eq!(send.local_addr().unwrap().unwrap().port(), port);
+
+    let serve = async {
+        let (id, client) = next_request(&server).await;
+        assert_eq!(client.port(), port);
+        server
+            .send_to(&answer(id, "203.0.113.9:7007"), client)
+            .await
+            .unwrap();
+        server.send_to(&wireguard(4, 32), client).await.unwrap();
+    };
+    let gotatun = async { recv.recv_from(&mut PacketBufPool::new(1)).await.unwrap() };
+    let (mapping, (), _) = tokio::join!(
+        stun.binding(server_address, Duration::from_secs(2)),
+        serve,
+        gotatun
+    );
+    assert_eq!(mapping.unwrap(), addr("203.0.113.9:7007"));
 }
