@@ -56,6 +56,8 @@ impl Tunnel {
     pub async fn start(config: &Config) -> Result<(Self, StunPort)> {
         let server = config.server()?;
         netcfg::require_free_address(config.interface.address.ip())?;
+        #[cfg(target_os = "macos")]
+        netcfg::macos::require_free_routes(&allowed_ips(config, server))?;
         let subnet = subnet(config.interface.address);
         let rule = Rule::new(&server.instance, &server.iface, subnet, server.lan);
         let nat = rule.clone().check()?;
@@ -358,6 +360,17 @@ fn server_peers(config: &Config, server: &ServerConfig) -> Result<Vec<Peer>> {
         Peer::new(public(key)).with_allowed_ip(Ipv4Network::from(address).into())
     });
     Ok(config.peers.iter().map(peer).chain(doctor).collect())
+}
+
+/// The allowed IPs of every peer, the doctor's address among them.
+#[cfg(target_os = "macos")]
+fn allowed_ips(config: &Config, server: &ServerConfig) -> Vec<Ipv4Network> {
+    let doctor = server.doctor.iter().map(|doctor| doctor.address.into());
+    let peers = config
+        .peers
+        .iter()
+        .flat_map(|peer| peer.allowed_ips.clone());
+    peers.chain(doctor).collect()
 }
 
 fn peer(config: &PeerConfig) -> Peer {
