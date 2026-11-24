@@ -1,7 +1,7 @@
 //! The service definitions natwg writes, and the commands that need root.
 
 use natwg::config::{Instance, make_private_dir};
-use natwg::service::{BINARY, Service, launchd, systemd};
+use natwg::service::{self, BINARY, Service, launchd, systemd};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -282,4 +282,37 @@ fn an_install_that_cannot_write_its_definition_changes_nothing() {
     ] {
         assert!(!definition.exists(), "{} exists", definition.display());
     }
+}
+
+#[test]
+fn install_takes_only_directories_that_root_owns_and_nobody_else_can_write() {
+    service::require_root_only(Path::new("/usr/bin")).unwrap();
+    service::require_root_only(Path::new("/usr/bin/natwg-missing/libexec")).unwrap();
+    let error = service::require_root_only(Path::new("/tmp/natwg-missing")).unwrap_err();
+    assert_eq!(error.code, "SERVICE_PATH_UNSAFE");
+    assert!(error.message.starts_with("/tmp: "), "{}", error.message);
+    if !is_root() {
+        let mine = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let error = service::require_root_only(mine.path()).unwrap_err();
+        assert_eq!(error.code, "SERVICE_PATH_UNSAFE");
+    }
+}
+
+/// Needs root, so it runs only where the tests run as root, as in the
+/// Linux VM.
+#[test]
+fn a_symlink_in_the_chain_is_followed_to_where_it_points() {
+    if !is_root() {
+        return;
+    }
+    let target = tempfile::tempdir().unwrap();
+    let real = target.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+    let link = Path::new("/usr/local/natwg-chain-test");
+    let _ = fs::remove_file(link);
+    std::os::unix::fs::symlink(&real, link).unwrap();
+    let checked = service::require_root_only(&link.join("libexec"));
+    fs::remove_file(link).unwrap();
+    assert_eq!(checked.unwrap_err().code, "SERVICE_PATH_UNSAFE");
 }

@@ -58,6 +58,10 @@ pub fn install(config: &Path) -> Result<String> {
     // Everything that can refuse the install runs before the host changes.
     let service = load(config)?;
     let text = manager::definition(&service)?;
+    let binary_dir = Path::new(BINARY).parent().expect("BINARY has a directory");
+    for dir in std::iter::once(binary_dir).chain(manager::log_dir()) {
+        require_root_only(dir)?;
+    }
     let name = manager::name(&service.instance);
     let before = manager::state(&name)?;
     // Only natwg's own directory: the directory of a config elsewhere can
@@ -197,6 +201,34 @@ fn load(config: &Path) -> Result<Service> {
     let config = canonical(config)?;
     let instance = Config::load(&config)?.server()?.instance.clone();
     Ok(Service { instance, config })
+}
+
+/// Refuse `dir` unless root owns it and every directory above it, and no
+/// group or other user can write any of them. Whoever can write one of
+/// them can swap the binary that root runs, or point the log that launchd
+/// opens as root at another file. The part of `dir` that does not exist yet
+/// passes, because install creates it as root with mode 0755.
+pub fn require_root_only(dir: &Path) -> Result<()> {
+    let existing = dir
+        .ancestors()
+        .find(|dir| dir.exists())
+        .unwrap_or(Path::new("/"));
+    let real = fs::canonicalize(existing).map_err(|e| storage(existing, e))?;
+    for dir in existing.ancestors().chain(real.ancestors()) {
+        let meta = fs::metadata(dir).map_err(|e| storage(dir, e))?;
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return Err(Error::new(
+                "SERVICE_PATH_UNSAFE",
+                format!(
+                    "{}: owner uid {} and mode {:04o}; natwg installs only under directories that root owns and that no group or other user can write",
+                    dir.display(),
+                    meta.uid(),
+                    meta.mode() & 0o7777
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn canonical(path: &Path) -> Result<PathBuf> {

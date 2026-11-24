@@ -22,6 +22,11 @@ pub fn definition_path(instance: &Instance) -> PathBuf {
     Path::new(UNITS).join(name(instance))
 }
 
+/// None, because the journal keeps the logs.
+pub fn log_dir() -> Option<&'static Path> {
+    None
+}
+
 /// Where the server's output goes: the journal.
 pub fn log(instance: &Instance) -> String {
     format!("journalctl -u {}", name(instance))
