@@ -7,6 +7,7 @@ use natwg::tunnel::Detached;
 use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
+    num::NonZeroU16,
     process::{Command, Output},
     time::Duration,
 };
@@ -366,6 +367,7 @@ async fn doctor_run(
     let server = Detached::server(&config).await.unwrap();
     let endpoint = endpoint(&server).await;
     answering(server, replies);
+    let attempts = NonZeroU16::new(attempts).unwrap();
     doctor::loopback(&config, None, endpoint, attempts)
         .await
         .unwrap()
@@ -462,7 +464,7 @@ async fn the_doctor_needs_a_doctor_section() {
     let mut value = server_json(&key());
     value["peers"] = json!([{ "name": "laptop", "public_key": public(&key()), "allowed_ips": ["10.66.67.2/32"] }]);
     let endpoint = "127.0.0.1:9".parse().unwrap();
-    let error = doctor::loopback(&config(value), None, endpoint, 1)
+    let error = doctor::loopback(&config(value), None, endpoint, NonZeroU16::MIN)
         .await
         .unwrap_err();
     assert_eq!(error.code, "DOCTOR_NOT_CONFIGURED");
@@ -549,6 +551,22 @@ fn natwg_doctor_loopback_needs_an_endpoint() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("--endpoint"), "{stderr}");
+}
+
+#[test]
+fn natwg_doctor_loopback_refuses_zero_attempts_before_it_reads_the_config() {
+    let endpoint = ["--endpoint", "127.0.0.1:9", "--config", "/natwg-none.json"];
+    let output = natwg(&[&["doctor", "loopback", "--attempts", "0"], &endpoint[..]].concat());
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--attempts"), "{stderr}");
+
+    let output = natwg(&[&["doctor", "loopback", "--attempts", "1"], &endpoint[..]].concat());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.starts_with(b"CONFIG_UNREADABLE"),
+        "{output:?}"
+    );
 }
 
 #[test]

@@ -6,12 +6,13 @@ use crate::tunnel::Detached;
 use crate::{Error, Result};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
+    num::NonZeroU16,
     time::{Duration, Instant},
 };
 
 /// How many echo requests `natwg doctor loopback` sends to a target that
 /// stays silent, one per second.
-pub const ATTEMPTS: u16 = 8;
+pub const ATTEMPTS: NonZeroU16 = NonZeroU16::new(8).unwrap();
 
 const INTERVAL: Duration = Duration::from_secs(1);
 const IP_HEADER: usize = 20;
@@ -125,7 +126,7 @@ pub async fn loopback(
     config: &Config,
     iface: Option<&str>,
     endpoint: SocketAddrV4,
-    attempts: u16,
+    attempts: NonZeroU16,
 ) -> Result<Vec<Probe>> {
     let server = config.server()?;
     let doctor = server.doctor.as_ref().ok_or_else(|| {
@@ -142,7 +143,7 @@ pub async fn loopback(
     let mut client = Detached::doctor(config, doctor, iface, endpoint).await?;
     let id = std::process::id() as u16;
     let mut sent = Vec::new();
-    for seq in 0..attempts {
+    for seq in 0..attempts.get() {
         if probes.iter().all(|probe| probe.reply.is_some()) {
             break;
         }

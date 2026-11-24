@@ -12,6 +12,7 @@ use natwg::wire::transport::{BoundInterface, StunPort};
 use natwg::{Error, Result, doctor, keys::Key};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
+    num::NonZeroU16,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -89,9 +90,10 @@ enum DoctorAction {
         /// The interface the client sends through (default: the server's interface).
         #[arg(long)]
         iface: Option<String>,
-        /// How many echo requests a silent target gets, one per second.
+        /// How many echo requests a silent target gets, one per second. At
+        /// least 1.
         #[arg(long, default_value_t = doctor::ATTEMPTS)]
-        attempts: u16,
+        attempts: NonZeroU16,
     },
 }
 
@@ -241,7 +243,7 @@ fn doctor_loopback(
     config: &Path,
     iface: Option<&str>,
     endpoint: SocketAddrV4,
-    attempts: u16,
+    attempts: NonZeroU16,
 ) -> Result<()> {
     let config = Config::load(config)?;
     let probes = runtime(tokio::runtime::Builder::new_current_thread())?
