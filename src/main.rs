@@ -308,10 +308,10 @@ fn server(config: &Path) -> Result<()> {
 async fn serve(config: &Config) -> Result<()> {
     let server = config.server()?;
     let mut stop = Stop::listen()?;
-    let mut tunnel = Tunnel::start(config).await?;
+    let (mut tunnel, mut stun) = Tunnel::start(config).await?;
     say!("tun {}", tunnel.tun_name());
     let served = tokio::select! {
-        failure = until_failure(&mut tunnel, server) => Err(failure),
+        failure = until_failure(&mut tunnel, &mut stun, server) => Err(failure),
         () = stop.requested() => Ok(()),
     };
     let stopped = tunnel.stop().await;
@@ -349,8 +349,8 @@ impl Stop {
 
 /// Print the public mapping of the server's socket, then wait for the device
 /// to fail. A server that learns no mapping keeps its tunnel up.
-async fn until_failure(tunnel: &mut Tunnel, server: &ServerConfig) -> Error {
-    match public_mapping(tunnel.stun(), server).await {
+async fn until_failure(tunnel: &mut Tunnel, stun: &mut StunPort, server: &ServerConfig) -> Error {
+    match public_mapping(stun, server).await {
         Ok(mapping) => say!("mapping {mapping}"),
         Err(error) => warn!("{error}"),
     }
