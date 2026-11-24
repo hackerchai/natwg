@@ -136,6 +136,9 @@ enum ConfigAction {
         /// Print the redacted configuration without writing it.
         #[arg(long)]
         dry_run: bool,
+        /// Replace a configuration that exists already.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -218,6 +221,7 @@ fn run(cli: Cli) -> Result<()> {
                     cf_token,
                     out,
                     dry_run,
+                    force,
                 },
         } => {
             let config =
@@ -225,7 +229,11 @@ fn run(cli: Cli) -> Result<()> {
             say!("{}", config.redacted());
             if !dry_run {
                 let out = out.unwrap_or(cli.config);
-                config.save(&out)?;
+                if force {
+                    config.save(&out)?;
+                } else {
+                    config.create(&out)?;
+                }
                 warn!("Wrote {}", out.display());
             }
         }

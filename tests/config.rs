@@ -398,8 +398,8 @@ fn legacy_import_twice_writes_identical_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("config.json");
     let mut runs = Vec::new();
-    for _ in 0..2 {
-        let output = import_fixture(&out, &[]);
+    for extra in [&[][..], &["--force"]] {
+        let output = import_fixture(&out, extra);
         assert!(output.status.success(), "{output:?}");
         runs.push(fs::read(&out).unwrap());
     }
@@ -621,4 +621,62 @@ fn a_fifo_at_the_config_path_is_refused_without_blocking() {
     );
     fs::set_permissions(&fifo, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(Config::load(&fifo).unwrap_err().code, "CONFIG_UNSAFE");
+}
+
+#[test]
+fn import_legacy_replaces_a_config_only_with_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("config.json");
+    write_private(&out, "the config of someone else\n");
+
+    let output = import_fixture(&out, &[]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("CONFIG_EXISTS: "), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "the config of someone else\n"
+    );
+    let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+    assert_eq!(left.len(), 1, "a refused import leaves no temporary file");
+
+    let output = import_fixture(&out, &["--force"]);
+    assert!(output.status.success(), "{output:?}");
+    let imported = Config::load(&out).unwrap();
+    assert_eq!(imported.private_key.public_key().to_string(), SERVER_PUBLIC);
+}
+
+#[test]
+fn save_creates_missing_directories_readable_only_by_their_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("etc/natwg");
+    let config = load_value(&server_json()).unwrap();
+    config.save(&nested.join("config.json")).unwrap();
+    assert_eq!(mode(&dir.path().join("etc")), 0o700);
+    assert_eq!(mode(&nested), 0o700);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_config_that_carries_an_acl_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    load_value(&server_json()).unwrap().save(&path).unwrap();
+    let chmod = |args: &[&str]| {
+        let status = Command::new("/bin/chmod")
+            .args(args)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "chmod {args:?}");
+    };
+
+    chmod(&["+a", "everyone allow read"]);
+    assert_eq!(mode(&path), 0o600, "the ACL leaves the mode as it was");
+    let error = Config::load(&path).unwrap_err();
+    assert_eq!(error.code, "CONFIG_UNSAFE");
+    assert!(error.message.contains("ACL"), "{}", error.message);
+
+    chmod(&["-N"]);
+    Config::load(&path).unwrap();
 }
