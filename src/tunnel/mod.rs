@@ -16,9 +16,11 @@ use gotatun::tun::tun_async_device::TunDevice;
 use gotatun::tun::{IpRecv, IpSend, tun};
 use gotatun::x25519;
 use ipnetwork::{IpNetwork, Ipv4Network};
+use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const PACKET_QUEUE: usize = 64;
@@ -32,6 +34,7 @@ pub struct Tunnel {
     rule: Rule,
     device: Device<(BoundUdp, TunDevice, TunDevice)>,
     tun_name: String,
+    handshakes: Handshakes,
 }
 
 /// What a WireGuard device knows about one of its peers.
@@ -39,7 +42,7 @@ pub struct Tunnel {
 pub struct PeerStats {
     pub public_key: PublicKey,
     pub endpoint: Option<SocketAddr>,
-    /// How long ago the last handshake completed.
+    /// How long ago the last handshake completed, as [`Handshakes`] dates it.
     pub last_handshake: Option<Duration>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
@@ -86,6 +89,7 @@ impl Tunnel {
                     rule,
                     device,
                     tun_name,
+                    handshakes: Handshakes::default(),
                 };
                 Ok((tunnel, stun))
             }
@@ -108,7 +112,7 @@ impl Tunnel {
     }
 
     pub async fn peers(&self) -> Vec<PeerStats> {
-        peer_stats(&self.device).await
+        peer_stats(&self.device, &self.handshakes).await
     }
 
     /// Load the NAT rule again if it no longer takes effect. Returns whether
@@ -132,6 +136,7 @@ pub struct Detached {
     device: Device<(BoundUdp, ChannelSend, ChannelRecv)>,
     outbound: mpsc::Sender<Packet<Ip>>,
     inbound: mpsc::Receiver<Packet<Ip>>,
+    handshakes: Handshakes,
 }
 
 impl Detached {
@@ -194,6 +199,7 @@ impl Detached {
             device,
             outbound,
             inbound,
+            handshakes: Handshakes::default(),
         };
         Ok((detached, stun))
     }
@@ -205,7 +211,7 @@ impl Detached {
     }
 
     pub async fn peers(&self) -> Vec<PeerStats> {
-        peer_stats(&self.device).await
+        peer_stats(&self.device, &self.handshakes).await
     }
 
     pub async fn stop(self) {
@@ -234,18 +240,55 @@ impl Detached {
     }
 }
 
-async fn peer_stats<T: DeviceTransports>(device: &Device<T>) -> Vec<PeerStats> {
+async fn peer_stats<T: DeviceTransports>(
+    device: &Device<T>,
+    handshakes: &Handshakes,
+) -> Vec<PeerStats> {
     let peers = device.read(async |device| device.peers().await).await;
+    let now = Instant::now();
     peers
         .into_iter()
-        .map(|peer| PeerStats {
-            public_key: PublicKey::from(peer.peer.public_key.to_bytes()),
-            endpoint: peer.peer.endpoint,
-            last_handshake: peer.stats.last_handshake,
-            rx_bytes: peer.stats.rx_bytes as u64,
-            tx_bytes: peer.stats.tx_bytes as u64,
+        .map(|peer| {
+            let key = peer.peer.public_key.to_bytes();
+            PeerStats {
+                public_key: PublicKey::from(key),
+                endpoint: peer.peer.endpoint,
+                last_handshake: handshakes.date(key, peer.stats.last_handshake, now),
+                rx_bytes: peer.stats.rx_bytes as u64,
+                tx_bytes: peer.stats.tx_bytes as u64,
+            }
         })
         .collect()
+}
+
+/// When each peer of a device last completed a handshake. gotatun 0.10.3 is
+/// wrong in two cases. Its timer loop skips a peer that has no endpoint, so
+/// it dates the first handshake of a peer without a configured endpoint
+/// from the start of the device. And it reports no handshake once the
+/// session expires. So a handshake is never dated before the last look at
+/// the peers that saw it without a session, and it outlives its session.
+#[derive(Default)]
+struct Handshakes(Mutex<HashMap<[u8; 32], Handshake>>);
+
+#[derive(Default)]
+struct Handshake {
+    at: Option<Instant>,
+    /// The last look that saw the peer without a session.
+    idle: Option<Instant>,
+}
+
+impl Handshakes {
+    /// How long ago the peer `key` completed its last handshake, given what
+    /// gotatun `reported` at `now`.
+    fn date(&self, key: [u8; 32], reported: Option<Duration>, now: Instant) -> Option<Duration> {
+        let mut peers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let seen = peers.entry(key).or_default();
+        match reported.and_then(|ago| now.checked_sub(ago)) {
+            None => seen.idle = Some(now),
+            Some(at) => seen.at = seen.at.max(seen.idle.max(Some(at))),
+        }
+        seen.at.map(|at| now.saturating_duration_since(at))
+    }
 }
 
 fn stopped() -> Error {
@@ -366,4 +409,57 @@ async fn device<Tx: IpSend, Rx: IpRecv>(
             error => Error::new("TUNNEL_FAILED", error.to_string()),
         })?;
     Ok((device, stun))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Handshakes;
+    use std::time::{Duration, Instant};
+
+    const PEER: [u8; 32] = [7; 32];
+
+    fn secs(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_first_handshake_is_dated_no_earlier_than_the_last_look_without_a_session() {
+        let handshakes = Handshakes::default();
+        let start = Instant::now();
+        assert_eq!(handshakes.date(PEER, None, start + secs(3590)), None);
+        let device_age = secs(3600);
+        let ago = handshakes.date(PEER, Some(device_age), start + device_age);
+        assert_eq!(ago, Some(secs(10)));
+    }
+
+    #[test]
+    fn a_handshake_that_gotatun_dates_right_keeps_its_date() {
+        let handshakes = Handshakes::default();
+        let start = Instant::now();
+        assert_eq!(handshakes.date(PEER, None, start), None);
+        assert_eq!(
+            handshakes.date(PEER, Some(secs(3)), start + secs(10)),
+            Some(secs(3))
+        );
+        assert_eq!(
+            handshakes.date(PEER, Some(secs(13)), start + secs(20)),
+            Some(secs(13))
+        );
+    }
+
+    #[test]
+    fn a_handshake_outlives_its_session() {
+        let handshakes = Handshakes::default();
+        let start = Instant::now();
+        handshakes.date(PEER, Some(secs(5)), start + secs(10));
+        assert_eq!(
+            handshakes.date(PEER, None, start + secs(400)),
+            Some(secs(395))
+        );
+        assert_eq!(
+            handshakes.date(PEER, Some(secs(1)), start + secs(500)),
+            Some(secs(1)),
+            "a later handshake replaces it"
+        );
+    }
 }
