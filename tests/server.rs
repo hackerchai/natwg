@@ -1,11 +1,18 @@
-use natwg::config::StunConfig;
+use natwg::config::{CloudflareConfig, StunConfig};
+use natwg::server::cloudflare::{self, Publish, Publisher, Record};
 use natwg::server::keepalive::{self, Health, Mapping, Targets};
 use natwg::wire::transport::{BoundInterface, StunPort};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
-    net::{SocketAddr, SocketAddrV4},
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, SocketAddrV4, TcpStream},
     num::NonZeroU64,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{mpsc, watch};
 
@@ -181,6 +188,323 @@ async fn the_keepalive_counts_misses_and_reports_each_new_mapping() {
     };
     tokio::select! {
         never = keepalive => match never {},
+        () = check => {}
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct Request {
+    method: String,
+    target: String,
+    authorization: Option<String>,
+    body: Option<Value>,
+}
+
+/// An HTTP/1.1 server on a blocking thread that answers each request with
+/// the status and JSON body of `reply`, and reports the request. It stops
+/// when the value drops.
+struct MockApi {
+    url: String,
+    requests: mpsc::UnboundedReceiver<Request>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for MockApi {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl MockApi {
+    fn start(reply: impl Fn(&Request) -> (u16, Value) + Send + 'static) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/client/v4", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let (seen, requests) = mpsc::unbounded_channel();
+        tokio::task::spawn_blocking(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve(stream, &reply, &seen),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+        }
+    }
+
+    /// The requests that arrived so far.
+    fn taken(&mut self) -> Vec<Request> {
+        std::iter::from_fn(|| self.requests.try_recv().ok()).collect()
+    }
+}
+
+fn serve(
+    mut stream: TcpStream,
+    reply: &impl Fn(&Request) -> (u16, Value),
+    seen: &mpsc::UnboundedSender<Request>,
+) {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let mut words = line.split_whitespace().map(str::to_owned);
+    let (method, target) = (words.next().unwrap(), words.next().unwrap());
+    let (mut length, mut authorization) = (0, None);
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let Some((name, value)) = line.trim_end().split_once(':') else {
+            break;
+        };
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => length = value.trim().parse().unwrap(),
+            "authorization" => authorization = Some(value.trim().to_owned()),
+            _ => {}
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    let request = Request {
+        method,
+        target,
+        authorization,
+        body: (length > 0).then(|| serde_json::from_slice(&body).unwrap()),
+    };
+    let (status, answer) = reply(&request);
+    let _ = seen.send(request);
+    let answer = answer.to_string();
+    let head = format!(
+        "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        answer.len()
+    );
+    let _ = stream.write_all(format!("{head}{answer}").as_bytes());
+}
+
+const TOKEN: &str = "cf-test-token-7Hq2";
+const ZONES: &str = "/client/v4/zones?name=example.com";
+const RECORDS: &str = "/client/v4/zones/zone1/dns_records";
+const LOOKUP: &str = "/client/v4/zones/zone1/dns_records?type=TXT&name=_wg.example.com";
+const RECORD: &str = "/client/v4/zones/zone1/dns_records/rec1";
+
+fn ok(result: Value) -> (u16, Value) {
+    (
+        200,
+        json!({"success": true, "errors": [], "result": result}),
+    )
+}
+
+fn unknown() -> (u16, Value) {
+    (
+        404,
+        json!({"success": false, "errors": [{"code": 7003, "message": "no route"}]}),
+    )
+}
+
+fn cloudflare_config() -> CloudflareConfig {
+    CloudflareConfig {
+        zone: "example.com".into(),
+        record: "_wg.example.com".into(),
+        token: TOKEN.parse().unwrap(),
+    }
+}
+
+fn mapping(text: &str) -> Option<Mapping> {
+    Some(Mapping {
+        addr: addr(text),
+        since: SystemTime::now(),
+    })
+}
+
+/// The body natwg.py sends, as its `json.dumps` prints it.
+fn python_body(value: &str) -> Value {
+    let printed = format!(
+        r#"{{"type": "TXT", "name": "_wg.example.com", "content": "\"{value}\"", "ttl": 60, "comment": "natwg: WireGuard public endpoint, auto-updated"}}"#
+    );
+    serde_json::from_str(&printed).unwrap()
+}
+
+fn put(value: &str) -> Request {
+    Request {
+        method: "PUT".into(),
+        target: RECORD.into(),
+        authorization: Some(format!("Bearer {TOKEN}")),
+        body: Some(python_body(value)),
+    }
+}
+
+fn get(target: &str) -> Request {
+    Request {
+        method: "GET".into(),
+        target: target.into(),
+        authorization: Some(format!("Bearer {TOKEN}")),
+        body: None,
+    }
+}
+
+/// Let 200 ms of real time pass while tokio's paused clock stands still, so
+/// a request that the code under test sends now reaches the mock.
+async fn real_pause() {
+    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(200)))
+        .await
+        .unwrap();
+}
+
+async fn published(state: &mut watch::Receiver<Publish>, value: &str) -> Record {
+    let value = addr(value);
+    let state = state
+        .wait_for(|state| matches!(state, Publish::Published(record) if record.value == value))
+        .await
+        .unwrap();
+    state.record().unwrap()
+}
+
+async fn failed(state: &mut watch::Receiver<Publish>) -> (String, tokio::time::Instant) {
+    match &*state
+        .wait_for(|state| matches!(state, Publish::Failed { .. }))
+        .await
+        .unwrap()
+    {
+        Publish::Failed {
+            error, retry_at, ..
+        } => (error.clone(), *retry_at),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn a_missing_record_is_created_with_the_body_natwg_py_sends() {
+    let mut api =
+        MockApi::start(
+            |request| match (request.method.as_str(), request.target.as_str()) {
+                ("GET", ZONES) => ok(json!([{"id": "zone1"}])),
+                ("GET", LOOKUP) => ok(json!([])),
+                ("POST", RECORDS) => ok(json!({"id": "rec1"})),
+                _ => unknown(),
+            },
+        );
+    let (_mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let check = async {
+        published(&mut state, "203.0.113.9:7007").await;
+        let create = Request {
+            method: "POST".into(),
+            target: RECORDS.into(),
+            authorization: Some(format!("Bearer {TOKEN}")),
+            body: Some(python_body("203.0.113.9:7007")),
+        };
+        assert_eq!(api.taken(), [get(ZONES), get(LOOKUP), create]);
+    };
+    tokio::select! {
+        never = publisher.run(mapping_rx, state_tx) => match never {},
+        () = check => {}
+    }
+}
+
+#[tokio::test]
+async fn an_existing_record_is_updated_and_a_value_already_published_is_skipped() {
+    let mut api =
+        MockApi::start(
+            |request| match (request.method.as_str(), request.target.as_str()) {
+                ("GET", ZONES) => ok(json!([{"id": "zone1"}])),
+                ("GET", LOOKUP) => ok(json!([{"id": "rec1"}])),
+                ("PUT", RECORD) => ok(json!({"id": "rec1"})),
+                _ => unknown(),
+            },
+        );
+    let (mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let check = async {
+        let first = published(&mut state, "203.0.113.9:7007").await;
+        assert_eq!(
+            api.taken(),
+            [get(ZONES), get(LOOKUP), put("203.0.113.9:7007")]
+        );
+
+        mapping_tx.send_replace(mapping("203.0.113.9:7008"));
+        let second = published(&mut state, "203.0.113.9:7008").await;
+        assert!(second.at >= first.at);
+        assert_eq!(api.taken(), [put("203.0.113.9:7008")], "ids are cached");
+
+        mapping_tx.send_replace(mapping("203.0.113.9:7008"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(api.taken(), [], "the record holds 7008 already");
+        mapping_tx.send_replace(mapping("203.0.113.9:7009"));
+        published(&mut state, "203.0.113.9:7009").await;
+        assert_eq!(api.taken(), [put("203.0.113.9:7009")]);
+    };
+    tokio::select! {
+        never = publisher.run(mapping_rx, state_tx) => match never {},
+        () = check => {}
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_api_error_is_reported_without_the_token_and_tried_again_after_60_s() {
+    let mut api = MockApi::start(|_| {
+        let message = format!("Invalid access token {TOKEN}");
+        (
+            403,
+            json!({"success": false, "errors": [{"code": 9109, "message": message}]}),
+        )
+    });
+    let (_mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let check = async {
+        assert_eq!(api.requests.recv().await.unwrap(), get(ZONES));
+        let (error, retry_at) = failed(&mut state).await;
+        let failed_at = tokio::time::Instant::now();
+        assert!(error.starts_with("CLOUDFLARE_API: HTTP 403"), "{error}");
+        assert!(error.contains("9109"), "{error}");
+        assert!(!error.contains(TOKEN), "the token leaked into {error:?}");
+        assert_eq!(retry_at, failed_at + cloudflare::RETRY);
+
+        tokio::time::advance(cloudflare::RETRY - Duration::from_secs(1)).await;
+        real_pause().await;
+        assert_eq!(api.taken(), [], "no retry before 60 s");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(api.requests.recv().await.unwrap(), get(ZONES));
+        assert_eq!(tokio::time::Instant::now() - failed_at, cloudflare::RETRY);
+    };
+    tokio::select! {
+        never = publisher.run(mapping_rx, state_tx) => match never {},
+        () = check => {}
+    }
+}
+
+#[tokio::test]
+async fn a_zone_the_token_cannot_see_is_an_error() {
+    let api = MockApi::start(|request| match request.target.as_str() {
+        ZONES => ok(json!([])),
+        _ => unknown(),
+    });
+    let (_mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let check = async {
+        let (error, _) = failed(&mut state).await;
+        assert_eq!(
+            error,
+            "CLOUDFLARE_ZONE: the zone example.com is not visible to the token"
+        );
+        assert_eq!(state.borrow().record(), None);
+    };
+    tokio::select! {
+        never = publisher.run(mapping_rx, state_tx) => match never {},
         () = check => {}
     }
 }
