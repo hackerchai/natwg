@@ -7,6 +7,7 @@ use natwg::tunnel::Detached;
 use serde_json::{Value, json};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
+    process::{Command, Output},
     time::Duration,
 };
 
@@ -465,4 +466,106 @@ async fn the_doctor_needs_a_doctor_section() {
         .await
         .unwrap_err();
     assert_eq!(error.code, "DOCTOR_NOT_CONFIGURED");
+}
+
+fn natwg(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_natwg"))
+        .args(args)
+        .env_remove("NATWG_CONFIG")
+        .output()
+        .unwrap()
+}
+
+/// Run `natwg doctor loopback` against a server in this process.
+async fn natwg_doctor(
+    replies: impl Fn(Echo) -> Vec<Echo> + Send + 'static,
+    extra: &'static [&'static str],
+) -> Output {
+    let config = with_doctor();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    config.save(&path).unwrap();
+    let server = Detached::server(&config).await.unwrap();
+    let endpoint = endpoint(&server).await.to_string();
+    answering(server, replies);
+    tokio::task::spawn_blocking(move || {
+        let path = path.to_str().unwrap();
+        let mut args = vec!["doctor", "loopback", "--config", path];
+        args.extend(["--endpoint", &endpoint]);
+        args.extend(extra);
+        natwg(&args)
+    })
+    .await
+    .unwrap()
+}
+
+fn reply_time(line: &str, target: &str) -> f64 {
+    line.strip_prefix(target)
+        .and_then(|rest| rest.strip_prefix(" reply "))
+        .and_then(|rest| rest.strip_suffix(" ms"))
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("expected `{target} reply <ms> ms`, got {line:?}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn natwg_doctor_loopback_prints_one_reply_line_for_each_target_and_exits_0() {
+    let output = natwg_doctor(|request| vec![pong(request)], &[]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    for (line, target) in lines.iter().zip(["10.66.67.1", "10.24.0.1"]) {
+        let ms = reply_time(line, target);
+        assert!((0.0..1000.0).contains(&ms), "{line}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn natwg_doctor_loopback_exits_1_and_names_the_target_that_stayed_silent() {
+    let only_the_tunnel_address = |request: Echo| {
+        if request.destination == SERVER {
+            vec![pong(request)]
+        } else {
+            vec![]
+        }
+    };
+    let output = natwg_doctor(only_the_tunnel_address, &["--attempts", "2"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    reply_time(lines[0], "10.66.67.1");
+    assert_eq!(lines[1], "10.24.0.1 no reply");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("DOCTOR_NO_REPLY"), "{stderr}");
+    assert!(stderr.contains("10.24.0.1"), "{stderr}");
+    assert!(!stderr.contains("10.66.67.1"), "{stderr}");
+}
+
+#[test]
+fn natwg_doctor_loopback_needs_an_endpoint() {
+    let output = natwg(&["doctor", "loopback"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--endpoint"), "{stderr}");
+}
+
+#[test]
+fn natwg_server_needs_the_foreground_flag() {
+    let output = natwg(&["server"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--foreground"), "{stderr}");
+}
+
+#[test]
+fn natwg_server_without_root_exits_with_not_root() {
+    // Root passes this check and would go on to start a server.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let output = natwg(&["server", "--foreground", "--config", "/natwg-none.json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.starts_with(b"NOT_ROOT"), "{output:?}");
 }
