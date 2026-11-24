@@ -1,0 +1,21 @@
+{
+  "iface": "en6",
+  "listen_port": 51830,
+  "wg_port": 51820,
+  "wg_iface": "wg-home",
+  "wg_conf": "/etc/wireguard/wg-home.conf",
+  "wg_subnet": "10.66.66.0/24",
+  "lan_subnet": "10.73.0.0/24",
+  "stun_servers": ["stun.miwifi.com:3478", "stun.chat.bilibili.com:3478", "stun.hitv.com:3478", "stun.cloudflare.com:3478"],
+  "stun_fallback": ["111.206.174.3:3478", "111.206.174.2:3478"],
+  "dns_server": "223.5.5.5",
+  "keepalive": 17,
+  "upnp_control_url": "http://10.73.0.1:1900/ipc",
+  "upnp_refresh": 300,
+  "upnp_lease": 3600,
+  "cf_zone": "example.com",
+  "cf_record": "_wg-home.example.com",
+  "cf_token_file": "/usr/local/etc/natwg/cf_token",
+  "status_file": "/usr/local/var/natwg/status.json",
+  "session_idle": 600
+}
