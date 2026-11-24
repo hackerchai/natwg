@@ -70,6 +70,10 @@ pub fn path(server: &ServerConfig) -> PathBuf {
     }
 }
 
+/// A status older than this many seconds means the server stopped writing
+/// it, which it does every 10 s.
+pub const STALE_AFTER: u64 = 60;
+
 pub fn unix(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
@@ -106,6 +110,32 @@ impl Status {
         })?;
         serde_json::from_str(&text)
             .map_err(|e| Error::new("STATUS_INVALID", format!("{}: {e}", path.display())))
+    }
+
+    /// What this status shows to be wrong at `now`, for people to read.
+    /// None of it holds while the server serves: the status is fresh, a
+    /// tunnel runs with its NAT rule, there is a public mapping, the last TXT
+    /// publish worked, and UPnP did not fail. UPnP that is off is fine.
+    pub fn problems(&self, now: u64) -> Vec<String> {
+        let age = now.saturating_sub(self.updated);
+        let tunnel = self.tun.is_some();
+        [
+            (age > STALE_AFTER, format!("the status is {age}s old")),
+            (!tunnel, "no tunnel runs".to_owned()),
+            (
+                tunnel && self.nat_ok != Some(true),
+                "NAT is not ok".to_owned(),
+            ),
+            (self.mapping.is_none(), "no public mapping".to_owned()),
+            (
+                self.publish_error.is_some(),
+                "the TXT publish failed".to_owned(),
+            ),
+            (self.upnp_ok == Some(false), "UPnP failed".to_owned()),
+        ]
+        .into_iter()
+        .filter_map(|(wrong, problem)| wrong.then_some(problem))
+        .collect()
     }
 
     /// The status for people to read, with times as their age at `now`.

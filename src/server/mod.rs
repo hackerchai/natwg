@@ -198,11 +198,12 @@ impl Supervisor<'_> {
         );
         let mut keepalive = pin!(keepalive);
         let mut status_tick = tokio::time::interval(STATUS_EVERY);
-        let mut nat_tick = tokio::time::interval(NAT_EVERY);
+        // The first status already says whether NAT works.
+        let mut nat_ok = self.check_nat(device, None);
+        let mut nat_tick = tokio::time::interval_at(Instant::now() + NAT_EVERY, NAT_EVERY);
         for tick in [&mut status_tick, &mut nat_tick] {
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         }
-        let mut nat_ok = None;
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun}, udp/{}", server.listen_port);
         loop {
