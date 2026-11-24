@@ -1,7 +1,7 @@
 //! The service definitions natwg writes, and the commands that need root.
 
 use natwg::config::{Instance, make_private_dir};
-use natwg::service::{Service, launchd, systemd};
+use natwg::service::{BINARY, Service, launchd, systemd};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -212,7 +212,7 @@ fn an_open_config_directory_becomes_private_and_passes_no_acl_to_a_new_config() 
 
 #[test]
 fn service_commands_that_change_the_host_need_root() {
-    if unsafe { libc::geteuid() } == 0 {
+    if is_root() {
         return;
     }
     for action in ["install", "uninstall", "restart"] {
@@ -224,5 +224,62 @@ fn service_commands_that_change_the_host_need_root() {
         assert!(!output.status.success(), "{action}");
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.starts_with("NOT_ROOT: "), "{action}: {stderr}");
+    }
+}
+
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// A server config for the instance `natwg_odd` at `path`, private to its
+/// owner.
+fn write_server_config(path: &Path) {
+    let config = serde_json::json!({
+        "version": 1,
+        "private_key": natwg::keys::Key::generate().unwrap().to_base64(),
+        "interface": { "address": "10.66.79.1/24" },
+        "peers": [],
+        "role": { "server": {
+            "instance": "natwg_odd",
+            "iface": "lo",
+            "listen_port": 51899,
+            "lan": "10.73.0.0/24",
+            "stun": { "servers": [], "fallback": [], "dns_server": "127.0.0.1" },
+            "cloudflare": { "zone": "example.com", "record": "_wg.example.com", "token": "t" }
+        }}
+    });
+    fs::write(path, config.to_string()).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Needs root, so it runs only where the tests run as root, as in the
+/// Linux VM.
+#[test]
+fn an_install_that_cannot_write_its_definition_changes_nothing() {
+    if !is_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let odd = dir.path().join("a\nb");
+    fs::create_dir(&odd).unwrap();
+    let config = odd.join("config.json");
+    write_server_config(&config);
+    let binary = fs::read(BINARY).ok();
+    let output = Command::new(env!("CARGO_BIN_EXE_natwg"))
+        .arg("--config")
+        .arg(&config)
+        .args(["service", "install"])
+        .env_remove("NATWG_CONFIG")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("SERVICE_PATH: "), "{stderr}");
+    assert_eq!(fs::read(BINARY).ok(), binary, "{BINARY} changed");
+    let odd_instance = instance("natwg_odd");
+    for definition in [
+        launchd::definition_path(&odd_instance),
+        systemd::definition_path(&odd_instance),
+    ] {
+        assert!(!definition.exists(), "{} exists", definition.display());
     }
 }
