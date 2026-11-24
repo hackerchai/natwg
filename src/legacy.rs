@@ -4,8 +4,8 @@
 //! install always produces the same config.
 
 use crate::config::{
-    CloudflareConfig, Config, DEFAULT_MTU, Interface, PeerConfig, Role, ServerConfig, StunConfig,
-    UpnpConfig, Version1,
+    CloudflareConfig, Config, DEFAULT_MTU, Instance, Interface, PeerConfig, Role, ServerConfig,
+    StunConfig, UpnpConfig, Version1,
 };
 use crate::keys::{Key, PublicKey, Secret};
 use crate::{Error, Result};
@@ -74,6 +74,7 @@ pub fn import(
         interface: server.interface,
         peers: server.peers,
         role: Role::Server(ServerConfig {
+            instance: Instance::default(),
             iface: legacy.iface,
             listen_port: legacy.listen_port,
             lan: legacy.lan_subnet,

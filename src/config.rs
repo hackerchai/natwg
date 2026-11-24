@@ -6,11 +6,13 @@ use crate::{Error, Result};
 use ipnetwork::Ipv4Network;
 use serde::{Deserialize, Serialize};
 use std::{
+    fmt,
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU64,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
+    str::FromStr,
 };
 
 #[cfg(target_os = "macos")]
@@ -78,6 +80,10 @@ pub struct PeerConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a process loads one Config, so the size of the server variant costs nothing"
+)]
 pub enum Role {
     Server(ServerConfig),
     Client(ClientConfig),
@@ -86,6 +92,8 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub instance: Instance,
     pub iface: String,
     pub listen_port: u16,
     pub lan: Ipv4Network,
@@ -95,6 +103,61 @@ pub struct ServerConfig {
     pub cloudflare: CloudflareConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doctor: Option<DoctorConfig>,
+}
+
+/// The name of one natwg server on a host. It names the pf anchor, the nftables
+/// table and the Linux TUN device, so two servers with different names can run
+/// side by side.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Instance(String);
+
+impl Instance {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for Instance {
+    fn default() -> Self {
+        Self("natwg".to_owned())
+    }
+}
+
+impl TryFrom<String> for Instance {
+    type Error = &'static str;
+
+    fn try_from(name: String) -> std::result::Result<Self, Self::Error> {
+        // A Linux interface name holds 15 bytes, and the Linux TUN takes this name.
+        let valid = (1..=15).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'));
+        if !valid {
+            return Err("expected an instance name of 1 to 15 characters from a-z, 0-9 and _");
+        }
+        Ok(Self(name))
+    }
+}
+
+impl FromStr for Instance {
+    type Err = &'static str;
+
+    fn from_str(name: &str) -> std::result::Result<Self, Self::Err> {
+        name.to_owned().try_into()
+    }
+}
+
+impl From<Instance> for String {
+    fn from(instance: Instance) -> Self {
+        instance.0
+    }
+}
+
+impl fmt::Display for Instance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
