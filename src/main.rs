@@ -12,7 +12,7 @@ use natwg::tunnel::{self, Tunnel};
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
-use natwg::{Error, Result, doctor, keys::Key, service};
+use natwg::{Error, Result, doctor, keys::Key, peer, service};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
@@ -82,6 +82,14 @@ enum Action {
         #[arg(long, required = true)]
         foreground: bool,
     },
+    /// Add, list or remove the clients of the server config.
+    ///
+    /// natwg replaces --config in one step. Restart the server to load the
+    /// change: sudo natwg service restart.
+    Peer {
+        #[command(subcommand)]
+        action: PeerAction,
+    },
     /// Show what the running server or client reported last. Needs no root.
     ///
     /// natwg exits 1 when the status is older than 60 s or shows a problem:
@@ -115,6 +123,32 @@ enum Action {
     /// `server --foreground` and `client --foreground` do.
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Subcommand)]
+enum PeerAction {
+    /// Give a new client fresh keys and the next free tunnel address, add it
+    /// to the server config, and print the client's config.json.
+    ///
+    /// The client config holds the client's private key. Copy it to the
+    /// client privately, as /usr/local/etc/natwg/config.json (macOS) or
+    /// /etc/natwg/config.json (Linux), owned by root with mode 0600.
+    Add {
+        /// The name of the peer: 1 to 32 characters from A-Z, a-z, 0-9, '.',
+        /// '_' and '-'.
+        name: String,
+        /// Write the client config here, readable only by its owner, instead
+        /// of printing it.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Replace a file at --out.
+        #[arg(long, requires = "out")]
+        force: bool,
+    },
+    /// Print each peer: its name, allowed IPs and public key.
+    List,
+    /// Remove a peer from the server config.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -343,6 +377,7 @@ fn run(cli: Cli) -> Result<()> {
         Action::Server { foreground: _ } => daemon(&cli.config, Some(Want::Server))?,
         Action::Client { foreground: _ } => daemon(&cli.config, Some(Want::Client))?,
         Action::Daemon => daemon(&cli.config, None)?,
+        Action::Peer { action } => peer_action(&cli.config, action)?,
         Action::Status { json, status_file } => {
             let status = Report::read(&status_file.unwrap_or_else(status::default_path))?;
             let now = status::unix(SystemTime::now());
@@ -368,6 +403,51 @@ fn run(cli: Cli) -> Result<()> {
                 },
         } => doctor_loopback(&cli.config, iface.as_deref(), endpoint, attempts)?,
         Action::Service { action } => service_action(&cli.config, action)?,
+    }
+    Ok(())
+}
+
+fn peer_action(path: &Path, action: PeerAction) -> Result<()> {
+    let mut config = Config::load(path)?;
+    match action {
+        PeerAction::List => {
+            match peer::list(&config)?.trim_end() {
+                "" => warn!("{} has no peers", path.display()),
+                listed => say!("{listed}"),
+            }
+            return Ok(());
+        }
+        PeerAction::Add { name, out, force } => {
+            let client = peer::add(&mut config, &name)?;
+            // The client's file comes first, so a refused --out leaves the
+            // server config as it was.
+            if let Some(out) = &out {
+                if force {
+                    client.save(out)?;
+                } else {
+                    client.create(out)?;
+                }
+            }
+            config.save(path)?;
+            let address = client.interface.address;
+            match &out {
+                Some(out) => warn!("Wrote the config of {name} to {}", out.display()),
+                None => say!("{}", client.exposed()),
+            }
+            warn!(
+                "Added peer {name} at {address} to {}; sudo natwg service restart loads it",
+                path.display()
+            );
+        }
+        PeerAction::Remove { name } => {
+            let removed = peer::remove(&mut config, &name)?;
+            config.save(path)?;
+            warn!(
+                "Removed peer {name} ({}) from {}; sudo natwg service restart drops it",
+                removed.public_key,
+                path.display()
+            );
+        }
     }
     Ok(())
 }
