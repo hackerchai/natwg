@@ -149,6 +149,45 @@ async fn the_server_reports_each_peer_with_its_handshake_and_traffic() {
     assert!(after.rx_bytes > 0 && after.tx_bytes > 0, "{after:?}");
 }
 
+/// A server that ran for `age` before the doctor's first handshake, and what
+/// it reports for the doctor then. `look` reads the peers once before the
+/// handshake.
+async fn first_handshake_after(age: Duration, look: bool) -> Duration {
+    let config = with_doctor();
+    let mut server = Detached::server(&config).await.unwrap().0;
+    tokio::time::sleep(age).await;
+    if look {
+        assert_eq!(server.peers().await[0].last_handshake, None);
+    }
+    let doctor = dial_as_doctor(&config, &server).await;
+    doctor
+        .send(&packet(DOCTOR, SERVER, b"hello"))
+        .await
+        .unwrap();
+    next(&mut server).await;
+    let [peer] = &server.peers().await[..] else {
+        panic!("the doctor is the only peer");
+    };
+    peer.last_handshake
+        .expect("the doctor completed a handshake")
+}
+
+/// gotatun 0.10.3 skips a peer that has no endpoint in its timer loop, so
+/// the first handshake of such a peer is as old as the device. When this
+/// fails, gotatun dates it right, and `tunnel::Handshakes` can go.
+#[tokio::test]
+async fn gotatun_dates_a_first_handshake_from_the_device_start() {
+    let age = Duration::from_secs(2);
+    let reported = first_handshake_after(age, false).await;
+    assert!(reported >= age, "{reported:?}");
+}
+
+#[tokio::test]
+async fn a_first_handshake_is_dated_no_earlier_than_the_last_look_that_saw_none() {
+    let reported = first_handshake_after(Duration::from_secs(2), true).await;
+    assert!(reported < Duration::from_secs(1), "{reported:?}");
+}
+
 #[tokio::test]
 async fn the_doctor_sends_the_lan_through_the_tunnel_and_nothing_else() {
     let config = with_doctor();
