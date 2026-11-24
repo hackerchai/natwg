@@ -389,6 +389,30 @@ fn keys_gen_prints_a_fresh_matching_pair() {
 }
 
 #[test]
+fn natwg_prints_into_a_closed_pipe_without_a_panic() {
+    let closed_pipe = || {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer
+    };
+    let output = natwg()
+        .args(["keys", "gen"])
+        .stdout(closed_pipe())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(stderr, "");
+
+    let output = natwg()
+        .args(["config", "show", "--config", "/natwg-none.json"])
+        .stderr(closed_pipe())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "CONFIG_UNREADABLE exits 1");
+}
+
+#[test]
 fn secrets_serialize_redacted_outside_the_config_file() {
     let config = load_value(&server_json()).unwrap();
     let text = serde_json::to_string(&config).unwrap();

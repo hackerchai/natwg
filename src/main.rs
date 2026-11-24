@@ -1,3 +1,8 @@
+// `println!` and `eprintln!` panic when the pipe they write to is closed, and
+// the server outlives the reader of its output. Every line goes through
+// `say!` or `warn!`, which drop a line that cannot be written.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use clap::{Args, Parser, Subcommand};
 use natwg::config::{Config, ServerConfig};
 use natwg::tunnel::Tunnel;
@@ -11,6 +16,20 @@ use std::{
     time::Duration,
 };
 use tokio::signal::unix::{Signal, SignalKind, signal};
+
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+macro_rules! warn {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 #[derive(Parser)]
 #[command(
@@ -165,7 +184,7 @@ fn millis(text: &str) -> std::result::Result<Duration, std::num::ParseIntError> 
 
 fn main() {
     if let Err(error) = run(Cli::parse()) {
-        eprintln!("{error}");
+        warn!("{error}");
         std::process::exit(1);
     }
 }
@@ -180,11 +199,11 @@ fn run(cli: Cli) -> Result<()> {
                 "private_key": key.to_base64(),
                 "public_key": key.public_key(),
             });
-            println!("{keys:#}");
+            say!("{keys:#}");
         }
         Action::Config {
             action: ConfigAction::Show,
-        } => println!("{}", Config::load(&cli.config)?.redacted()),
+        } => say!("{}", Config::load(&cli.config)?.redacted()),
         Action::Config {
             action:
                 ConfigAction::ImportLegacy {
@@ -197,11 +216,11 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let config =
                 natwg::legacy::import(&natwg_json, wg_conf.as_deref(), cf_token.as_deref())?;
-            println!("{}", config.redacted());
+            say!("{}", config.redacted());
             if !dry_run {
                 let out = out.unwrap_or(cli.config);
                 config.save(&out)?;
-                eprintln!("Wrote {}", out.display());
+                warn!("Wrote {}", out.display());
             }
         }
         Action::Probe { action } => probe(action)?,
@@ -232,10 +251,10 @@ fn doctor_loopback(
         match probe.reply {
             Some(reply) => {
                 let ms = reply.as_secs_f64() * 1000.0;
-                println!("{} reply {ms:.1} ms", probe.target);
+                say!("{} reply {ms:.1} ms", probe.target);
             }
             None => {
-                println!("{} no reply", probe.target);
+                say!("{} no reply", probe.target);
                 silent.push(probe.target.to_string());
             }
         }
@@ -271,7 +290,7 @@ async fn serve(config: &Config) -> Result<()> {
     let server = config.server()?;
     let mut stop = Stop::listen()?;
     let mut tunnel = Tunnel::start(config).await?;
-    println!("tun {}", tunnel.tun_name());
+    say!("tun {}", tunnel.tun_name());
     let served = tokio::select! {
         failure = until_failure(&mut tunnel, server) => Err(failure),
         () = stop.requested() => Ok(()),
@@ -313,8 +332,8 @@ impl Stop {
 /// to fail. A server that learns no mapping keeps its tunnel up.
 async fn until_failure(tunnel: &mut Tunnel, server: &ServerConfig) -> Error {
     match public_mapping(tunnel.stun(), server).await {
-        Ok(mapping) => println!("mapping {mapping}"),
-        Err(error) => eprintln!("{error}"),
+        Ok(mapping) => say!("mapping {mapping}"),
+        Err(error) => warn!("{error}"),
     }
     tunnel.failed().await;
     Error::new(
@@ -331,7 +350,7 @@ async fn public_mapping(stun: &mut StunPort, server: &ServerConfig) -> Result<So
     for entry in &server.stun.servers {
         match host_port(entry) {
             Ok(server) => servers.push(server),
-            Err(error) => eprintln!("STUN_SERVER_INVALID: {entry:?}: {error}"),
+            Err(error) => warn!("STUN_SERVER_INVALID: {entry:?}: {error}"),
         }
     }
     let fallbacks = server.stun.fallback.clone();
@@ -339,7 +358,7 @@ async fn public_mapping(stun: &mut StunPort, server: &ServerConfig) -> Result<So
     let (mapping, _) = match configured {
         Ok(found) => found,
         Err(error) => {
-            eprintln!("{error}; trying the built-in STUN servers");
+            warn!("{error}; trying the built-in STUN servers");
             let (servers, fallbacks) = built_in_stun();
             first_mapping(stun, &iface, dns, STUN_TIMEOUT, servers, fallbacks).await?
         }
@@ -376,7 +395,7 @@ async fn probe_records(lookup: Lookup, kind: RecordKind) -> Result<()> {
     let iface = BoundInterface::lookup(&iface)?;
     let server = SocketAddrV4::new(dns, DNS_PORT);
     for record in dns::resolve(&iface, server, &lookup.name, kind, timeout).await? {
-        println!("{record}");
+        say!("{record}");
     }
     Ok(())
 }
@@ -397,7 +416,7 @@ async fn probe_stun(
     let (dns, timeout) = (uplink.dns, uplink.timeout);
     let (mapping, target) =
         first_mapping(&mut stun, &iface, dns, timeout, servers, fallbacks).await?;
-    println!("{mapping} via {target}");
+    say!("{mapping} via {target}");
     Ok(())
 }
 
@@ -419,7 +438,7 @@ async fn first_mapping(
                 Record::A(ip) => Some(SocketAddrV4::new(ip, server_port)),
                 Record::Txt(_) => None,
             })),
-            Err(error) => eprintln!("{error}; skipping {host}:{server_port}"),
+            Err(error) => warn!("{error}; skipping {host}:{server_port}"),
         }
     }
     targets.extend(fallbacks);
@@ -428,7 +447,7 @@ async fn first_mapping(
         match stun.binding(target, timeout).await {
             Ok(mapping) => return Ok((mapping, target)),
             Err(error) => {
-                eprintln!("{error}");
+                warn!("{error}");
                 failure = Some(error.code);
             }
         }
