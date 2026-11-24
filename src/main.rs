@@ -87,6 +87,9 @@ enum Action {
         #[command(subcommand)]
         action: DoctorAction,
     },
+    /// Run the server for a service manager, as `server --foreground` does.
+    #[command(hide = true)]
+    Daemon,
 }
 
 #[derive(Subcommand)]
@@ -238,7 +241,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Action::Probe { action } => probe(action)?,
-        Action::Server { foreground: _ } => server(&cli.config)?,
+        Action::Server { foreground: _ } | Action::Daemon => server(&cli.config)?,
         Action::Status { json, status_file } => {
             let status = Status::read(&status_file)?;
             if json {
