@@ -9,7 +9,7 @@
   "stun_servers": ["stun.miwifi.com:3478", "stun.chat.bilibili.com:3478", "stun.hitv.com:3478", "stun.cloudflare.com:3478"],
   "stun_fallback": ["111.206.174.3:3478", "111.206.174.2:3478"],
   "dns_server": "223.5.5.5",
-  "keepalive": 25,
+  "keepalive": 17,
   "upnp_control_url": "http://10.24.0.1:1900/ipc",
   "upnp_refresh": 300,
   "upnp_lease": 3600,
