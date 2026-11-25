@@ -178,7 +178,7 @@ def experiment(args, work, cleanup):
         if not args.active and now >= 100 and capture is None:
             # Sample only already-generated client WireGuard datagrams after
             # a one-minute pause policy has had time to settle.
-            capture = start(*ns(client, "tcpdump", "-n", "-l", "-i", "eth0",
+            capture = start(*ns(client, "tcpdump", "-p", "-n", "-l", "-i", "eth0",
                                 f"src host 192.0.2.2 and udp dst port {PORT}"), log="wire.log")
         mtime = status.stat().st_mtime_ns
         if not args.active and now >= 15 and idle_start is None:
@@ -227,6 +227,9 @@ def experiment(args, work, cleanup):
                 raise RuntimeError("keepalive did not resume")
             time.sleep(.1)
         assert report["effective_keepalive"] == 0, report
+        # An initial data packet can still arm WireGuard's normal session
+        # rekey. Its key confirmation is also an empty transport packet.
+        assert report["empty_transport_packets"] <= report["initiations"] + 1, report
     return report
 
 
@@ -234,14 +237,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=lambda p: str(Path(p).resolve(strict=True)))
     parser.add_argument("keepalive", type=int)
-    parser.add_argument("--active", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--active", action="store_true")
     parser.add_argument("--move-after", type=int, metavar="SECONDS",
                         help="change the move phase relative to the initial working echo")
-    parser.add_argument("--routes", action="store_true", help="test physical route and address changes with a fixed endpoint")
-    parser.add_argument("--pause", action="store_true")
+    mode.add_argument("--routes", action="store_true", help="test physical route and address changes with a fixed endpoint")
+    mode.add_argument("--pause", action="store_true")
     args = parser.parse_args()
     if args.move_after is not None and args.move_after <= 0:
         parser.error("--move-after must be positive")
+    if args.pause and (args.keepalive <= 0 or (args.move_after or 187) < 180):
+        parser.error("--pause needs an enabled keepalive and at least 180 seconds to measure idle traffic")
     os.umask(0o077)
     with tempfile.TemporaryDirectory(prefix="natwg-recovery-") as directory, ExitStack() as cleanup:
         print(json.dumps(experiment(args, Path(directory), cleanup), sort_keys=True), flush=True)

@@ -568,11 +568,12 @@ The client config has the client role and exactly one peer, the server:
   If the NAT mapping expires, the laptop may need to send traffic first.
 - To pause keepalives automatically, set `role.client.idle_pause_minutes`
   to a positive whole number. Omit it to keep the configured interval.
-  The client samples traffic crossing the TUN in either direction. Any inner
-  IP packet counts, including background application traffic. WireGuard
+  The client samples inner traffic received from the peer or addressed to
+  its allowed networks, including background application traffic. WireGuard
   handshakes and empty keepalives travel outside the TUN. After the idle
   interval it sets the peer's keepalive to 0. On the next sample with traffic
-  it restores the configured value. Packets can use the tunnel while paused.
+  it restores the configured value. Normal WireGuard session rekeys and replies
+  can still occur while persistent keepalives are paused.
 - With keepalives off or paused, an old handshake alone is normal. New
   traffic can use an existing session until WireGuard needs a handshake.
   The client observes actual initiation retries and sends no test packets.
