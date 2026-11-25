@@ -164,12 +164,21 @@ fn remove_service(instance: &Instance, files: Option<Files>) -> Result<String> {
             if remove(files.config)? {
                 removed.push(files.config.to_owned());
             }
-            if manager::installed()?.is_empty() && remove(Path::new(BINARY))? {
-                removed.push(BINARY.into());
-                // The binary that the last natwg update replaced.
+            if manager::installed()?.is_empty() {
+                // The last natwg service is gone: so go its binary, the
+                // binary that the last natwg update replaced, and the update
+                // check that the services shared.
                 let previous = crate::update::backup_path(Path::new(BINARY));
-                if remove(&previous)? {
-                    removed.push(previous);
+                let cache = Path::new(crate::update::CHECK_CACHE);
+                for path in [Path::new(BINARY), &previous, cache] {
+                    if remove(path)? {
+                        removed.push(path.to_owned());
+                    }
+                }
+                if let Some(dir) = Path::new(BINARY).parent()
+                    && fs::remove_dir(dir).is_ok()
+                {
+                    removed.push(dir.to_owned());
                 }
             }
         }
