@@ -8,6 +8,12 @@ on:
     secrets:
       CARGO_REGISTRY_TOKEN:
         required: true
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
   workflow_dispatch:
     inputs:
       tag:
@@ -64,8 +70,60 @@ jobs:
     with:
       ref: ${{ needs.validate.outputs.sha }}
 
-  publish:
+  binaries:
     needs: [validate, checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: '1.99.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install the musl compiler
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          target_key=${TARGET//-/_}
+          echo "CARGO_TARGET_${target_key^^}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          echo "CC_${target_key}=musl-gcc" >> "$GITHUB_ENV"
+      - name: Package the CLI
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          scripts/package.sh "$TARGET"
+          "target/$TARGET/release/natwg" --version
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: |
+            target/packages/*.tar.gz
+            target/packages/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [validate, checks, binaries]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -77,15 +135,59 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: '1.99.0'
-      - name: Publish to crates.io
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: binaries-*
+          path: target/packages
+          merge-multiple: true
+      - name: Confirm the download site is writable before publishing anything
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: python3 scripts/publish-crate.py
-      - name: Finalize the GitHub release
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 scripts/publish-download-site.py --check
+      - name: Attach the archives to the release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
-            gh release edit "$TAG" --draft=false --latest
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          if [ "$draft" = true ]; then
+            (cd target/packages && sha256sum -c ./*.sha256)
+            python3 scripts/package-source.py
+            gh release upload "$TAG" target/packages/*.tar.gz target/packages/*.sha256 --clobber
+          else
+            # A retry after publication reuses the locked original bytes. A
+            # release locked before its update manifest needs a new version.
+            gh release view "$TAG" --json assets --jq '.assets[].name' | grep -Fxq natwg-update.json
+            gh release download "$TAG" --pattern '*.tar.gz' --pattern '*.sha256' \
+              --pattern natwg-update.json --dir target/packages --clobber
+            (cd target/packages && sha256sum -c ./*.sha256)
+            cp target/packages/natwg-update.json "$RUNNER_TEMP/release-update.json"
           fi
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: python3 scripts/publish-crate.py
+      - name: Write the update manifest after every release gate passed
+        run: python3 scripts/update-manifest.py
+      - name: Finalize the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          DRAFT: ${{ steps.release.outputs.draft }}
+        run: |
+          if [ "$DRAFT" = true ]; then
+            gh release upload "$TAG" target/packages/natwg-update.json --clobber
+            gh release edit "$TAG" --draft=false --latest
+          else
+            cmp "$RUNNER_TEMP/release-update.json" target/packages/natwg-update.json
+          fi
+      - name: Publish to the download site
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: python3 scripts/publish-download-site.py target/packages

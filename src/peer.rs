@@ -66,6 +66,7 @@ pub fn add(config: &mut Config, name: &str) -> Result<Config> {
             iface: None,
             status_file: None,
         }),
+        update: None,
     };
     config.peers.push(PeerConfig {
         name: name.to_owned(),

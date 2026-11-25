@@ -29,4 +29,8 @@ behaviour until the Rust daemon reaches parity:
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+python3 scripts/test-download-site.py
 ```
+
+`docs/releasing.md` describes the release pipeline, the download site and its
+secrets.
