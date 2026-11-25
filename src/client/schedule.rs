@@ -1,5 +1,6 @@
 //! Client DNS and keepalive deadlines, driven by observations from one device.
 use super::Options;
+use crate::wire::transport::{HandshakeFlight, Initiation};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -84,7 +85,20 @@ impl Handshake {
         Duration::from_secs(if self.first_success { 10 } else { 1 })
     }
 
-    pub fn retried(&mut self, at: Instant, dns: &mut Lookups) {
+    pub fn observed(&mut self, flight: HandshakeFlight, dns: &mut Lookups) {
+        // A watch snapshot may contain both the previous confirmation and a
+        // later initiation. Only a confirmation within this outage clears it.
+        if let Some(at) = flight.confirmed
+            && dns.failure.is_some_and(|since| at >= since)
+        {
+            dns.recovered(at);
+        }
+        if let Some(attempt) = flight.pending.filter(|i| i.retry) {
+            self.retried(attempt.at, dns);
+        }
+    }
+
+    fn retried(&mut self, at: Instant, dns: &mut Lookups) {
         if at >= self.pointed_at {
             self.last_retry = Some(at);
             dns.failed(at);
@@ -116,7 +130,7 @@ impl Handshake {
             || (keepalive == 0
                 && self
                     .last_retry
-                    .is_none_or(|at| now - at >= super::Initiation::RETRY_WINDOW))
+                    .is_none_or(|at| now - at >= Initiation::RETRY_WINDOW))
         {
             dns.recovered(now);
         }
@@ -228,6 +242,38 @@ mod tests {
         hs.sample(start + secs(300), Some(secs(279)), 25, &mut dns);
         assert_eq!(dns.at, start + secs(300));
         assert_eq!(hs.interval(), secs(10));
+    }
+
+    #[test]
+    fn confirmed_retry_ends_backoff_even_if_wireguard_dates_it_before_the_retry() {
+        let start = Instant::now();
+        let mut dns = Lookups::new(true, &Options::default());
+        let mut hs = Handshake::new(start);
+        let retry = start + secs(5);
+        hs.retried(retry, &mut dns);
+        hs.sample(retry + secs(1), Some(secs(2)), 25, &mut dns);
+        assert_eq!(dns.failure, Some(retry));
+
+        let confirmed = retry + Duration::from_millis(10);
+        let mut flight = HandshakeFlight {
+            confirmed: Some(confirmed),
+            pending: None,
+        };
+        hs.observed(flight, &mut dns);
+        assert!(dns.failure.is_none());
+        assert_eq!(dns.at, confirmed + secs(600));
+
+        let later = start + secs(30);
+        flight.pending = Some(Initiation {
+            at: later,
+            destination: "192.0.2.1:51830".parse().unwrap(),
+            retry: true,
+        });
+        hs.observed(flight, &mut dns);
+        dns.looked_up(later, true, true);
+        hs.observed(flight, &mut dns);
+        assert_eq!(dns.failure, Some(later));
+        assert_eq!(dns.at, later + secs(5));
     }
 
     #[test]

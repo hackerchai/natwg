@@ -109,7 +109,7 @@ pub fn bound_tcp_connect(
 /// gotatun.
 pub struct BoundUdp {
     iface: BoundInterface,
-    initiations: Option<watch::Sender<Option<Initiation>>>,
+    observation: Option<watch::Sender<Option<watch::Receiver<HandshakeFlight>>>>,
     socket: watch::Sender<Weak<UdpSocket>>,
     pending: Slot,
 }
@@ -126,7 +126,7 @@ impl BoundUdp {
         let pending = Slot::default();
         let udp = Self {
             iface,
-            initiations: None,
+            observation: None,
             socket: socket_tx,
             pending: pending.clone(),
         };
@@ -153,14 +153,37 @@ impl Initiation {
     pub(crate) const RETRY_WINDOW: Duration = Duration::from_secs(15);
 }
 
+/// Observations from one binding of the client socket. A new bind starts an
+/// independent flight, even while a send task on the old socket is unwinding.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HandshakeFlight {
+    pub pending: Option<Initiation>,
+    pub confirmed: Option<Instant>,
+}
+
+impl HandshakeFlight {
+    fn initiated(&mut self, at: Instant, destination: SocketAddr) {
+        let retry = self.pending.is_some_and(|i| {
+            i.destination == destination && at.duration_since(i.at) < Initiation::RETRY_WINDOW
+        });
+        self.pending = Some(Initiation {
+            at,
+            destination,
+            retry,
+        });
+    }
+}
+
+pub(crate) type SocketFlights = watch::Receiver<Option<watch::Receiver<HandshakeFlight>>>;
+
 impl BoundUdp {
     pub(crate) fn interface(&self) -> &BoundInterface {
         &self.iface
     }
 
-    pub(crate) fn observe_initiations(&mut self) -> watch::Receiver<Option<Initiation>> {
+    pub(crate) fn observe_handshakes(&mut self) -> SocketFlights {
         let (tx, rx) = watch::channel(None);
-        self.initiations = Some(tx);
+        self.observation = Some(tx);
         rx
     }
 }
@@ -183,7 +206,11 @@ impl UdpTransportFactory for BoundUdp {
         Ok((
             BoundSend {
                 socket,
-                initiations: self.initiations.clone(),
+                flight: self.observation.as_ref().map(|observation| {
+                    let (tx, rx) = watch::channel(HandshakeFlight::default());
+                    observation.send_replace(Some(rx));
+                    tx
+                }),
             },
             recv,
         ))
@@ -213,28 +240,28 @@ async fn bind_retrying(iface: &BoundInterface, port: u16) -> io::Result<std::net
 #[derive(Clone)]
 pub struct BoundSend {
     socket: Arc<UdpSocket>,
-    initiations: Option<watch::Sender<Option<Initiation>>>,
+    flight: Option<watch::Sender<HandshakeFlight>>,
 }
 
 impl UdpSend for BoundSend {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
-        if let Some(events) = &self.initiations
-            && packet.starts_with(&1u32.to_le_bytes())
-        {
-            let at = Instant::now();
-            events.send_modify(|last| {
-                let retry = last.is_some_and(|i| {
-                    i.destination == destination
-                        && at.duration_since(i.at) < Initiation::RETRY_WINDOW
+        if let Some(flight) = &self.flight {
+            if packet.starts_with(&1u32.to_le_bytes()) {
+                flight.send_modify(|f| f.initiated(Instant::now(), destination));
+            } else if packet.len() == 32
+                && packet.starts_with(&4u32.to_le_bytes())
+                && packet[8..16] == [0; 8]
+            {
+                // gotatun confirms an authenticated handshake response with
+                // the new session's empty transport packet, counter zero.
+                // Later persistent keepalives use increasing counters.
+                flight.send_modify(|f| {
+                    f.pending = None;
+                    f.confirmed = Some(Instant::now());
                 });
-                *last = Some(Initiation {
-                    at,
-                    destination,
-                    retry,
-                });
-            });
+            }
         }
         self.socket.send_to(&packet, destination).await.map(drop)
     }

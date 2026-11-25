@@ -8,7 +8,9 @@ use crate::config::{Config, DoctorConfig, PeerConfig, ServerConfig};
 use crate::keys::{Key, PublicKey};
 use crate::nat::{self, Nat, Rule};
 use crate::netcfg;
-use crate::wire::transport::{BoundInterface, BoundUdp, Initiation, StunPort};
+use crate::wire::transport::{
+    BoundInterface, BoundUdp, HandshakeFlight, Initiation, SocketFlights, StunPort,
+};
 use crate::{Error, Result};
 use activity::{Activity, ClientTun};
 use channel::{ChannelRecv, ChannelSend};
@@ -153,7 +155,7 @@ impl Tunnel {
 pub struct Client {
     device: Device<(BoundUdp, ClientTun, ClientTun)>,
     traffic: Option<Arc<Activity>>,
-    initiations: Option<watch::Receiver<Option<Initiation>>>,
+    flights: Option<SocketFlights>,
     tun_name: String,
     server: x25519::PublicKey,
     handshakes: Handshakes,
@@ -194,7 +196,7 @@ impl Client {
         let tun_name = tun.name().map_err(tun_unavailable)?;
         let peer = client_peer(server, endpoint);
         let (mut udp, _) = BoundUdp::new(uplink.clone());
-        let initiations = client.record.as_ref().map(|_| udp.observe_initiations());
+        let flights = client.record.as_ref().map(|_| udp.observe_handshakes());
         let traffic = client
             .idle_pause_minutes
             .map(|_| Arc::new(Activity::new(&server.allowed_ips)));
@@ -218,7 +220,7 @@ impl Client {
             tun_name,
             server: public(server.public_key),
             traffic,
-            initiations,
+            flights,
             handshakes: Handshakes::default(),
         })
     }
@@ -239,8 +241,8 @@ impl Client {
         peer_stats(&self.device, &self.handshakes).await.pop()
     }
 
-    pub fn initiations(&self) -> Option<watch::Receiver<Option<Initiation>>> {
-        self.initiations.clone()
+    pub fn flights(&self) -> Option<watch::Receiver<HandshakeFlight>> {
+        self.flights.as_ref()?.borrow().clone()
     }
 
     pub fn take_traffic(&self) -> bool {
@@ -263,33 +265,54 @@ impl Client {
     /// Preserve a pending handshake and its queued user packets when a retry
     /// discovers the move. Otherwise start with a fresh peer on the same socket.
     pub async fn point(&self, endpoint: SocketAddrV4) -> Result<()> {
-        let last = self.initiations.as_ref().and_then(|rx| *rx.borrow());
+        self.apply_endpoint(endpoint, None).await.map(drop)
+    }
+
+    /// Return to the advertised address only while this binding is still
+    /// failing on a different live endpoint. A response can race DNS.
+    pub async fn apply_endpoint(
+        &self,
+        endpoint: SocketAddrV4,
+        failed_since: Option<tokio::time::Instant>,
+    ) -> Result<bool> {
+        let flight = self.flights();
         self.device
             .write(async |device| {
-                let Some(stats) = device.peers().await.pop() else {
-                    return false;
-                };
+                let stats = device.peers().await.pop()?;
                 let mut peer = stats.peer;
-                let retrying = last.is_some_and(|i| {
-                    i.retry
-                        && Some(i.destination) == peer.endpoint
+                let observed = flight.as_ref().map(|rx| *rx.borrow()).unwrap_or_default();
+                if let Some(since) = failed_since
+                    && (peer.endpoint == Some(endpoint.into())
+                        || observed.confirmed.is_some_and(|at| at >= since)
+                        || observed
+                            .pending
+                            .is_some_and(|i| i.at >= since && Some(i.destination) != peer.endpoint))
+                {
+                    return Some(false);
+                }
+                let pending = observed.pending.is_some_and(|i| {
+                    Some(i.destination) == peer.endpoint
                         && i.at.elapsed() < Initiation::RETRY_WINDOW
                 });
-                if peer.endpoint.is_none() || retrying {
+                let applied = if pending {
+                    // Keep gotatun's queued TUN packets while its handshake
+                    // retries on the new address.
                     device
                         .modify_peer(&self.server, |peer| {
                             peer.set_endpoint(Some(endpoint.into()))
                         })
                         .await
                 } else {
+                    // Even a peer which never had an endpoint can be past
+                    // gotatun's 540 s expiry. Start its timers at discovery.
                     device.remove_peer(&self.server).await;
                     peer.endpoint = Some(endpoint.into());
                     device.add_peer(peer)
-                }
+                };
+                applied.then_some(true)
             })
             .await
             .map_err(|e| Error::new("TUNNEL_FAILED", e.to_string()))?
-            .then_some(())
             .ok_or_else(|| Error::new("TUNNEL_FAILED", "the device lost its peer"))
     }
 

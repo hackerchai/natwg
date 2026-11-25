@@ -540,7 +540,9 @@ The client config has the client role and exactly one peer, the server:
   about 5 seconds after initiation), or an overdue handshake with persistent
   keepalive enabled, triggers an immediate lookup. While the failure lasts,
   retries start at 5 seconds and double to a maximum of 60 seconds. Recovery
-  also depends on when the resolver serves the new answer.
+  also depends on when the resolver serves the new answer. An unchanged TXT
+  answer leaves a healthy WireGuard roam in place. If the roamed session
+  fails, the client uses that answer to return to the advertised endpoint.
 - `server` (`"home.example.com:51830"`) takes the place of `record` for a
   server in [public mode](#public-mode-an-a-record). The client asks the
   `resolvers` for the A record of the name every 60 seconds, dials
@@ -565,7 +567,9 @@ The client config has the client role and exactly one peer, the server:
 - `peers[0].keepalive` defaults to 25 seconds, a good choice for a laptop
   on Wi-Fi that should remain reachable. When tethered to a phone, set it to
   0 to disable persistent keepalives, or try 120 to send them less often.
-  If the NAT mapping expires, the laptop may need to send traffic first.
+  With keepalive enabled, even a late first TXT answer starts a handshake so
+  the server can send the first application packet. With keepalive off, the
+  laptop may need to send traffic first to establish or refresh its NAT mapping.
 - To pause keepalives automatically, set `role.client.idle_pause_minutes`
   to a positive whole number. Omit it to keep the configured interval.
   The client samples inner traffic received from the peer or addressed to
@@ -577,8 +581,11 @@ The client config has the client role and exactly one peer, the server:
 - With keepalives off or paused, an old handshake alone is normal. New
   traffic can use an existing session until WireGuard needs a handshake.
   The client observes actual initiation retries and sends no test packets.
-  The first packet can be lost during an endpoint move. Applications may
-  need to retransmit. The 10-minute TXT refresh still runs while idle.
+  When it sees a pending handshake, the client updates its endpoint in place
+  so WireGuard can deliver queued packets. Traffic sent before the first
+  endpoint is known, or encrypted for the old address, can still require
+  retransmission.
+  The 10-minute TXT refresh still runs while idle.
 - The client checks the handshake every second until the first success on a
   new device, then every 10 seconds. `role.client.status_file` selects the
   file. Reachability, endpoint, keepalive and handshake changes update it.
