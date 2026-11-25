@@ -7,6 +7,10 @@ archives are missing. A retry uploads the same bytes again. `--check` writes a
 small marker object and nothing else, proving that the credentials can publish
 before anything else is published.
 
+Every release also uploads the installer, scripts/install-latest.sh, as
+`v<version>/install.sh` and as `install.sh`. `--installer` uploads only
+`install.sh`, so a change to the installer goes live without a release.
+
 Uploads go through the S3 API of R2, signed with AWS Signature Version 4:
 R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY (scoped to the objects of the bucket)
 and CLOUDFLARE_ACCOUNT_ID come from the environment and never reach argv.
@@ -29,6 +33,8 @@ IMMUTABLE = 'public, max-age=31536000, immutable'
 LATEST = 'public, max-age=300'
 NO_STORE = 'no-store'
 CHECK_KEY = 'preflight/check.txt'
+INSTALLER = Path(__file__).with_name('install-latest.sh')
+INSTALLER_KEY = 'install.sh'
 TARGETS = ('aarch64-apple-darwin', 'x86_64-apple-darwin',
            'aarch64-unknown-linux-musl', 'x86_64-unknown-linux-musl')
 ATTEMPTS = 4
@@ -56,7 +62,9 @@ def plan(directory):
             raise SystemExit(f'{checksum.name} does not match {name}; download site not updated.')
         uploads += [(f'v{version}/{name}', archive, IMMUTABLE),
                     (f'v{version}/{checksum.name}', checksum, IMMUTABLE)]
+    uploads.append((f'v{version}/{INSTALLER_KEY}', INSTALLER, IMMUTABLE))
     uploads.append((f'v{version}/{MANIFEST}', directory / MANIFEST, IMMUTABLE))
+    uploads.append((INSTALLER_KEY, INSTALLER, LATEST))
     uploads.append((f'latest/{MANIFEST}', directory / MANIFEST, LATEST))
     return uploads
 
@@ -139,6 +147,11 @@ def publish(directory, endpoint, credentials):
         print('Uploaded', key)
 
 
+def installer(endpoint, credentials):
+    put(endpoint, credentials, INSTALLER_KEY, INSTALLER.read_bytes(), LATEST)
+    print('Uploaded', INSTALLER_KEY)
+
+
 def check(endpoint, credentials):
     put(endpoint, credentials, CHECK_KEY, b'publish check\n', NO_STORE)
     print('The download site is writable')
@@ -159,6 +172,9 @@ def environment():
 def main():
     if sys.argv[1:] == ['--check']:
         check(*environment())
+        return
+    if sys.argv[1:] == ['--installer']:
+        installer(*environment())
         return
     directory = Path(sys.argv[1] if len(sys.argv) > 1 else 'target/packages')
     plan(directory)  # Refuse a broken set before touching the bucket.
