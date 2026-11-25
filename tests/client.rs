@@ -183,6 +183,85 @@ async fn a_lookup_that_finds_no_endpoint_names_each_resolver_and_what_it_said() 
     }
 }
 
+/// A DNS response to `query` with one A answer per address.
+fn a_answer(query: &[u8], addresses: &[Ipv4Addr]) -> Vec<u8> {
+    let mut message = query[..2].to_vec();
+    message.extend([0x81, 0x80, 0, 1]);
+    message.extend((addresses.len() as u16).to_be_bytes());
+    message.extend([0, 0, 0, 0]);
+    message.extend(&query[12..]);
+    for address in addresses {
+        message.extend([0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        message.extend(address.octets());
+    }
+    message
+}
+
+type Addresses = Arc<std::sync::Mutex<Vec<Ipv4Addr>>>;
+
+/// A DNS server on loopback that answers every A query with the addresses
+/// `answer` holds at the time, and that counts the queries.
+async fn a_dns_server(answer: Addresses) -> (SocketAddrV4, Arc<AtomicU32>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(address) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let queries = Arc::new(AtomicU32::new(0));
+    let counted = queries.clone();
+    tokio::spawn(async move {
+        let mut query = [0; 512];
+        while let Ok((len, from)) = socket.recv_from(&mut query).await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let addresses = answer.lock().unwrap().clone();
+            let _ = socket
+                .send_to(&a_answer(&query[..len], &addresses), from)
+                .await;
+        }
+    });
+    (address, queries)
+}
+
+fn holding(addresses: &[&str]) -> Addresses {
+    Arc::new(std::sync::Mutex::new(
+        addresses
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect(),
+    ))
+}
+
+const HOME: &str = "home.example.com";
+
+#[tokio::test]
+async fn the_first_resolver_with_a_usable_a_record_gives_the_ip_at_the_servers_port() {
+    let (silent, _held) = silent_server().await;
+    let (unusable, _) = a_dns_server(holding(&["0.0.0.0", "224.0.0.1"])).await;
+    let (good, good_queries) = a_dns_server(holding(&["45.77.0.10", "45.77.0.11"])).await;
+    let (other, other_queries) = a_dns_server(holding(&["45.77.0.12"])).await;
+    let server = format!("{HOME}:51830").parse().unwrap();
+    let resolvers = [silent, unusable, good, other];
+    let found = resolve::lookup_a(&loopback(), &resolvers, &server, DNS_TIMEOUT).await;
+    assert_eq!(found.unwrap(), (addr("45.77.0.10:51830"), good));
+    assert_eq!(good_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(other_queries.load(Ordering::SeqCst), 0);
+
+    let error = resolve::lookup_a(&loopback(), &[silent, unusable], &server, DNS_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "A_NO_ADDRESS");
+    for part in [
+        format!("no DNS server gave an A record for {HOME}: "),
+        format!("DNS_TIMEOUT: no answer from {silent}"),
+        format!("{unusable} answered no usable address"),
+    ] {
+        assert!(
+            error.message.contains(&part),
+            "{part:?} in {}",
+            error.message
+        );
+    }
+}
+
 #[test]
 fn macos_lists_the_interfaces_of_its_default_routes_in_service_order() {
     let nwi = "Network information\n\nIPv4 network interface information\n   utun8 : flags      : 0x5 (IPv4,DNS)\n     en6 : flags      : 0x5 (IPv4,DNS)\n\n   REACH : flags 0x00000003 (Reachable,Transient Connection)\n\nNetwork interfaces: utun8 en6 en0\n";
@@ -333,7 +412,7 @@ fn a_wg_quick_endpoint_stands_in_for_a_record() {
     assert!(
         error
             .message
-            .contains("role.client.record or peers[0].endpoint"),
+            .contains("role.client.record, role.client.server or peers[0].endpoint"),
         "{}",
         error.message
     );
@@ -720,6 +799,80 @@ async fn the_client_follows_the_txt_record_when_the_server_moves() {
         assert_eq!(status.lookup_error, None);
         assert_eq!(status.rebuilds, 0);
         assert!(status.server.unwrap().last_handshake.is_some());
+        stop_tx.send(()).unwrap();
+    };
+    let (ran, ()) = tokio::join!(running, check);
+    ran.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_follows_the_a_record_of_the_server_and_keeps_it_when_a_lookup_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let status_file = dir.path().join("client.status.json");
+    let (server_config, mut client_config) = pair(&status_file);
+    let mut server = Detached::server(&server_config).await.unwrap().0;
+    let port = server.listen_port().await;
+    let Role::Client(role) = &mut client_config.role else {
+        unreachable!()
+    };
+    role.record = None;
+    role.server = Some(format!("{HOME}:{port}").parse().unwrap());
+    client_config.validate().unwrap();
+    let answer = holding(&[]);
+    let (dns, _) = a_dns_server(answer.clone()).await;
+    let options = options(dns);
+    let (handle_tx, mut handle) = tokio::sync::mpsc::unbounded_channel();
+    let server_key = client_config.peers[0].public_key;
+    let build = async |config: &Config, uplink: &Uplink, endpoint| {
+        let device = Detached::client(config, uplink.iface.clone(), endpoint).await?;
+        let device = Arc::new(Mutex::new(device));
+        handle_tx.send(device.clone()).unwrap();
+        Ok(Shared {
+            device,
+            server: server_key,
+        })
+    };
+    let (stop_tx, stop) = tokio::sync::oneshot::channel::<()>();
+    let stop = async move {
+        let _ = stop.await;
+    };
+    let running = client::run(
+        &client_config,
+        &options,
+        |_| Ok(loopback_uplink(Ipv4Addr::LOCALHOST)),
+        build,
+        stop,
+    );
+    let check = async {
+        let device = handle.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let status = client_status(&status_file);
+        assert_eq!(status.record.as_deref(), Some(HOME));
+        assert_eq!(status.record_type, Some(natwg::config::PublishMode::A));
+        assert_eq!(status.endpoint, None, "no A record yet");
+        let error = status.lookup_error.unwrap();
+        assert!(error.starts_with("A_NO_ADDRESS: "), "{error}");
+
+        *answer.lock().unwrap() = vec![Ipv4Addr::LOCALHOST];
+        assert!(
+            reaches(&device, &mut server, b"to the A record", WITHIN).await,
+            "the client dials the address of the A record at the server's port"
+        );
+        let at = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        let status = client_status(&status_file);
+        assert_eq!(status.endpoint, Some(at));
+        assert_eq!(status.lookup_error, None);
+
+        answer.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let status = client_status(&status_file);
+        assert!(status.lookup_error.is_some(), "{status:?}");
+        assert_eq!(
+            status.endpoint,
+            Some(at),
+            "a failed lookup keeps the endpoint"
+        );
+        assert!(reaches(&device, &mut server, b"still there", WITHIN).await);
         stop_tx.send(()).unwrap();
     };
     let (ran, ()) = tokio::join!(running, check);

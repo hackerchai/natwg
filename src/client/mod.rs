@@ -1,7 +1,7 @@
 //! The long-running client. It keeps a tunnel to the server up on the
-//! current uplink, points it at the endpoint that the TXT record names, and
-//! writes the status file. A tunnel that dies or loses its uplink is torn
-//! down and built again.
+//! current uplink, points it at the endpoint that the TXT record names, or
+//! at the A record of the server's name, and writes the status file. A
+//! tunnel that dies or loses its uplink is torn down and built again.
 
 pub mod resolve;
 pub mod uplink;
@@ -15,6 +15,7 @@ use crate::status::{self, ClientRole, ClientStatus};
 use crate::tunnel::{self, PeerStats};
 use crate::wire::transport::BoundInterface;
 use ipnetwork::Ipv4Network;
+use resolve::Lookup;
 use std::{
     future::Future,
     net::SocketAddrV4,
@@ -87,10 +88,10 @@ pub struct Options {
     pub dns_port: u16,
     /// How long one DNS server may take to answer.
     pub dns_timeout: Duration,
-    /// How often the TXT record is looked up once there is an endpoint.
+    /// How often the record is looked up once there is an endpoint.
     pub lookup_every: Duration,
-    /// How soon the TXT record is looked up again while there is no
-    /// endpoint. The pause doubles up to `lookup_every`.
+    /// How soon the record is looked up again while there is no endpoint.
+    /// The pause doubles up to `lookup_every`.
     pub retry_every: Duration,
     /// How often the uplink is looked up.
     pub watch_every: Duration,
@@ -302,7 +303,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                     return Exit::Died(format!("the WireGuard device on {tun} stopped, because its TUN or its UDP socket failed"));
                 }
                 () = stop.as_mut() => return Exit::Stopped,
-                () = tokio::time::sleep_until(lookup_at), if self.client.record.is_some() => {
+                () = tokio::time::sleep_until(lookup_at), if Lookup::of(self.client).is_some() => {
                     let found = tokio::select! {
                         found = self.lookup(&uplink.iface) => found,
                         () = stop.as_mut() => return Exit::Stopped,
@@ -314,16 +315,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                         }
                         status_tick.reset_immediately();
                     }
-                    // Without an endpoint the client asks again soon, then
-                    // less often while the record stays missing.
-                    let every = match self.endpoint {
-                        Some(_) => options.lookup_every,
-                        None => {
-                            let next = (retry * 2).min(options.lookup_every);
-                            std::mem::replace(&mut retry, next)
-                        }
-                    };
-                    lookup_at = Instant::now() + every;
+                    lookup_at = Instant::now() + self.next_lookup(&mut retry);
                 }
                 _ = watch.tick() => {
                     let now = match self.uplink() {
@@ -385,12 +377,28 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         }
     }
 
-    /// Ask the resolvers for the TXT record, and return the endpoint it names
-    /// when that is a new one. A failed lookup keeps the endpoint.
+    /// How long until the next lookup. With an endpoint, the client asks
+    /// every `lookup_every`. Without one, it asks again soon, then less often
+    /// while the record stays missing: the pause `retry` doubles up to
+    /// `lookup_every`.
+    fn next_lookup(&self, retry: &mut Duration) -> Duration {
+        match self.endpoint {
+            Some(_) => self.options.lookup_every,
+            None => {
+                let next = (*retry * 2).min(self.options.lookup_every);
+                std::mem::replace(retry, next)
+            }
+        }
+    }
+
+    /// Ask the resolvers for the TXT record, or the A record of the server's
+    /// name, and return the endpoint it names when that is a new one. A
+    /// failed lookup keeps the endpoint.
     async fn lookup(&mut self, iface: &BoundInterface) -> Option<SocketAddrV4> {
-        let record = self.client.record.as_deref()?;
+        let lookup = Lookup::of(self.client)?;
+        let (kind, record) = (lookup.mode().record_type(), lookup.name());
         let timeout = self.options.dns_timeout;
-        match resolve::lookup(iface, &self.resolvers, record, timeout).await {
+        match lookup.endpoint(iface, &self.resolvers, timeout).await {
             Err(error) => {
                 let kept = match self.endpoint() {
                     Some(endpoint) => format!("keeping {endpoint}"),
@@ -404,7 +412,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                 let now = SystemTime::now();
                 self.looked_up = Some(now);
                 if self.lookup_error.take().is_some() {
-                    tracing::info!("the TXT lookup works again");
+                    tracing::info!("the {kind} lookup works again");
                 }
                 if self.endpoint() == Some(addr) {
                     return None;
@@ -412,7 +420,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                 let old = self
                     .endpoint()
                     .map_or("none".to_owned(), |endpoint| endpoint.to_string());
-                tracing::info!("endpoint {old} -> {addr} from {record} via {resolver}");
+                tracing::info!("endpoint {old} -> {addr} from {kind} {record} via {resolver}");
                 self.endpoint = Some(Endpoint { addr, since: now });
                 Some(addr)
             }
@@ -421,6 +429,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
 
     fn write_status(&self, tun: Option<&str>, uplink: Option<&Uplink>, server: Option<PeerStats>) {
         let now = SystemTime::now();
+        let lookup = Lookup::of(self.client);
         let status = ClientStatus {
             role: ClientRole::Client,
             updated: status::unix(now),
@@ -430,7 +439,8 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
             uplink: uplink.map(|uplink| uplink.iface.to_string()),
             uplink_address: uplink.and_then(|uplink| uplink.address),
             tun: tun.map(str::to_owned),
-            record: self.client.record.clone(),
+            record: lookup.map(|lookup| lookup.name().to_owned()),
+            record_type: lookup.map(Lookup::mode),
             endpoint: self.endpoint(),
             endpoint_since: self
                 .endpoint

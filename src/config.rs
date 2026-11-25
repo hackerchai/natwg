@@ -148,9 +148,17 @@ pub struct ServerConfig {
     /// form natwg 0.2 wrote.
     #[serde(default, deserialize_with = "lans")]
     pub lan: Vec<Ipv4Network>,
-    pub stun: StunConfig,
+    /// The STUN keepalive that learns the public mapping. Publish `txt` needs
+    /// it. Publish `a` needs it only when the uplink's own address is not
+    /// public.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun: Option<StunConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upnp: Option<UpnpConfig>,
+    /// What `cloudflare.record` holds: the endpoint as a TXT record (the
+    /// default), or the public IP as an A record.
+    #[serde(default, skip_serializing_if = "PublishMode::is_txt")]
+    pub publish: PublishMode,
     pub cloudflare: CloudflareConfig,
     /// Where the server writes its status (default: `status::path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +237,42 @@ impl fmt::Display for Instance {
     }
 }
 
+/// How the server publishes where clients find it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishMode {
+    /// A TXT record that holds the STUN mapping as `"ip:port"`, for a NAT1
+    /// network whose public port is not the listen port.
+    #[default]
+    Txt,
+    /// An A record that holds the public IP, for a network where the public
+    /// port is the listen port. Clients dial `record:listen_port`.
+    A,
+}
+
+impl PublishMode {
+    pub fn is_txt(&self) -> bool {
+        *self == Self::Txt
+    }
+
+    /// The DNS record type: `TXT` or `A`.
+    pub fn record_type(self) -> &'static str {
+        match self {
+            Self::Txt => "TXT",
+            Self::A => "A",
+        }
+    }
+}
+
+impl fmt::Display for PublishMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Txt => "txt",
+            Self::A => "a",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StunConfig {
@@ -257,15 +301,19 @@ pub struct CloudflareConfig {
 }
 
 /// The client of one natwg server, the only peer of its config. It finds the
-/// server through the TXT `record`, or at the peer's `endpoint` when there is
-/// no record.
+/// server through the TXT `record`, through the A record of `server`, or at
+/// the peer's `endpoint` when there is neither.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     /// The TXT record that holds the server's endpoint as `"ip:port"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<String>,
-    /// The DNS servers asked for `record`, in order (default:
+    /// The server as `"name:port"`: the A record of `name` holds its public
+    /// IP, and `port` is its listen port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<HostPort>,
+    /// The DNS servers asked for `record` or `server`, in order (default:
     /// `client::resolve::DEFAULT_RESOLVERS`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolvers: Vec<Ipv4Addr>,
@@ -276,6 +324,51 @@ pub struct ClientConfig {
     /// Where the client writes its status (default: `status::client_path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_file: Option<PathBuf>,
+}
+
+/// A DNS name and a port, written `"name:port"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct HostPort {
+    pub host: String,
+    pub port: u16,
+}
+
+impl TryFrom<String> for HostPort {
+    type Error = String;
+
+    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
+        let invalid = || format!("{text:?} is not \"name:port\" with a port from 1 to 65535");
+        let (host, port) = text.rsplit_once(':').ok_or_else(invalid)?;
+        let port: u16 = port.parse().map_err(|_| invalid())?;
+        if host.is_empty() || port == 0 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            host: host.to_owned(),
+            port,
+        })
+    }
+}
+
+impl FromStr for HostPort {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        text.to_owned().try_into()
+    }
+}
+
+impl From<HostPort> for String {
+    fn from(name: HostPort) -> Self {
+        name.to_string()
+    }
+}
+
+impl fmt::Display for HostPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
 }
 
 /// A client identity the server also loads as a peer, so `natwg doctor` can
@@ -358,6 +451,29 @@ impl Config {
                 server.iface
             ));
         }
+        match server.publish {
+            PublishMode::Txt if server.stun.is_none() => {
+                return Err(
+                    "role.server.stun is missing, and publish txt needs it to learn the public endpoint"
+                        .to_owned(),
+                );
+            }
+            PublishMode::Txt => {}
+            PublishMode::A => {
+                let record = &server.cloudflare.record;
+                if !is_dns_name(record) {
+                    return Err(format!(
+                        "cloudflare.record {record:?} is not a DNS name, and with publish a clients dial it"
+                    ));
+                }
+                if server.listen_port == 0 {
+                    return Err(
+                        "role.server.listen_port is 0, and with publish a clients dial the listen port"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
         for (index, &lan) in server.lan.iter().enumerate() {
             if lan.prefix() == 0 {
                 return Err(format!(
@@ -422,16 +538,35 @@ impl Config {
                 "peers[0].allowed_ips {net} is a default route, which natwg client does not take; name the networks to reach"
             ));
         }
-        if client.record.is_none() && server.endpoint.is_none() {
-            return Err(
-                "the client needs role.client.record or peers[0].endpoint to find the server"
-                    .to_owned(),
-            );
+        match (&client.record, &client.server) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "role.client.record and role.client.server both name the server; keep one: record for a TXT \"ip:port\", server for an A record and a port"
+                        .to_owned(),
+                );
+            }
+            (None, None) if server.endpoint.is_none() => {
+                return Err(
+                    "the client needs role.client.record, role.client.server or peers[0].endpoint to find the server"
+                        .to_owned(),
+                );
+            }
+            _ => {}
         }
         if let Some(record) = &client.record
             && !is_dns_name(record)
         {
             return Err(format!("role.client.record {record:?} is not a DNS name"));
+        }
+        if let Some(HostPort { host, port }) = &client.server {
+            if host.parse::<Ipv4Addr>().is_ok() {
+                return Err(format!(
+                    "role.client.server {host:?} is an address; dial it with peers[0].endpoint \"{host}:{port}\" instead"
+                ));
+            }
+            if !is_dns_name(host) {
+                return Err(format!("role.client.server {host:?} is not a DNS name"));
+            }
         }
         if let Some(iface) = &client.iface
             && !is_iface_name(iface)

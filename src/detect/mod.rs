@@ -275,7 +275,7 @@ impl Detection {
             Some(PublicBy::Address) => ", by the uplink's own address",
             Some(PublicBy::Upnp) => ", by the UPnP gateway's forward",
             Some(PublicBy::PortKept) => {
-                ", by STUN alone: a full-cone NAT that keeps the port looks the same"
+                ", by STUN alone: a full-cone NAT that keeps the port looks the same, so publish txt; publish a needs address or upnp"
             }
             None => "",
         };

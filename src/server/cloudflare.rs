@@ -1,15 +1,17 @@
-//! Publish the mapping as the TXT record that clients read, through the
-//! Cloudflare API, with the record natwg.py writes.
+//! Keep the Cloudflare record that clients read: a TXT record with the
+//! mapping as `"ip:port"`, the record natwg.py writes, or an A record with the
+//! public IP.
 
 use crate::config::CloudflareConfig;
 use crate::keys::Secret;
-use crate::server::{error_chain, keepalive::Mapping};
+use crate::server::error_chain;
 use crate::{Error, Result};
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::{
     convert::Infallible,
-    net::SocketAddrV4,
+    fmt,
+    net::{Ipv4Addr, SocketAddrV4},
     time::{Duration, SystemTime},
 };
 use tokio::{sync::watch, time::Instant};
@@ -17,18 +19,83 @@ use tokio::{sync::watch, time::Instant};
 pub const API: &str = "https://api.cloudflare.com/client/v4";
 
 /// How long the publisher waits after a failure before it tries the same
-/// value again. A new mapping does not wait.
+/// value again. A new value does not wait.
 pub const RETRY: Duration = Duration::from_secs(60);
 
 const TTL: u32 = 60;
-const COMMENT: &str = "natwg: WireGuard public endpoint, auto-updated";
+const TXT_COMMENT: &str = "natwg: WireGuard public endpoint, auto-updated";
+const A_COMMENT: &str = "natwg: WireGuard public IP, auto-updated";
 const TIMEOUT: Duration = Duration::from_secs(15);
 const REDACTED: &str = "<redacted>";
 
-/// A value the TXT record holds, and when natwg wrote it or found it there.
+/// What the record holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Content {
+    /// A TXT record with the endpoint as `"ip:port"`.
+    Txt(SocketAddrV4),
+    /// An A record with the public IP.
+    A(Ipv4Addr),
+}
+
+impl Content {
+    /// The DNS record type: `TXT` or `A`.
+    pub fn record_type(self) -> &'static str {
+        match self {
+            Self::Txt(_) => "TXT",
+            Self::A(_) => "A",
+        }
+    }
+
+    /// The `content` of the record in the Cloudflare API.
+    fn api_content(self) -> String {
+        match self {
+            Self::Txt(endpoint) => format!("\"{endpoint}\""),
+            Self::A(ip) => ip.to_string(),
+        }
+    }
+
+    /// The body that creates or replaces the record. The TXT body is the one
+    /// natwg.py sends. An A record is never proxied, since Cloudflare's proxy
+    /// carries no WireGuard.
+    fn body(self, name: &str) -> Value {
+        match self {
+            Self::Txt(_) => json!({
+                "type": "TXT",
+                "name": name,
+                "content": self.api_content(),
+                "ttl": TTL,
+                "comment": TXT_COMMENT,
+            }),
+            Self::A(_) => json!({
+                "type": "A",
+                "name": name,
+                "content": self.api_content(),
+                "ttl": TTL,
+                "proxied": false,
+                "comment": A_COMMENT,
+            }),
+        }
+    }
+
+    /// Whether the `content` the API reports is this value.
+    fn held_by(self, content: &str) -> bool {
+        content.trim_matches('"') == self.to_string()
+    }
+}
+
+impl fmt::Display for Content {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Txt(endpoint) => endpoint.fmt(f),
+            Self::A(ip) => ip.fmt(f),
+        }
+    }
+}
+
+/// A value the record holds, and when natwg wrote it or found it there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
-    pub value: SocketAddrV4,
+    pub value: Content,
     pub at: SystemTime,
 }
 
@@ -36,7 +103,7 @@ pub struct Record {
 /// from an earlier success.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Publish {
-    /// No mapping to publish yet.
+    /// No value to publish yet.
     Idle,
     Publishing {
         previous: Option<Record>,
@@ -52,7 +119,7 @@ pub enum Publish {
 }
 
 impl Publish {
-    /// The value the TXT record holds since natwg last wrote it.
+    /// The value the record holds since natwg last wrote it.
     pub fn record(&self) -> Option<Record> {
         match self {
             Self::Idle => None,
@@ -78,7 +145,8 @@ pub struct Publisher {
     record: String,
     token: Secret,
     zone_id: Option<String>,
-    record_id: Option<String>,
+    /// The ID of the record, and its type.
+    record_id: Option<(&'static str, String)>,
 }
 
 impl Publisher {
@@ -101,18 +169,18 @@ impl Publisher {
         })
     }
 
-    /// Publish every new mapping, one request at a time. A value already in
+    /// Publish every new value, one request at a time. A value already in
     /// the record is skipped, and a failed value is tried again after
-    /// [`RETRY`], or at once when the mapping moves on.
+    /// [`RETRY`], or at once when the wanted value moves on.
     pub async fn run(
         mut self,
-        mut mapping: watch::Receiver<Option<Mapping>>,
+        mut wanted: watch::Receiver<Option<Content>>,
         state: watch::Sender<Publish>,
     ) -> Infallible {
         loop {
-            let wanted = mapping.borrow_and_update().map(|mapping| mapping.addr);
+            let value = *wanted.borrow_and_update();
             let previous = state.borrow().record();
-            match (wanted, previous) {
+            match (value, previous) {
                 (Some(value), Some(record)) if record.value == value => {
                     state.send_if_modified(|state| {
                         let stale = !matches!(state, Publish::Published(_));
@@ -127,11 +195,11 @@ impl Publisher {
                     state.send_replace(Publish::Publishing { previous, error });
                     match self.publish(value).await {
                         Ok(wrote) => {
-                            let record = &self.record;
+                            let (kind, record) = (value.record_type(), &self.record);
                             if wrote {
-                                tracing::info!("published TXT {record} = \"{value}\"");
+                                tracing::info!("published {kind} {record} = \"{value}\"");
                             } else {
-                                tracing::info!("TXT {record} holds \"{value}\" already");
+                                tracing::info!("{kind} {record} holds \"{value}\" already");
                             }
                             let at = SystemTime::now();
                             state.send_replace(Publish::Published(Record { value, at }));
@@ -147,7 +215,7 @@ impl Publisher {
                             });
                             tokio::select! {
                                 () = tokio::time::sleep_until(retry_at) => {}
-                                () = changed(&mut mapping) => {}
+                                () = changed(&mut wanted) => {}
                             }
                             continue;
                         }
@@ -155,15 +223,15 @@ impl Publisher {
                 }
                 (None, _) => {}
             }
-            changed(&mut mapping).await;
+            changed(&mut wanted).await;
         }
     }
 
     /// Make the record hold `value`, and return whether that took a write.
     /// The lookup of the record ID, after a start or a failed write, reads
     /// what the record holds too, so a server that restarts on the same
-    /// mapping finds it published.
-    async fn publish(&mut self, value: SocketAddrV4) -> Result<bool> {
+    /// value finds it published.
+    async fn publish(&mut self, value: Content) -> Result<bool> {
         let zone_id = match &self.zone_id {
             Some(id) => id.clone(),
             None => {
@@ -179,24 +247,29 @@ impl Publisher {
             }
         };
         let records = format!("/zones/{zone_id}/dns_records");
-        if self.record_id.is_none() {
-            let query = [("type", "TXT"), ("name", &self.record)];
+        let kind = value.record_type();
+        if self
+            .record_id
+            .as_ref()
+            .is_none_or(|(held, _)| *held != kind)
+        {
+            let query = [("type", kind), ("name", &self.record)];
             let found = self.call(Method::GET, &records, &query, None).await?;
-            self.record_id = first_id(&found);
+            self.record_id = first_id(&found).map(|id| (kind, id));
+            if let Some(count) = found.as_array().map(Vec::len).filter(|count| *count > 1) {
+                tracing::warn!(
+                    "{} has {count} {kind} records, and natwg keeps only the first; delete the others",
+                    self.record
+                );
+            }
             let content = found[0]["content"].as_str().unwrap_or_default();
-            if content.trim_matches('"') == value.to_string() {
+            if value.held_by(content) {
                 return Ok(false);
             }
         }
-        let body = json!({
-            "type": "TXT",
-            "name": self.record,
-            "content": format!("\"{value}\""),
-            "ttl": TTL,
-            "comment": COMMENT,
-        });
+        let body = value.body(&self.record);
         match &self.record_id {
-            Some(id) => {
+            Some((_, id)) => {
                 let path = format!("{records}/{id}");
                 let put = self.call(Method::PUT, &path, &[], Some(&body)).await;
                 // The record may be gone, so the next try looks it up again.
@@ -210,7 +283,7 @@ impl Publisher {
                 let id = created["id"]
                     .as_str()
                     .ok_or_else(|| Error::new("CLOUDFLARE_API", "the created record has no id"))?;
-                self.record_id = Some(id.to_owned());
+                self.record_id = Some((kind, id.to_owned()));
                 Ok(true)
             }
         }
@@ -250,10 +323,10 @@ fn first_id(result: &Value) -> Option<String> {
     Some(result.get(0)?["id"].as_str()?.to_owned())
 }
 
-/// Resolve when the mapping changes. The supervisor owns the sender for as
+/// Resolve when the wanted value changes. The server owns the sender for as
 /// long as the publisher runs, so a closed channel never resolves.
-async fn changed(mapping: &mut watch::Receiver<Option<Mapping>>) {
-    if mapping.changed().await.is_err() {
+async fn changed(wanted: &mut watch::Receiver<Option<Content>>) {
+    if wanted.changed().await.is_err() {
         std::future::pending().await
     }
 }
