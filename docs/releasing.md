@@ -62,8 +62,18 @@ The R2 bucket `natwg-dl` of the Cloudflare account serves
 | --- | --- |
 | `v{version}/natwg-{version}-{target}.tar.gz` and `.sha256` | `public, max-age=31536000, immutable` |
 | `v{version}/natwg-update.json` | `public, max-age=31536000, immutable` |
+| `v{version}/install.sh` | `public, max-age=31536000, immutable` |
+| `install.sh` | `public, max-age=300` |
 | `latest/natwg-update.json` | `public, max-age=300`, uploaded last |
 | `preflight/check.txt` | `no-store` |
+
+`install.sh` is `scripts/install-latest.sh`, the installer behind
+`curl -fsSL https://natwg-dl.hackerchai.com/install.sh | bash`. Every release
+uploads it with the archives. A change to it on `main` needs no release: the
+`Installer` workflow (`.github/workflows/installer.yml`) runs its tests,
+uploads only `install.sh` (`scripts/publish-download-site.py --installer`),
+then installs the latest release with the hosted copy. Run that workflow by
+hand to upload it again.
 
 `scripts/publish-download-site.py` checks each archive against the manifest
 and its `.sha256` file before it uploads anything. It writes through the S3

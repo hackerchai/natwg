@@ -1,0 +1,42 @@
+name: Installer
+# Upload scripts/install-latest.sh as https://natwg-dl.hackerchai.com/install.sh
+# whenever it changes on main, without a release. Every release uploads it as
+# well (publish.yml, through scripts/publish-download-site.py).
+on:
+  push:
+    branches: [main]
+    paths: [scripts/install-latest.sh]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Check the installer
+        run: |
+          shellcheck scripts/install-latest.sh
+          python3 scripts/test-download-site.py
+      - name: Upload install.sh
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 scripts/publish-download-site.py --installer
+      - name: Install the latest release with the hosted installer
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # The query skips any copy the CDN still caches.
+          curl -fsSL "https://natwg-dl.hackerchai.com/install.sh?ci=$SHA" -o "$RUNNER_TEMP/install.sh"
+          cmp "$RUNNER_TEMP/install.sh" scripts/install-latest.sh
+          NATWG_INSTALL_DIR="$RUNNER_TEMP/bin" bash "$RUNNER_TEMP/install.sh"
+          "$RUNNER_TEMP/bin/natwg" --version

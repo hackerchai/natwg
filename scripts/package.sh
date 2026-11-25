@@ -2,7 +2,7 @@
 # Build the release archive of natwg for one target into target/packages.
 # Publication is a separate CI step.
 set -eu
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_dir"
 package_target=${1:?usage: scripts/package.sh TARGET}
 case "$package_target" in
