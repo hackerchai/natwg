@@ -1,4 +1,4 @@
-use natwg::config::{Config, DoctorConfig, Role};
+use natwg::config::{Config, DoctorConfig, HostPort, PublishMode, Role};
 use natwg::keys::Key;
 use serde_json::{Value, json};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
@@ -388,9 +388,10 @@ fn a_client_has_exactly_one_peer_the_server() {
 
 #[test]
 fn a_client_finds_the_server_by_its_record_or_at_its_endpoint() {
-    client_refused("role.client.record or peers[0].endpoint", |config| {
-        config["role"]["client"] = json!({});
-    });
+    client_refused(
+        "role.client.record, role.client.server or peers[0].endpoint",
+        |config| config["role"]["client"] = json!({}),
+    );
     client_validated(|config| {
         config["role"]["client"] = json!({});
         config["peers"][0]["endpoint"] = json!("192.0.2.7:51830");
@@ -403,6 +404,173 @@ fn a_client_finds_the_server_by_its_record_or_at_its_endpoint() {
             config["role"]["client"]["record"] = json!(record);
         });
     }
+}
+
+#[test]
+fn a_client_names_the_server_by_a_txt_record_or_by_name_and_port_never_both() {
+    let with_server = |server: Value| {
+        move |config: &mut Value| config["role"]["client"] = json!({ "server": server })
+    };
+    client_validated(with_server(json!("home.example.com:51830"))).unwrap();
+    let mut value = client_json();
+    with_server(json!("home.example.com:51830"))(&mut value);
+    let config: Config = serde_json::from_value(value).unwrap();
+    let Role::Client(client) = &config.role else {
+        panic!("a client config")
+    };
+    let server = client.server.as_ref().unwrap();
+    assert_eq!(
+        (server.host.as_str(), server.port),
+        ("home.example.com", 51830)
+    );
+    assert_eq!(
+        serde_json::to_value(&config).unwrap()["role"]["client"],
+        json!({ "server": "home.example.com:51830" })
+    );
+    client_refused("role.client.record and role.client.server both", |config| {
+        config["role"]["client"]["server"] = json!("home.example.com:51830");
+    });
+}
+
+#[test]
+fn a_server_name_is_an_rfc_1123_host_name_and_its_port_plain_digits() {
+    for good in [
+        "home.example.com:51830",
+        "a.b:1",
+        "HOME-1.Example.COM:65535",
+        "x1.example.co:443",
+    ] {
+        let parsed: HostPort = good.parse().unwrap_or_else(|e| panic!("{good}: {e}"));
+        assert_eq!(parsed.to_string(), good);
+    }
+    let long = format!("{}.example.com:51830", "a".repeat(64));
+    let too_long = format!("{}.com:51830", vec!["a".repeat(63); 4].join("."));
+    for (text, why) in [
+        (
+            "home.example.com:+51830",
+            "no port from 1 to 65535 of plain digits",
+        ),
+        (
+            "home.example.com:051830",
+            "no port from 1 to 65535 of plain digits",
+        ),
+        (
+            "home.example.com:0",
+            "no port from 1 to 65535 of plain digits",
+        ),
+        (
+            "home.example.com:65536",
+            "no port from 1 to 65535 of plain digits",
+        ),
+        (
+            "home.example.com: 51830",
+            "no port from 1 to 65535 of plain digits",
+        ),
+        ("home.example.com", "is not \"name:port\""),
+        (":51830", "the name is empty"),
+        (
+            "1.2.3.4:51830",
+            "names an address; dial it with peers[0].endpoint \"1.2.3.4:51830\"",
+        ),
+        ("1.2.3:51830", "ends with an all-digit label"),
+        ("home.example.com.:51830", "ends with a dot; leave it out"),
+        ("-home.example.com:51830", "has the label \"-home\""),
+        ("home-.example.com:51830", "has the label \"home-\""),
+        ("home..example.com:51830", "has the label \"\""),
+        ("_wg.example.com:51830", "has the label \"_wg\""),
+        (
+            "white space.example.com:51830",
+            "has the label \"white space\"",
+        ),
+        ("localhost:51830", "is a single label"),
+        ("[::1]:51830", "has the label \"[::1]\""),
+        (&long, "has the label"),
+        (&too_long, "is longer than 253 characters"),
+    ] {
+        let error = text.parse::<HostPort>().unwrap_err();
+        assert!(error.contains(why), "{text}: {error}");
+        let mut value = client_json();
+        value["role"]["client"] = json!({ "server": text });
+        let error = serde_json::from_value::<Config>(value)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(why), "{text}: {error}");
+    }
+}
+
+#[test]
+fn a_server_publishes_txt_unless_it_says_a() {
+    let config = load_value(&server_json()).unwrap();
+    let server = config.server().unwrap();
+    assert_eq!(server.publish, PublishMode::Txt);
+    assert!(
+        serde_json::to_value(&config).unwrap()["role"]["server"]
+            .get("publish")
+            .is_none(),
+        "a config without publish saves without it"
+    );
+    let mut value = server_json();
+    value["role"]["server"]["publish"] = json!("a");
+    value["role"]["server"]["cloudflare"]["record"] = json!("home.example.com");
+    let config = load_value(&value).unwrap();
+    assert_eq!(config.server().unwrap().publish, PublishMode::A);
+    assert_eq!(
+        serde_json::to_value(&config).unwrap()["role"]["server"]["publish"],
+        "a"
+    );
+    value["role"]["server"]["publish"] = json!("aaaa");
+    assert_eq!(load_value(&value).unwrap_err().code, "CONFIG_INVALID");
+}
+
+#[test]
+fn publish_txt_needs_stun_and_publish_a_does_not() {
+    refused(
+        "role.server.stun is missing, and publish txt needs it",
+        |config| {
+            config["role"]["server"]
+                .as_object_mut()
+                .unwrap()
+                .remove("stun");
+        },
+    );
+    validated(|config| {
+        config["role"]["server"]["cloudflare"]["record"] = json!("home.example.com");
+        let server = config["role"]["server"].as_object_mut().unwrap();
+        server.remove("stun");
+        server.insert("publish".into(), json!("a"));
+    })
+    .unwrap();
+}
+
+#[test]
+fn publish_a_needs_a_record_that_clients_can_dial_and_a_listen_port() {
+    for (record, why) in [
+        ("_wg-home.example.com", "has the label \"_wg-home\""),
+        ("home", "is a single label"),
+        ("home.example.com.", "ends with a dot"),
+    ] {
+        let error = validated(|config| {
+            config["role"]["server"]["publish"] = json!("a");
+            config["role"]["server"]["cloudflare"]["record"] = json!(record);
+        })
+        .unwrap_err();
+        assert!(
+            error.starts_with(
+                "cloudflare.record is not a host name that clients can dial, which publish a needs"
+            ),
+            "{error}"
+        );
+        assert!(error.contains(why), "{record}: {error}");
+    }
+    validated(|config| {
+        config["role"]["server"]["cloudflare"]["record"] = json!("_wg-home.example.com");
+    })
+    .unwrap();
+    refused("role.server.listen_port is 0", |config| {
+        config["role"]["server"]["publish"] = json!("a");
+        config["role"]["server"]["cloudflare"]["record"] = json!("home.example.com");
+        config["role"]["server"]["listen_port"] = json!(0);
+    });
 }
 
 #[test]

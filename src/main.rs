@@ -115,7 +115,8 @@ enum Action {
         action: ProbeAction,
     },
     /// Run the WireGuard server: the tunnel with its route and LAN NAT, the
-    /// STUN keepalive, the TXT record, the UPnP lease and the status file.
+    /// STUN keepalive, the TXT or A record, the UPnP lease and the status
+    /// file.
     Server {
         /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. `natwg
         /// service install` runs the server in the background.
@@ -123,8 +124,8 @@ enum Action {
         foreground: bool,
     },
     /// Run the WireGuard client: the tunnel to the server with a route for
-    /// each of its allowed IPs, the TXT lookup that follows the server's
-    /// endpoint, and the status file.
+    /// each of its allowed IPs, the TXT or A lookup that follows the
+    /// server's endpoint, and the status file.
     Client {
         /// Stay in the foreground until SIGINT, SIGTERM or SIGHUP. `natwg
         /// service install` runs the client in the background.
@@ -142,10 +143,10 @@ enum Action {
     /// Show what the running server or client reported last. Needs no root.
     ///
     /// natwg exits 1 when the status is older than 60 s or shows a problem:
-    /// for a server no tunnel, no public mapping, a failed TXT publish, or
-    /// failed NAT or UPnP; for a client no tunnel, no endpoint, a failed TXT
-    /// lookup, or, with a keepalive, no handshake yet or none for 210 s plus
-    /// the keepalive.
+    /// for a server no tunnel, no public mapping (with publish a, no public
+    /// IP), a failed publish, or failed NAT or UPnP; for a client no tunnel,
+    /// no endpoint, a failed lookup, or, with a keepalive, no handshake yet
+    /// or none for 210 s plus the keepalive.
     Status {
         /// Print the status file as JSON.
         #[arg(long)]
@@ -215,6 +216,10 @@ enum PeerAction {
     /// Give a new client fresh keys and the next free tunnel address, add it
     /// to the server config, and print the client's config.json.
     ///
+    /// The client finds the server the way the server publishes itself: the
+    /// TXT record (role.client.record), or with publish a the A record at
+    /// the listen port (role.client.server "name:port").
+    ///
     /// The client config holds the client's private key. Copy it to the
     /// client privately, as /usr/local/etc/natwg/config.json (macOS) or
     /// /etc/natwg/config.json (Linux), owned by root with mode 0600.
@@ -275,7 +280,7 @@ enum DoctorAction {
     /// an answer, so it includes the WireGuard handshake.
     Loopback {
         /// Where the client dials the server (default: the mapping in the
-        /// status file of the server).
+        /// status file of the server, else its public IP at the listen port).
         #[arg(long, value_name = "IP:PORT")]
         endpoint: Option<SocketAddrV4>,
         /// The interface the client sends through (default: the server's interface).
@@ -527,7 +532,7 @@ fn run(cli: Cli) -> Result<()> {
                     UpnpArg::Off => detect::UpnpMode::Off,
                 },
                 dns: dns
-                    .or(server.map(|server| server.stun.dns_server))
+                    .or(server.and_then(|server| Some(server.stun.as_ref()?.dns_server)))
                     .unwrap_or(detect::DEFAULT_DNS),
                 timeout,
             };
@@ -753,10 +758,17 @@ fn doctor_loopback(
         Some(endpoint) => endpoint,
         None => {
             let path = status::path(config.server()?);
-            Status::read(&path)?.mapping.ok_or_else(|| {
+            let status = Status::read(&path)?;
+            let public = status
+                .public_ip
+                .map(|ip| SocketAddrV4::new(ip, status.listen_port));
+            status.mapping.or(public).ok_or_else(|| {
                 Error::new(
                     "DOCTOR_NO_ENDPOINT",
-                    format!("{} holds no mapping yet; pass --endpoint", path.display()),
+                    format!(
+                        "{} holds no mapping or public IP yet; pass --endpoint",
+                        path.display()
+                    ),
                 )
             })?
         }
@@ -834,7 +846,10 @@ fn daemon(config: &Path, want: Option<Want>) -> Result<()> {
         let mut stop = Stop::listen()?;
         let stop = async move { stop.requested().await };
         match &config.role {
-            Role::Server(_) => server::run(&config, cloudflare::API, Tunnel::start, stop).await,
+            Role::Server(_) => {
+                let api = cloudflare_api();
+                server::run(&config, &api, Tunnel::start, stop).await
+            }
             Role::Client(_) => {
                 let build = async |config: &Config, uplink: &uplink::Uplink, endpoint| {
                     tunnel::Client::start(config, &uplink.iface, endpoint).await
@@ -844,6 +859,36 @@ fn daemon(config: &Path, want: Option<Want>) -> Result<()> {
             }
         }
     })
+}
+
+/// The Cloudflare API the server calls: [`cloudflare::API`], or in a debug
+/// build NATWG_CLOUDFLARE_API, such as the fake API of the network lab.
+fn cloudflare_api() -> String {
+    let set = std::env::var("NATWG_CLOUDFLARE_API").ok();
+    let (api, warning) = choose_api(set, cfg!(debug_assertions));
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    api
+}
+
+/// The API base URL, and what to warn about. The token goes wherever the
+/// override points, so only a debug build, which tests use, honours it.
+fn choose_api(set: Option<String>, debug: bool) -> (String, Option<String>) {
+    match set.filter(|api| !api.is_empty()) {
+        Some(api) if debug => {
+            let warning = format!("calling the Cloudflare API at {api}, from NATWG_CLOUDFLARE_API");
+            (api, Some(warning))
+        }
+        Some(_) => (
+            cloudflare::API.to_owned(),
+            Some(
+                "ignoring NATWG_CLOUDFLARE_API: it is for tests, and only a debug build honours it"
+                    .to_owned(),
+            ),
+        ),
+        None => (cloudflare::API.to_owned(), None),
+    }
 }
 
 /// The signals that stop the server or the client. SIGHUP is one of them, because a
@@ -973,7 +1018,34 @@ async fn first_mapping(
 
 #[cfg(test)]
 mod tests {
-    use super::Stop;
+    use super::{Stop, choose_api};
+    use natwg::server::cloudflare;
+
+    #[test]
+    fn only_a_debug_build_sends_the_cloudflare_calls_elsewhere() {
+        let lab = Some("http://45.78.0.80/client/v4".to_owned());
+        let (api, warning) = choose_api(lab.clone(), true);
+        assert_eq!(api, "http://45.78.0.80/client/v4");
+        assert!(
+            warning
+                .unwrap()
+                .starts_with("calling the Cloudflare API at http://45.78.0.80")
+        );
+        let (api, warning) = choose_api(lab, false);
+        assert_eq!(api, cloudflare::API, "a release build ignores the override");
+        assert!(
+            warning
+                .unwrap()
+                .starts_with("ignoring NATWG_CLOUDFLARE_API")
+        );
+        for debug in [true, false] {
+            assert_eq!(choose_api(None, debug), (cloudflare::API.to_owned(), None));
+            assert_eq!(
+                choose_api(Some(String::new()), debug),
+                (cloudflare::API.to_owned(), None)
+            );
+        }
+    }
     use std::time::Duration;
 
     #[tokio::test]

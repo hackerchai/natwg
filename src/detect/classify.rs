@@ -1,8 +1,11 @@
 //! The verdict of `natwg detect` as a pure function of what the tests saw,
 //! so every combination is testable without a network.
 
-use serde::Serialize;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt,
+    net::{Ipv4Addr, SocketAddrV4},
+};
 
 /// Whether this network can host a natwg server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -43,8 +46,9 @@ pub enum Kind {
     Nat1,
 }
 
-/// How natwg established that a supported network is public.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// How natwg established that a supported network is public. The server's
+/// status file names the source of the IP that publish `a` keeps with it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicBy {
     /// The uplink holds the public address that STUN sees.
@@ -56,6 +60,17 @@ pub enum PublicBy {
     /// but no gateway confirmed a forward: a full-cone NAT that keeps the
     /// port looks the same, and its mapping lives only while traffic flows.
     PortKept,
+}
+
+impl fmt::Display for PublicBy {
+    /// The name `--json` and the status file use.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Address => "address",
+            Self::Upnp => "upnp",
+            Self::PortKept => "port_kept",
+        })
+    }
 }
 
 /// How the NAT picks the public address of a socket (RFC 4787).

@@ -1,3 +1,5 @@
+use natwg::config::PublishMode;
+use natwg::detect::PublicBy;
 use natwg::status::{ClientRole, ClientStatus, PeerStatus, Report, Status};
 use serde_json::json;
 use std::{
@@ -17,11 +19,19 @@ fn fixture(updated: u64) -> Status {
         tun: Some("utun12".into()),
         mapping: Some("183.192.36.226:7105".parse().unwrap()),
         mapping_since: Some(updated - 300),
+        stun: true,
         last_stun_ok: Some(updated - 5),
         stun_misses: 0,
+        publish: PublishMode::Txt,
+        record: Some("_wg-home.example.com".into()),
         published: Some("183.192.36.226:7105".parse().unwrap()),
+        published_ip: None,
         published_at: Some(updated - 290),
         publish_error: None,
+        public_ip: None,
+        public_by: None,
+        public_error: None,
+        record_problem: None,
         upnp_ok: Some(true),
         upnp_at: Some(updated - 100),
         nat_ok: Some(true),
@@ -49,11 +59,19 @@ fn the_status_file_has_the_documented_fields() {
         "tun": "utun12",
         "mapping": "183.192.36.226:7105",
         "mapping_since": 999_700,
+        "stun": true,
         "last_stun_ok": 999_995,
         "stun_misses": 0,
+        "publish": "txt",
+        "record": "_wg-home.example.com",
         "published": "183.192.36.226:7105",
+        "published_ip": null,
         "published_at": 999_710,
         "publish_error": null,
+        "public_ip": null,
+        "public_by": null,
+        "public_error": null,
+        "record_problem": null,
         "upnp_ok": true,
         "upnp_at": 999_900,
         "nat_ok": true,
@@ -91,7 +109,7 @@ fn the_human_view_shows_each_part_with_its_age() {
     let text = fixture(1_000_000).render(now);
     let expected = "\
 public endpoint : 183.192.36.226:7105 (since 304s ago)
-published TXT   : 183.192.36.226:7105 (294s ago)
+published TXT   : _wg-home.example.com = 183.192.36.226:7105 (294s ago)
 last STUN reply : 9s ago, misses=0
 upnp/nat        : ok / ok
 tunnel          : utun12 on en6 udp/51831, rebuilds=1
@@ -116,7 +134,7 @@ fn the_human_view_names_what_is_missing_and_the_publish_error() {
     let text = status.render(1_000_000);
     for line in [
         "public endpoint : none (since never)",
-        "published TXT   : none (never)  ERROR: CLOUDFLARE_API: Authentication error",
+        "published TXT   : _wg-home.example.com = none (never)  ERROR: CLOUDFLARE_API: Authentication error",
         "upnp/nat        : off / failed",
         "tunnel          : none on en6 udp/51831, rebuilds=1",
         "handshake=never",
@@ -147,7 +165,7 @@ fn natwg_status_prints_the_status_file_for_people() {
     let text = String::from_utf8(output.stdout).unwrap();
     for line in [
         "public endpoint : 183.192.36.226:7105 (since 30",
-        "published TXT   : 183.192.36.226:7105 (29",
+        "published TXT   : _wg-home.example.com = 183.192.36.226:7105 (29",
         "upnp/nat        : ok / ok",
         "peer paDfvm0HLq… endpoint=10.24.0.9:51820",
         "status written  : ",
@@ -206,6 +224,128 @@ fn a_status_without_versions_still_reads() {
         panic!("a server status");
     };
     assert_eq!((status.version, status.latest_version), (None, None));
+}
+
+#[test]
+fn a_status_of_natwg_0_3_0_reads_as_publish_txt_with_stun() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let mut value = serde_json::to_value(fixture(1_000_000)).unwrap();
+    let object = value.as_object_mut().unwrap();
+    for field in [
+        "stun",
+        "publish",
+        "record",
+        "published_ip",
+        "public_ip",
+        "public_by",
+        "public_error",
+        "record_problem",
+    ] {
+        object.remove(field);
+    }
+    std::fs::write(&path, value.to_string()).unwrap();
+    let Report::Server(status) = Report::read(&path).unwrap() else {
+        panic!("a server status");
+    };
+    assert_eq!(status.publish, PublishMode::Txt);
+    assert!(status.stun);
+    assert!(
+        status
+            .render(1_000_004)
+            .contains("published TXT   : 183.192.36.226:7105 (294s ago)"),
+        "a status without the record name shows the value alone"
+    );
+}
+
+/// A server that publishes its public IP 45.77.0.10 in an A record.
+fn publish_a(updated: u64) -> Status {
+    let mut status = fixture(updated);
+    status.publish = PublishMode::A;
+    status.record = Some("home.example.com".into());
+    status.mapping = Some("45.77.0.10:51831".parse().unwrap());
+    status.published = None;
+    status.published_ip = Some("45.77.0.10".parse().unwrap());
+    status.public_ip = Some("45.77.0.10".parse().unwrap());
+    status.public_by = Some(PublicBy::Address);
+    status
+}
+
+#[test]
+fn the_human_view_of_publish_a_shows_the_ip_where_it_came_from_and_the_name() {
+    let now = 1_000_004;
+    let text = publish_a(1_000_000).render(now);
+    let expected = "\
+public IP       : 45.77.0.10 by address
+published A     : home.example.com = 45.77.0.10 (294s ago), clients dial home.example.com:51831
+public endpoint : 45.77.0.10:51831 (since 304s ago)
+last STUN reply : 9s ago, misses=0
+upnp/nat        : ok / ok
+";
+    assert!(text.starts_with(expected), "{text}");
+
+    let mut status = publish_a(1_000_000);
+    status.stun = false;
+    status.mapping = None;
+    status.last_stun_ok = None;
+    let text = status.render(now);
+    assert!(
+        text.contains("clients dial home.example.com:51831\nlast STUN reply : off (no role.server.stun)\nupnp/nat"),
+        "{text}"
+    );
+
+    status.public_by = Some(PublicBy::Upnp);
+    assert!(
+        status
+            .render(now)
+            .starts_with("public IP       : 45.77.0.10 by upnp\n")
+    );
+
+    let mut waiting = publish_a(1_000_000);
+    (waiting.public_ip, waiting.public_by, waiting.mapping) = (None, None, None);
+    assert!(
+        waiting
+            .render(now)
+            .contains("public IP       : none (not known yet)\n")
+    );
+}
+
+#[test]
+fn natwg_status_of_publish_a_needs_a_public_ip_and_not_a_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let mut status = publish_a(now());
+    status.stun = false;
+    status.mapping = None;
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "no mapping is fine without STUN: {output:?}"
+    );
+
+    let error = "STUN sees 45.77.0.2:51831, which keeps the listen port, but without role.server.upnp natwg cannot confirm that a router forwards udp/51831";
+    status.public_ip = None;
+    status.public_by = None;
+    status.public_error = Some(error.into());
+    status.publish_error = Some("CLOUDFLARE_API: HTTP 403".into());
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("public IP       : none  ERROR: {error}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("ERROR: CLOUDFLARE_API: HTTP 403"),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.trim(),
+        "SERVER_UNHEALTHY: no public IP, the A publish failed"
+    );
 }
 
 #[test]
@@ -334,6 +474,7 @@ fn client_fixture(updated: u64) -> ClientStatus {
         uplink_address: Some("10.16.0.105".parse().unwrap()),
         tun: Some("utun13".into()),
         record: Some("_wg-home.example.com".into()),
+        record_type: Some(PublishMode::Txt),
         endpoint: Some("183.192.36.226:7105".parse().unwrap()),
         endpoint_since: Some(updated - 300),
         looked_up: Some(updated - 20),
@@ -385,6 +526,46 @@ fn the_client_human_view_shows_the_endpoint_handshake_and_traffic() {
     let text = status.render(now);
     assert!(text.contains("from config"), "{text}");
     assert!(text.contains("TXT lookup      : off"), "{text}");
+}
+
+#[test]
+fn other_records_on_the_name_are_a_problem_that_names_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let problem = "home.example.com also has A 45.77.0.99, AAAA 2001:db8::1; delete them in Cloudflare: natwg keeps one A record and is IPv4-only, and clients may dial the others";
+    let mut status = publish_a(now());
+    status.record_problem = Some(problem.into());
+    assert!(
+        status
+            .render(status.updated)
+            .contains(&format!("other records   : ERROR: {problem}\n"))
+    );
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.trim(), format!("SERVER_UNHEALTHY: {problem}"));
+}
+
+#[test]
+fn the_client_human_view_names_the_a_record_it_follows() {
+    let now = 1_000_000;
+    let mut status = client_fixture(now);
+    status.record = Some("home.example.com".into());
+    status.record_type = Some(PublishMode::A);
+    status.endpoint = Some("45.77.0.10:51830".parse().unwrap());
+    let text = status.render(now + 3);
+    for line in [
+        "server endpoint : 45.77.0.10:51830 from A home.example.com (since 303s ago)",
+        "A lookup        : 23s ago",
+    ] {
+        assert!(text.contains(line), "{line:?} is missing from\n{text}");
+    }
+    status.lookup_error = Some("A_NO_ADDRESS: nothing".into());
+    assert_eq!(
+        Report::Client(status).problems(now),
+        ["the A lookup failed"]
+    );
 }
 
 #[test]

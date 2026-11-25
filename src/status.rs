@@ -2,7 +2,8 @@
 //! and `natwg status` reads without root. Anyone can read it, so it holds no
 //! secret. Every time in it is in Unix seconds.
 
-use crate::config::{ClientConfig, Instance, ServerConfig};
+use crate::config::{ClientConfig, Instance, PublishMode, ServerConfig};
+use crate::detect::PublicBy;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,13 +37,47 @@ pub struct Status {
     pub tun: Option<String>,
     pub mapping: Option<SocketAddrV4>,
     pub mapping_since: Option<u64>,
+    /// Whether the server runs the STUN keepalive. Only publish `a` on a
+    /// public uplink goes without. A status of natwg 0.3.0 has none, and ran
+    /// it.
+    #[serde(default = "on")]
+    pub stun: bool,
     pub last_stun_ok: Option<u64>,
     /// STUN requests in a row that got no answer.
     pub stun_misses: u32,
+    /// What the server publishes: `txt`, the mapping in a TXT record, or
+    /// `a`, the public IP in an A record. A status of natwg 0.3.0 has none,
+    /// and published TXT.
+    #[serde(default)]
+    pub publish: PublishMode,
+    /// The name of the Cloudflare record.
+    #[serde(default)]
+    pub record: Option<String>,
     /// What the TXT record holds, as natwg last wrote or found it.
     pub published: Option<SocketAddrV4>,
+    /// What the A record holds, as natwg last wrote or found it.
+    #[serde(default)]
+    pub published_ip: Option<Ipv4Addr>,
     pub published_at: Option<u64>,
     pub publish_error: Option<String>,
+    /// With publish `a`: the public IP that natwg keeps in the A record.
+    #[serde(default)]
+    pub public_ip: Option<Ipv4Addr>,
+    /// Where `public_ip` comes from: `address`, the uplink's own; or `upnp`,
+    /// a router's, confirmed by a working UPnP lease of the listen port, the
+    /// gateway's WAN address and a STUN mapping that keeps the port.
+    #[serde(default)]
+    pub public_by: Option<PublicBy>,
+    /// With publish `a`: why there is no public IP, as for a mapping that
+    /// does not keep the listen port, or that no UPnP gateway confirms. The A
+    /// record then stays as it was.
+    #[serde(default)]
+    pub public_error: Option<String>,
+    /// With publish `a`: the other records of the name that clients may
+    /// dial, more A records or an AAAA record, which the operator must
+    /// delete. natwg never deletes them.
+    #[serde(default)]
+    pub record_problem: Option<String>,
     /// None when the config has no UPnP section or the first lease is pending.
     pub upnp_ok: Option<bool>,
     pub upnp_at: Option<u64>,
@@ -164,6 +199,18 @@ fn or_none(value: Option<String>) -> String {
     value.unwrap_or_else(|| "none".to_owned())
 }
 
+fn on() -> bool {
+    true
+}
+
+/// `name = value`, or the value alone when the name is unknown.
+fn named(name: Option<&str>, value: String) -> String {
+    match name {
+        Some(name) => format!("{name} = {value}"),
+        None => value,
+    }
+}
+
 impl Status {
     /// Atomically replace `path` with this status, readable by everyone.
     pub fn write(&self, path: &Path) -> Result<()> {
@@ -176,12 +223,14 @@ impl Status {
 
     /// What this status shows to be wrong at `now`, for people to read.
     /// None of it holds while the server serves: the status is fresh, a
-    /// tunnel runs, its NAT rule works, there is a public mapping, the last
-    /// TXT publish worked, and UPnP did not fail. UPnP that is off is fine,
-    /// and so is NAT that is off because the server has no LAN.
+    /// tunnel runs, its NAT rule works, there is a public mapping (with
+    /// publish `a`, a public IP), the last publish worked, and UPnP did not
+    /// fail. UPnP that is off is fine, and so is NAT that is off because the
+    /// server has no LAN.
     pub fn problems(&self, now: u64) -> Vec<String> {
         let age = now.saturating_sub(self.updated);
         let tunnel = self.tun.is_some();
+        let a = self.publish == PublishMode::A;
         [
             (age > STALE_AFTER, format!("the status is {age}s old")),
             (!tunnel, "no tunnel runs".to_owned()),
@@ -189,10 +238,15 @@ impl Status {
                 tunnel && self.nat_ok == Some(false),
                 "NAT is not ok".to_owned(),
             ),
-            (self.mapping.is_none(), "no public mapping".to_owned()),
+            (!a && self.mapping.is_none(), "no public mapping".to_owned()),
+            (a && self.public_ip.is_none(), "no public IP".to_owned()),
+            (
+                self.record_problem.is_some(),
+                self.record_problem.clone().unwrap_or_default(),
+            ),
             (
                 self.publish_error.is_some(),
-                "the TXT publish failed".to_owned(),
+                format!("the {} publish failed", self.publish.record_type()),
             ),
             (self.upnp_ok == Some(false), "UPnP failed".to_owned()),
         ]
@@ -209,28 +263,66 @@ impl Status {
             Some(false) => "failed",
             None => "off",
         };
-        let error = self
-            .publish_error
-            .as_ref()
-            .map(|error| format!("  ERROR: {error}"))
-            .unwrap_or_default();
+        let error = |error: Option<&String>| {
+            error
+                .map(|error| format!("  ERROR: {error}"))
+                .unwrap_or_default()
+        };
+        let publish_error = error(self.publish_error.as_ref());
+        let record = self.record.as_deref();
+        let mut lines = Vec::new();
+        let mapping = format!(
+            "public endpoint : {} (since {})",
+            or_none(self.mapping.map(|m| m.to_string())),
+            age(self.mapping_since)
+        );
+        let stun = format!(
+            "last STUN reply : {}, misses={}",
+            age(self.last_stun_ok),
+            self.stun_misses
+        );
+        match self.publish {
+            PublishMode::Txt => {
+                lines.push(mapping);
+                lines.push(format!(
+                    "published TXT   : {} ({}){publish_error}",
+                    named(record, or_none(self.published.map(|p| p.to_string()))),
+                    age(self.published_at)
+                ));
+                lines.push(stun);
+            }
+            PublishMode::A => {
+                let public = match (self.public_ip, self.public_by) {
+                    (Some(ip), Some(by)) => format!("{ip} by {by}"),
+                    (Some(ip), None) => ip.to_string(),
+                    (None, _) if self.public_error.is_none() => "none (not known yet)".to_owned(),
+                    (None, _) => "none".to_owned(),
+                };
+                lines.push(format!(
+                    "public IP       : {public}{}",
+                    error(self.public_error.as_ref())
+                ));
+                let dial = record
+                    .map(|record| format!(", clients dial {record}:{}", self.listen_port))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "published A     : {} ({}){dial}{publish_error}",
+                    named(record, or_none(self.published_ip.map(|p| p.to_string()))),
+                    age(self.published_at)
+                ));
+                if let Some(problem) = &self.record_problem {
+                    lines.push(format!("other records   : ERROR: {problem}"));
+                }
+                if self.stun {
+                    lines.push(mapping);
+                    lines.push(stun);
+                } else {
+                    lines.push("last STUN reply : off (no role.server.stun)".to_owned());
+                }
+            }
+        }
         let mut text = String::new();
-        let lines = [
-            format!(
-                "public endpoint : {} (since {})",
-                or_none(self.mapping.map(|m| m.to_string())),
-                age(self.mapping_since)
-            ),
-            format!(
-                "published TXT   : {} ({}){error}",
-                or_none(self.published.map(|p| p.to_string())),
-                age(self.published_at)
-            ),
-            format!(
-                "last STUN reply : {}, misses={}",
-                age(self.last_stun_ok),
-                self.stun_misses
-            ),
+        lines.extend([
             format!(
                 "upnp/nat        : {} / {}",
                 health(self.upnp_ok),
@@ -243,7 +335,7 @@ impl Status {
                 self.listen_port,
                 self.rebuilds
             ),
-        ];
+        ]);
         for line in lines {
             let _ = writeln!(text, "{line}");
         }
@@ -288,14 +380,19 @@ pub struct ClientStatus {
     pub uplink_address: Option<Ipv4Addr>,
     /// The TUN of the running tunnel, or none while natwg rebuilds it.
     pub tun: Option<String>,
-    /// The TXT record that names the server's endpoint, if the config has one.
+    /// The record the client looks up, if the config has one: the TXT record
+    /// that holds the server's endpoint, or the name of role.client.server.
     pub record: Option<String>,
+    /// What `record` is: `txt`, or `a` for role.client.server. A status of
+    /// natwg 0.3.0 has none, and a TXT record.
+    #[serde(default)]
+    pub record_type: Option<PublishMode>,
     /// Where natwg points the server peer.
     pub endpoint: Option<SocketAddrV4>,
     pub endpoint_since: Option<u64>,
-    /// When the TXT record last gave a well-formed endpoint.
+    /// When the record last gave a well-formed endpoint.
     pub looked_up: Option<u64>,
-    /// Why the last TXT lookup failed, until one works.
+    /// Why the last lookup failed, until one works.
     pub lookup_error: Option<String>,
     /// The persistent keepalive in seconds, 0 when it is off.
     pub keepalive: u16,
@@ -310,9 +407,14 @@ impl ClientStatus {
         write_public(path, self)
     }
 
+    /// The record type the client looks up: `TXT` or `A`.
+    fn record_type(&self) -> &'static str {
+        self.record_type.unwrap_or_default().record_type()
+    }
+
     /// What this status shows to be wrong at `now`. None of it holds while
     /// the client reaches the server: the status is fresh, a tunnel runs,
-    /// natwg knows an endpoint, the last TXT lookup worked, and, with a
+    /// natwg knows an endpoint, the last lookup worked, and, with a
     /// keepalive, the last handshake is younger than a session.
     pub fn problems(&self, now: u64) -> Vec<String> {
         let age = now.saturating_sub(self.updated);
@@ -338,7 +440,7 @@ impl ClientStatus {
                 .then(|| "no server endpoint".to_owned()),
             self.lookup_error
                 .is_some()
-                .then(|| "the TXT lookup failed".to_owned()),
+                .then(|| format!("the {} lookup failed", self.record_type())),
             handshake_problem,
         ]
         .into_iter()
@@ -349,8 +451,9 @@ impl ClientStatus {
     /// The status for people to read, with times as their age at `now`.
     pub fn render(&self, now: u64) -> String {
         let age = |time| age(now, time);
+        let kind = self.record_type();
         let source = match &self.record {
-            Some(record) => format!("TXT {record}"),
+            Some(record) => format!("{kind} {record}"),
             None => "config".to_owned(),
         };
         let lookup = match (&self.record, &self.lookup_error) {
@@ -384,7 +487,7 @@ impl ClientStatus {
                 or_none(self.endpoint.map(|e| e.to_string())),
                 age(self.endpoint_since)
             ),
-            format!("TXT lookup      : {lookup}"),
+            format!("{:<16}: {lookup}", format!("{kind} lookup")),
             format!("handshake       : {handshake}, {keepalive}"),
             format!(
                 "tunnel          : {} via {uplink}, rebuilds={}",
