@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.4.0](https://github.com/hackerchai/natwg/compare/v0.3.0...v0.4.0) (2026-11-25)
+
+
+### Features
+
+* add natwg detect to tell whether the network can host natwg
+* export WireGuard, Surge and mihomo configurations
+* export WireGuard, Surge and mihomo configurations
+* follow uplink events and recover TXT endpoints on handshake failure
+* follow uplink events and recover TXT endpoints on handshake failure
+* initialize WireGuard servers from network detection
+* initialize WireGuard servers from network detection
+* natwg detect tells whether the network can host natwg
+* publish the public IP as an A record in public mode
+* publish the public IP as an A record in public mode
+
+
+### Bug Fixes
+
+* **client:** recover TXT peers across retries and roaming
+* **client:** start handshake grace at first TXT discovery
+* ignore unrouted traffic when pausing client keepalives
+* make natwg detect claim only what it saw, and keep UPnP safe
+* preserve peer keys and recover native endpoint snapshots
+* prove the review fixes of public mode in the network lab
+* prove the review's cases in the network lab
+* verify first-peer endpoints and reload the initialized server
+* write only an exact A record of an IP confirmed now
+
 ## [0.3.0](https://github.com/hackerchai/natwg/compare/v0.2.0...v0.3.0) (2026-11-25)
 
 
