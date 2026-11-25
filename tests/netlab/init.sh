@@ -19,8 +19,8 @@ isolated() {
 		mkdir /run/natwg
 		mount --bind "$work/runtime" /run/natwg
 		mount --bind "$work/platform-wg" /etc/wireguard
-		mount -t tmpfs -o mode=0755 tmpfs /etc/systemd/system
-		mount -t tmpfs -o mode=0755 tmpfs /usr/local
+		mount --bind "$work/units" /etc/systemd/system
+		mount --bind "$work/local" /usr/local
 		mount --bind "$work/systemctl" /usr/bin/systemctl
 		exec "$@"
 	' _ "$WORK" "$@"
@@ -68,11 +68,18 @@ client_traffic() {
 daemon_init() {
 	local mode=txt ip=$ROUTER_WAN port=$NAT_PORT lan=$ROUTER_LAN args=()
 	case $SCENARIO in
-	public) mode=a ip=$PUBLIC_HOST port=$PORT lan=$LAN_HOST; args+=(--lan "$LAN_NET") ;;
+	public)
+		mode=a ip=$PUBLIC_HOST port=$PORT lan=$LAN_HOST
+		args+=(--lan "$LAN_NET")
+		;;
 	upnp) mode=a port=$PORT ;;
 	public-forward) port=$PORT ;;
 	esac
-	extras "$SCENARIO"
+	if [[ $scenario = stale-first ]]; then
+		extras upnp --record "$NAME=TXT:$ROUTER_WAN:55555"
+	else
+		extras "$SCENARIO"
+	fi
 	if [[ $mode = txt ]]; then
 		refused 'needs a confirmed public IP' --mode wireguard --wg-dir "$WORK/wg"
 		[[ ! -e $WORK/server.json && ! -e $WORK/wg ]]
@@ -80,6 +87,9 @@ daemon_init() {
 	if [[ $SCENARIO = nat1 ]]; then
 		# Fresh install. There is no TXT to snapshot until the new server runs.
 		refused INIT_PEER_RECOVERY --peer laptop --format surge --out "$WORK/surge.conf"
+		if [[ $scenario = stale-first ]]; then
+			grep -qF TXT_NOT_CURRENT "$WORK/init.log"
+		fi
 		local recovery
 		recovery=$(sed -n 's/^First peer recovery file \(.*\) (0600).*/\1/p' "$WORK/init.log")
 		private "$WORK/server.json" "$recovery"
@@ -109,7 +119,7 @@ daemon_init() {
 	if [[ $mode = a ]]; then
 		wait_until 35 api_logged "^POST A $NAME $ip$"
 	else
-		wait_until 35 api_logged "^POST TXT $NAME .*$ip:$port" # fake API logs TXT with quotes
+		wait_until 35 api_logged "^(POST|PUT) TXT $NAME .*$ip:$port" # fake API logs TXT with quotes
 	fi
 	client_traffic "$ip:$port" "$lan"
 	if [[ $SCENARIO = nat1 ]]; then
@@ -121,8 +131,16 @@ daemon_init() {
 
 native_init() {
 	local lan=$LAN_HOST ip=$PUBLIC_HOST wg=$WORK/platform-wg args=(--lan "$LAN_NET")
-	if [[ $SCENARIO = upnp ]]; then ip=$ROUTER_WAN lan=$ROUTER_LAN wg=$WORK/wg; args=(--wg-dir "$wg"); fi
+	if [[ $SCENARIO = upnp ]]; then
+		ip=$ROUTER_WAN lan=$ROUTER_LAN wg=$WORK/wg
+		args=(--wg-dir "$wg")
+	fi
 	extras "$SCENARIO" --record "$NAME=A:$ip"
+	if [[ $scenario = native-default ]]; then
+		args=()
+		refused 'contains the public WireGuard endpoint' --mode wireguard --lan "$PUBLIC_HOST/24"
+		[[ ! -e $WORK/server.json ]]
+	fi
 	initialize --mode wireguard --peer mobile --format clash --out "$WORK/mobile.yaml" "${args[@]}"
 	private "$WORK/server.json" "$wg/natwg.conf" "$wg/natwg-client.conf" "$WORK/mobile.yaml"
 	grep -Fq "server: \"$NAME\"" "$WORK/mobile.yaml"
@@ -139,7 +157,14 @@ native_init() {
 	local started
 	started=$(date +%s)
 	client_up
-	traffic "$lan" "$ip:$PORT" "$started"
+	if [[ $scenario = native-default ]]; then
+		is_field server.json role.server.lan '[]'
+		ns peer ip route get "$ip" | grep -Fq " dev $P-p0 "
+		pings "$TUNNEL_IP"
+		[[ $(ns peer wg show mobile latest-handshakes | awk '{print $2}') -ge $started ]]
+	else
+		traffic "$lan" "$ip:$PORT" "$started"
+	fi
 	ns peer wg-quick down "$WORK/mobile.conf"
 	ns host wg-quick down "$wg/natwg.conf"
 	nothing_written
@@ -147,9 +172,7 @@ native_init() {
 
 # A stand-in for systemctl inside the masked OS paths starts the installed
 # binary in the server namespace. The unit, binary, PID and logs are private.
-service_init() {
-	# This name still holds an old endpoint when the installer starts.
-	extras upnp --record "$NAME=TXT:$ROUTER_WAN:55555"
+fake_manager() {
 	cat >"$WORK/systemctl" <<'MANAGER'
 #!/bin/sh
 set -eu
@@ -163,7 +186,14 @@ show)
 		echo LoadState=not-found
 	fi ;;
 daemon-reload) ;;
-enable)
+enable|restart)
+	if [ "$1" = restart ]; then
+		kill "$(cat "$run/pid")"
+		for _ in $(seq 100); do
+			ip link show natwg >/dev/null 2>&1 || break
+			sleep 0.1
+		done
+	fi
 	config=$(cat "$run/config-path")
 	grep -Fq "$config" /etc/systemd/system/natwg.service
 	NATWG_UPDATE_CHECK=off NATWG_CLOUDFLARE_API=http://45.78.0.80/client/v4 \
@@ -173,6 +203,12 @@ enable)
 esac
 MANAGER
 	printf '%s\n' "$WORK/server.json" >"$WORK/runtime/config-path"
+}
+
+service_init() {
+	# This name still holds an old endpoint when the installer starts.
+	extras upnp --record "$NAME=TXT:$ROUTER_WAN:55555"
+	fake_manager
 	initialize --install-service --peer mobile --format wg-quick --out "$WORK/mobile.conf"
 	grep -Fxq 'enable --now natwg.service' "$WORK/runtime/systemctl.called"
 	grep -Fq "Endpoint = $ROUTER_WAN:$NAT_PORT" "$WORK/mobile.conf"
@@ -181,6 +217,37 @@ MANAGER
 	started=$(date +%s)
 	client_up
 	traffic "$ROUTER_LAN" "$ROUTER_WAN:$NAT_PORT" "$started"
+	ns peer wg-quick down "$WORK/mobile.conf"
+}
+
+# All arguments in the fixture use paths without spaces. Execute exactly
+# the arguments from the printed command with the isolated binary as root.
+printed_command() {
+	local label=$1
+	shift
+	local -a cmd
+	read -ra cmd <<<"$(sed -n "s/^$label //p" "$WORK/init.log")"
+	[[ ${cmd[0]} = sudo && ${cmd[1]} = natwg ]]
+	isolated host "$NATWG" "${cmd[@]:2}" "$@"
+}
+
+service_reload() {
+	extras public
+	fake_manager
+	initialize --install-service --port 52111 --lan "$LAN_NET"
+	local old_pid
+	old_pid=$(cat "$WORK/runtime/pid")
+	initialize --force --port 52112 --lan "$LAN_NET" --peer mobile --format wg-quick --out "$WORK/mobile.conf"
+	[[ $(cat "$WORK/runtime/pid") = "$old_pid" ]]
+	printed_command 'Start the server with' >"$WORK/install.log"
+	grep -Fxq 'restart natwg.service' "$WORK/runtime/systemctl.called"
+	[[ $(cat "$WORK/runtime/pid") != "$old_pid" ]]
+	[[ $(field "$WORK/runtime/status.json" listen_port) = 52112 ]]
+	local started
+	started=$(date +%s)
+	wait_until 20 dns_answers "$PUBLIC_HOST"
+	client_up
+	traffic "$LAN_HOST" "$PUBLIC_HOST:52112" "$started"
 	ns peer wg-quick down "$WORK/mobile.conf"
 }
 
@@ -203,9 +270,13 @@ cli_checks() {
 		>"$WORK/stdout" 2>"$WORK/init.log"; then die "accepted missing token"; fi
 	grep -Fq -- 'missing --token-file' "$WORK/init.log"
 	[[ ! -e $WORK/new ]]
-	initialize --force --no-lan
+	initialize --force --no-lan --port 52123 --upnp off
 	[[ $(sha256sum "$WORK/server.json") != "$before" ]]
 	is_field server.json role.server.lan '[]'
+	grep -qF -- "--server=$STUN_A:3478 --server=$PLAIN_A:3478" "$WORK/init.log"
+	printed_command 'Check the network with' --json >"$WORK/detect.json"
+	is_field detect.json port.tested 52123
+	is_field detect.json verdict supported
 	echo "TTY defaults, hidden token, Ctrl-C, multiple LANs, no-TTY input errors, --force and file permissions passed"
 }
 
@@ -246,20 +317,21 @@ cleanup() {
 	down
 }
 trap cleanup EXIT
-[[ $# -gt 0 ]] || set -- public upnp nat1 public-forward likely native-public native-upnp service cli blocked lan-stun occupied
+[[ $# -gt 0 ]] || set -- public upnp nat1 public-forward likely stale-first native-public native-default native-upnp service reload cli blocked lan-stun occupied
 for scenario in "$@"; do
 	WORK=$base/$scenario
-	mkdir -p "$WORK/runtime" "$WORK/platform-wg"
+	mkdir -p "$WORK/runtime" "$WORK/platform-wg" "$WORK/units" "$WORK/local"
 	ln -s "$WORK/runtime/client.status.json" "$WORK/client.status.json"
 	printf '%s\n' "$TOKEN" >"$WORK/token"
 	printf '#!/bin/sh\necho called >>"%s/systemctl.called"\nexit 1\n' "$WORK" >"$WORK/systemctl"
 	chmod 700 "$WORK/systemctl"
 	SCENARIO=${scenario#native-}
-	case $scenario in occupied | cli) SCENARIO=public ;; service) SCENARIO=nat1 ;; esac
+	case $scenario in occupied | cli | native-default | reload) SCENARIO=public ;; service | stale-first) SCENARIO=nat1 ;; esac
 	up "$SCENARIO"
 	case $scenario in
 	native-*) native_init ;;
 	service) service_init ;;
+	reload) service_reload ;;
 	cli) cli_checks ;;
 	blocked | lan-stun | occupied) negative ;;
 	*) daemon_init ;;

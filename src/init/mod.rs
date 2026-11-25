@@ -48,7 +48,7 @@ pub(super) struct Args {
     /// Server tunnel address with prefix (default: 10.66.66.1/24).
     #[arg(long)]
     subnet: Option<Ipv4Network>,
-    /// LAN to route, repeatable (default: the tested uplink's subnet).
+    /// LAN to route, repeatable (default: the uplink subnet if it excludes the public endpoint).
     #[arg(long)]
     lan: Vec<Ipv4Network>,
     /// Host the tunnel alone, without a LAN route.
@@ -183,10 +183,16 @@ impl Args {
                 .find(|(name, net)| *name == found.uplink.iface && net.ip() == found.uplink.address)
                 .ok_or_else(|| invalid("uplink address changed; run init again"))?
                 .1;
-            let answer = prompt.ask(
-                "LANs (space-separated CIDRs, or none)",
-                &format!("{}/{}", default.network(), default.prefix()),
-            )?;
+            let public = found.mapping.endpoint.map(|endpoint| *endpoint.ip());
+            let default = if public.is_some_and(|ip| default.contains(ip)) {
+                warn!(
+                    "The uplink subnet contains the public WireGuard endpoint. Use --lan for a separate LAN; the default routes only the tunnel."
+                );
+                "none".to_owned()
+            } else {
+                format!("{}/{}", default.network(), default.prefix())
+            };
+            let answer = prompt.ask("LANs (space-separated CIDRs, or none)", &default)?;
             if answer != "none" {
                 lans = words(&answer)
                     .map(str::parse)
@@ -366,6 +372,16 @@ impl Args {
             ));
         }
         let lan = self.lans(found, prompt)?;
+        if let Some(endpoint) = found.mapping.endpoint
+            && let Some(net) = std::iter::once(&address)
+                .chain(&lan)
+                .find(|net| net.contains(*endpoint.ip()))
+        {
+            return Err(invalid(format!(
+                "route {net} contains the public WireGuard endpoint {}; choose --subnet and --lan networks that leave the endpoint reachable through the uplink",
+                endpoint.ip()
+            )));
+        }
         let cloudflare = self.cloudflare(prompt)?;
         let upnp = gateway(found).map(|url| UpnpConfig {
             control_url: url.to_owned(),
@@ -538,13 +554,26 @@ pub(super) fn run(mut args: Args, path: &Path) -> Result<()> {
         );
     } else if !install {
         warn!(
-            "Start the server with sudo natwg --config {} service install",
-            shell_path(path)
+            "Start the server with sudo natwg --config {} service install{}",
+            shell_path(path),
+            if args.force { " --reload-config" } else { "" }
         );
     }
-    warn!(
-        "Check with natwg detect --config {} and sudo natwg doctor loopback --config {}{}",
+    let mut detect = format!(
+        "sudo natwg detect --config {} --dns {}",
         shell_path(path),
+        request.dns
+    );
+    if matches!(request.upnp, UpnpMode::Off) {
+        detect.push_str(" --upnp off");
+    }
+    for (host, port) in &request.servers {
+        use std::fmt::Write;
+        write!(detect, " --server={host}:{port}").unwrap();
+    }
+    warn!("Check the network with {detect}");
+    warn!(
+        "Check the tunnel with sudo natwg doctor loopback --config {}{}",
         shell_path(path),
         if mode == Mode::Wireguard {
             format!(" --endpoint {}", found.mapping.endpoint.unwrap())
@@ -558,7 +587,7 @@ pub(super) fn run(mut args: Args, path: &Path) -> Result<()> {
             warn!("{report}");
         }
         if let Some(peer) = &enrollment {
-            rt.block_on(peer.deliver(config.server()?, install))?;
+            rt.block_on(peer.deliver(config.server()?, install, found.mapping.endpoint))?;
         }
         Ok(())
     };
@@ -573,13 +602,34 @@ struct Enrollment {
 }
 
 impl Enrollment {
-    async fn deliver(&self, server: &ServerConfig, install: bool) -> Result<()> {
+    async fn deliver(
+        &self,
+        server: &ServerConfig,
+        install: bool,
+        detected: Option<SocketAddrV4>,
+    ) -> Result<()> {
         // Service installation waits for the tunnel. The first TXT record
         // may still be propagating when a native profile needs a snapshot.
-        let wait = install && server.publish == PublishMode::Txt && self.format != Format::Natwg;
-        if !wait {
+        if server.publish != PublishMode::Txt || self.format == Format::Natwg {
             let profile =
                 export::render(&self.client, self.format, &self.name, Some(server)).await?;
+            return self.output.write(&profile);
+        }
+        if !install {
+            let endpoint = detected.ok_or_else(|| {
+                Error::new(
+                    "INIT_DNS_PENDING",
+                    "no mapping was confirmed on the configured port",
+                )
+            })?;
+            let profile = export::render_confirmed(
+                &self.client,
+                self.format,
+                &self.name,
+                Some(server),
+                Some(endpoint),
+            )
+            .await?;
             return self.output.write(&profile);
         }
         let status = natwg::status::path(server);
