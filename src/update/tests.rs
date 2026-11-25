@@ -337,13 +337,29 @@ fn artifacts(version: &str, digest: &str) -> Manifest {
 }
 
 #[test]
-fn a_manifest_names_four_archives_of_its_version() {
+fn a_later_manifest_with_new_fields_and_targets_still_reads() {
+    let platform = target().unwrap();
+    let text = serde_json::json!({
+        "schema": 1,
+        "version": "1.2.3",
+        "signature": "a field a later release adds",
+        "artifacts": [
+            { "target": "riscv64gc-unknown-linux-musl", "asset": "natwg-1.2.3-riscv64gc-unknown-linux-musl.tar.gz", "sha256": "b".repeat(64) },
+            { "target": platform, "asset": format!("natwg-1.2.3-{platform}.tar.gz"), "sha256": "a".repeat(64), "size": 1 },
+        ],
+    });
+    let manifest: Manifest = serde_json::from_value(text).unwrap();
+    assert_eq!(artifact(&manifest, "1.2.3").unwrap().target, platform);
+}
+
+#[test]
+fn a_manifest_names_the_archive_of_this_platform_for_its_version() {
     let digest = "a".repeat(64);
     let manifest = artifacts("1.2.3", &digest);
     let found = artifact(&manifest, "1.2.3").unwrap();
     assert_eq!(found.target, target().unwrap());
-    // Another version, schema or count, a renamed asset or a malformed
-    // checksum is refused.
+    // Another version or schema, a missing archive for this platform, a
+    // renamed asset or a malformed checksum is refused.
     assert_eq!(
         artifact(&manifest, "1.2.4").unwrap_err().code,
         "UPDATE_INVALID"
@@ -354,11 +370,11 @@ fn a_manifest_names_four_archives_of_its_version() {
         artifact(&other, "1.2.3").unwrap_err().code,
         "UPDATE_INVALID"
     );
-    let mut short = artifacts("1.2.3", &digest);
-    short.artifacts.pop();
+    let mut missing = artifacts("1.2.3", &digest);
+    missing.artifacts.retain(|a| a.target != found.target);
     assert_eq!(
-        artifact(&short, "1.2.3").unwrap_err().code,
-        "UPDATE_INVALID"
+        artifact(&missing, "1.2.3").unwrap_err().code,
+        "UPDATE_PLATFORM"
     );
     for (asset, sha256) in [
         ("natwg-1.2.3-other.tar.gz".to_owned(), digest.clone()),
@@ -692,6 +708,8 @@ fn a_service_that_does_not_come_back_rolls_the_update_back() {
     let layout = layout(dir.path());
     file(&layout.service, b"old service", 0o755);
     file(&layout.executable, b"old cli", 0o755);
+    // An earlier update left the service binary a backup; the CLI has none.
+    file(&backup_path(&layout.service), b"older service", 0o755);
     let jobs = [
         "natwg.service",
         "natwg-office.service",
@@ -718,6 +736,12 @@ fn a_service_that_does_not_come_back_rolls_the_update_back() {
     );
     assert_eq!(fs::read(&layout.service).unwrap(), b"old service");
     assert_eq!(fs::read(&layout.executable).unwrap(), b"old cli");
+    // The backups are as they were before the update.
+    assert_eq!(
+        fs::read(backup_path(&layout.service)).unwrap(),
+        b"older service"
+    );
+    assert!(!backup_path(&layout.executable).exists());
     // The services restarted so far, and the one that failed, run the
     // previous binary again; the client never stopped.
     let restarts: Vec<(String, Vec<u8>)> = services.restarts.into_inner();

@@ -76,7 +76,8 @@ def _hmac(key, text):
 def sign(method, url, headers, payload_sha256, access_key, secret_key, now,
          region='auto', service='s3'):
     """The headers of a SigV4 request: `headers` plus host, x-amz-date,
-    x-amz-content-sha256 and Authorization, every one of them signed."""
+    x-amz-content-sha256 and Authorization, every one of them signed. The
+    path of `url` is URI-encoded already, and S3 signs it as it is sent."""
     parts = urllib.parse.urlsplit(url)
     amz_date = now.strftime('%Y%m%dT%H%M%SZ')
     day = amz_date[:8]
@@ -89,7 +90,7 @@ def sign(method, url, headers, payload_sha256, access_key, secret_key, now,
         for k, v in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)))
     canonical = '\n'.join([
         method,
-        urllib.parse.quote(parts.path or '/', safe='/-_.~'),
+        parts.path or '/',
         query,
         ''.join(f'{name}:{signed[name]}\n' for name in names),
         ';'.join(names),

@@ -93,8 +93,9 @@ class SignatureTests(unittest.TestCase):
             'Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41')
 
     def test_the_put_object_example(self):
+        # The path arrives encoded, as put() sends it, and is signed once.
         body = b'Welcome to Amazon S3.'
-        headers = site.sign('PUT', 'https://examplebucket.s3.amazonaws.com/test$file.text',
+        headers = site.sign('PUT', 'https://examplebucket.s3.amazonaws.com/test%24file.text',
                             {'Date': 'Fri, 24 May 2013 00:00:00 GMT',
                              'x-amz-storage-class': 'REDUCED_REDUNDANCY'},
                             hashlib.sha256(body).hexdigest(), *EXAMPLE_KEYS, EXAMPLE_DATE,

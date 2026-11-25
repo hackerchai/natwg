@@ -83,8 +83,10 @@ struct Release {
     assets: Vec<Asset>,
 }
 
+// Unknown fields and other targets are ignored, so a later release can add
+// them without stranding the natwg installed today. `schema` marks a
+// deliberate break.
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
 struct Manifest {
     schema: u8,
     version: String,
@@ -92,7 +94,6 @@ struct Manifest {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
 struct Artifact {
     target: String,
     asset: String,
@@ -293,7 +294,7 @@ impl GitHub {
             Error::new(
                 "UPDATE_AUTH",
                 format!(
-                    "the GitHub Releases of {repository} need a GitHub token, because the repository is private: set GH_TOKEN (sudo GH_TOKEN=\"$(gh auth token)\" natwg update) or log in with gh auth login"
+                    "the GitHub Releases of {repository} need a GitHub token, because the repository is private: log in with gh auth login, or export GH_TOKEN and run sudo --preserve-env=GH_TOKEN natwg update"
                 ),
             )
         })?;
@@ -373,6 +374,8 @@ impl GitHub {
 }
 
 /// GH_TOKEN or GITHUB_TOKEN, else what `gh auth token` prints within 5 s.
+/// Root never runs `gh` itself: under sudo, `gh` runs as the user who ran
+/// sudo, with that user's home, and a root daemon asks no one.
 async fn token() -> Option<String> {
     let set = ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|name| {
         let value = std::env::var(name).ok()?;
@@ -382,20 +385,53 @@ async fn token() -> Option<String> {
     if set.is_some() {
         return set;
     }
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::process::Command::new("gh")
-            .args(["auth", "token", "--hostname", "github.com"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut gh = tokio::process::Command::new("gh");
+    gh.args(["auth", "token", "--hostname", "github.com"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if unsafe { libc::geteuid() } == 0 {
+        let (uid, gid, home) = sudo_user()?;
+        gh.uid(uid).gid(gid).env("HOME", home);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(5), gh.output())
+        .await
+        .ok()?
+        .ok()?;
     let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
     (output.status.success() && !token.is_empty()).then_some(token)
+}
+
+/// The user and group that ran sudo, other than root, and the home
+/// directory of that user.
+fn sudo_user() -> Option<(u32, u32, PathBuf)> {
+    use std::os::unix::ffi::OsStrExt;
+    let id = |name| std::env::var(name).ok()?.parse::<u32>().ok();
+    let (uid, gid) = (id("SUDO_UID")?, id("SUDO_GID")?);
+    if uid == 0 {
+        return None;
+    }
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    Some((
+        uid,
+        gid,
+        PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
+    ))
 }
 
 /// A stable version, as the manifest or a release tag names it.
@@ -408,10 +444,7 @@ fn stable(version: &str) -> Result<semver::Version> {
 
 /// The artifact of this platform in the manifest of `version`.
 fn artifact<'a>(manifest: &'a Manifest, version: &str) -> Result<&'a Artifact> {
-    if manifest.schema != 1
-        || manifest.version != version
-        || manifest.artifacts.len() != TARGETS.len()
-    {
+    if manifest.schema != 1 || manifest.version != version {
         return Err(invalid());
     }
     let platform = target()?;
@@ -608,6 +641,9 @@ pub fn spawn_checks(config: Option<&UpdateConfig>) {
     remember(&cache);
     tokio::spawn(async move {
         tokio::time::sleep(FIRST_CHECK).await;
+        // The code of the last failure logged, so a failing check is logged
+        // once and not every hour.
+        let mut reported = None;
         loop {
             let checked = tokio::time::timeout(
                 CHECK_TIMEOUT,
@@ -615,10 +651,28 @@ pub fn spawn_checks(config: Option<&UpdateConfig>) {
             )
             .await;
             remember(&cache);
-            if let Ok(Ok(true)) = checked
-                && let Some(notice) = latest().and_then(|latest| notice(None, &latest))
-            {
-                tracing::info!("{notice}");
+            match checked {
+                Ok(Ok(ran)) => {
+                    reported = None;
+                    if ran && let Some(notice) = latest().and_then(|l| notice(None, &l)) {
+                        tracing::info!("{notice}");
+                    }
+                }
+                Ok(Err(error)) => {
+                    if reported != Some(error.code) {
+                        tracing::warn!("the update check failed: {error}");
+                    }
+                    reported = Some(error.code);
+                }
+                Err(_) => {
+                    if reported != Some("UPDATE_TIMEOUT") {
+                        tracing::warn!(
+                            "the update check took longer than {} s",
+                            CHECK_TIMEOUT.as_secs()
+                        );
+                    }
+                    reported = Some("UPDATE_TIMEOUT");
+                }
             }
             tokio::time::sleep(CHECK_EVERY).await;
         }
@@ -1019,13 +1073,15 @@ pub fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.previous"))
 }
 
-/// A file before the update: its bytes, owner and mode.
+/// A file before the update: its bytes, owner and mode, and the backup an
+/// earlier update left beside it, if any.
 struct Original {
     path: PathBuf,
     bytes: Vec<u8>,
     uid: u32,
     gid: u32,
     mode: u32,
+    previous: Option<Vec<u8>>,
 }
 
 impl Original {
@@ -1037,12 +1093,18 @@ impl Original {
                 format!("{} is not a regular file", path.display()),
             ));
         }
+        let backup = backup_path(path);
+        let previous = match fs::symlink_metadata(&backup) {
+            Ok(meta) if meta.is_file() => Some(fs::read(&backup).map_err(|e| storage(&backup, e))?),
+            _ => None,
+        };
         Ok(Self {
             path: path.to_owned(),
             bytes: fs::read(path).map_err(|e| storage(path, e))?,
             uid: meta.uid(),
             gid: meta.gid(),
             mode: meta.mode() & 0o777,
+            previous,
         })
     }
 
@@ -1087,8 +1149,18 @@ impl Original {
         self.write(&backup_path(&self.path), &self.bytes)
     }
 
+    /// Put the file back, and the backup beside it as it was, so a rolled
+    /// back update keeps the older backup too.
     fn restore(&self) -> Result<()> {
-        self.write(&self.path, &self.bytes)
+        self.write(&self.path, &self.bytes)?;
+        let backup = backup_path(&self.path);
+        match &self.previous {
+            Some(previous) => self.write(&backup, previous),
+            None => match fs::remove_file(&backup) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(storage(&backup, e)),
+                _ => Ok(()),
+            },
+        }
     }
 }
 

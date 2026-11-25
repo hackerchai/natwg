@@ -252,13 +252,20 @@ upgraded with that package manager instead. Two updates never run at once.
 
 The GitHub repository is private, so the fallback needs a token with
 Contents: read: natwg takes `GH_TOKEN` or `GITHUB_TOKEN`, else asks
-`gh auth token`. sudo drops the environment, so pass it on:
-`sudo GH_TOKEN="$(gh auth token)" natwg update`.
+`gh auth token`, run under sudo as the user who ran sudo. sudo drops the
+environment, so to pass a token on, export it and name it, which keeps it off
+the command line:
+
+```sh
+export GH_TOKEN=...            # or: export GH_TOKEN="$(gh auth token)"
+sudo --preserve-env=GH_TOKEN natwg update
+```
 
 `--download-url ORIGIN` (or `NATWG_UPDATE_URL`) picks another download site
 with the same layout, an exact `https://` origin. `--repository OWNER/REPO`
-(or `NATWG_UPDATE_REPOSITORY`) uses the GitHub Releases of that repository
-alone. The `update` object of the config sets them as well; see below.
+(or `NATWG_UPDATE_REPOSITORY`) skips the download site and uses the GitHub
+Releases of that repository alone. The `update` object of the config sets
+them as well; see below.
 
 ### Automatic update check
 
@@ -281,15 +288,17 @@ check off, and the sources:
 ```json
 "update": {
   "check": "6h",
-  "url": "https://natwg-dl.hackerchai.com",
-  "repository": "hackerchai/natwg"
+  "url": "https://natwg-dl.hackerchai.com"
 }
 ```
 
 - `check` is `off`, or an interval of at least an hour such as `6h` or `2d`
   (default `1d`). `NATWG_UPDATE_CHECK` overrides it.
 - `url` and `repository` work as `--download-url` and `--repository` do, for
-  the check and for `natwg update`.
+  the check and for `natwg update`. A `repository` skips the download site,
+  and a root service has no GitHub token, so leave it out unless the service
+  can reach that repository.
+- A check that fails is logged once, until one succeeds again.
 
 Restart the service to load a change: `sudo natwg service restart`.
 
