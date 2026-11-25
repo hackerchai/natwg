@@ -8,7 +8,15 @@ repository = "https://github.com/hackerchai/natwg"
 readme = "README.md"
 keywords = ["wireguard", "nat", "cgnat", "stun", "vpn"]
 categories = ["command-line-utilities", "network-programming"]
-include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md"]
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/README.zh-CN.md",
+    "/docs/*.md",
+]
 description = "Reach a home LAN over WireGuard from behind carrier-grade NAT"
 
 [dependencies]

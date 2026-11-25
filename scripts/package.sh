@@ -14,11 +14,11 @@ package_name="natwg-$package_version-$package_target"
 package_dir="$repo_dir/target/packages/$package_name"
 build_dir=${CARGO_TARGET_DIR:-"$repo_dir/target"}
 rm -rf "$package_dir"
-mkdir -p "$package_dir/bin"
+mkdir -p "$package_dir/bin" "$package_dir/docs"
 # Hash the build inputs before building and check them afterwards, so an edit
 # during the build cannot produce an archive that describes other sources.
 {
-  printf '%s\n' Cargo.toml Cargo.lock LICENSE README.md
+  printf '%s\n' Cargo.toml Cargo.lock LICENSE README.md README.zh-CN.md docs/*.md
   find src tests scripts .github -type f ! -name '*.pyc' ! -path '*/__pycache__/*'
 } | LC_ALL=C sort | while IFS= read -r package_input; do
   shasum -a 256 "$package_input"
@@ -40,9 +40,9 @@ cp "$build_dir/$package_target/release/natwg" "$package_dir/bin/natwg"
 chmod 755 "$package_dir/bin/natwg"
 cp scripts/install.sh "$package_dir/install.sh"
 chmod 755 "$package_dir/install.sh"
-cp README.md "$package_dir/README.md"
-cp LICENSE "$package_dir/LICENSE"
+cp README.md README.zh-CN.md LICENSE "$package_dir/"
+cp docs/*.md "$package_dir/docs/"
 printf '%s\n' "$package_target" > "$package_dir/TARGET"
-(cd "$package_dir" && shasum -a 256 bin/natwg install.sh README.md LICENSE TARGET SOURCE-MANIFEST.sha256 BUILD-INFO.txt > SHA256SUMS)
+(cd "$package_dir" && shasum -a 256 bin/natwg install.sh README.md README.zh-CN.md docs/*.md LICENSE TARGET SOURCE-MANIFEST.sha256 BUILD-INFO.txt > SHA256SUMS)
 (cd "$repo_dir/target/packages" && tar -czf "$package_name.tar.gz" "$package_name" && shasum -a 256 "$package_name.tar.gz" > "$package_name.tar.gz.sha256")
 printf '%s\n' "$repo_dir/target/packages/$package_name.tar.gz"

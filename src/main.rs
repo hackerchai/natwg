@@ -192,7 +192,7 @@ enum Action {
     /// the latest release even when this natwg is up to date. Nothing is
     /// downgraded.
     ///
-    /// The GitHub repository is private, so its releases need GH_TOKEN or
+    /// The GitHub Releases fallback needs GH_TOKEN or
     /// `gh auth login`. The `update` object of --config, when natwg can
     /// read it, sets `url` and `repository`.
     Update {

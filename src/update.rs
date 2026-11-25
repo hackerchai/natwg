@@ -32,7 +32,6 @@ const RELEASES_LIMIT: usize = 4 * 1024 * 1024;
 /// The update manifest: the version of a release and its archives.
 pub const MANIFEST: &str = "natwg-update.json";
 /// The repository whose GitHub Releases carry the archives and the manifest.
-/// It is private, so natwg sends a GitHub token to it.
 pub const REPOSITORY: &str = "hackerchai/natwg";
 /// The release download site (Cloudflare R2), tried before GitHub Releases.
 pub const SITE: &str = "https://natwg-dl.hackerchai.com";
@@ -281,7 +280,7 @@ impl Site {
     }
 }
 
-/// The GitHub API of a private repository, with a token.
+/// Authenticated GitHub API access for release metadata and assets.
 struct GitHub {
     client: reqwest::Client,
     token: String,
@@ -294,7 +293,7 @@ impl GitHub {
             Error::new(
                 "UPDATE_AUTH",
                 format!(
-                    "the GitHub Releases of {repository} need a GitHub token, because the repository is private: log in with gh auth login, or export GH_TOKEN and run sudo --preserve-env=GH_TOKEN natwg update"
+                    "the GitHub Releases of {repository} need a GitHub token for the updater: log in with gh auth login, or export GH_TOKEN and run sudo --preserve-env=GH_TOKEN natwg update"
                 ),
             )
         })?;
