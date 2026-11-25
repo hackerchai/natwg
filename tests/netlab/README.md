@@ -183,3 +183,36 @@ cases check unsupported and inconclusive verdicts, a busy port, missing
 inputs, file collisions and first-peer key recovery after a missing or stale TXT
 answer. The CLI test runs the printed detect command with a nondefault port
 and the same private STUN servers.
+
+### Client recovery and idle work
+
+Run these commands as root in the disposable Linux VM, with wireguard-tools,
+iproute2, nftables, curl, ping, tcpdump and util-linux installed. Supply an absolute
+path to the Linux binary. Repeat with the baseline binary for a matched pair.
+
+```sh
+python3 tests/netlab/client_recovery.py "$BINARY" 25 --active
+python3 tests/netlab/client_recovery.py "$BINARY" 0 --active
+python3 tests/netlab/client_recovery.py "$BINARY" 25
+python3 tests/netlab/client_recovery.py "$BINARY" 0
+python3 tests/netlab/client_recovery.py "$BINARY" 25 --pause
+python3 tests/netlab/client_recovery.py "$BINARY" 25 --routes
+```
+
+Each run creates private client and server namespaces, a kernel WireGuard
+server, synthetic keys and authoritative TXT DNS. After the first encrypted
+echo, the active scenario sends traffic every second and moves the endpoint at
+7 seconds. Repeat with `--active --move-after 47` to move late in the old
+60-second polling cycle. The idle scenario leaves the tunnel alone for 187 seconds, moves
+the endpoint, then sends traffic 5 seconds later. Recreating the server
+discards its sessions. Recovery requires both a fresh handshake there and an
+echo through the client TUN. The server drops cleartext tunnel pings arriving
+on its physical link. JSON reports elapsed times and counts status file
+replacements, actual route-discovery commands and TXT queries in the quiet
+window from 15 to 187 seconds. A passive capture from 100 to 187 seconds
+counts client WireGuard initiations and empty transport packets. These counts measure client work. Battery and
+cellular radio energy require measurements on the tethered hardware.
+
+`--pause` also checks that a one-minute idle policy disables keepalives and
+restores them after traffic. `--routes` checks a fixed endpoint, duplicate
+route events, switching the default interface and changing its IPv4 address.

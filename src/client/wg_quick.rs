@@ -42,6 +42,7 @@ pub fn import(path: &Path, record: Option<String>, resolvers: Vec<Ipv4Addr>) -> 
             server: None,
             resolvers,
             iface: None,
+            idle_pause_minutes: None,
             status_file: None,
         }),
         update: None,

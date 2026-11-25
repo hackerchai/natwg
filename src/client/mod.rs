@@ -4,6 +4,8 @@
 //! tunnel that dies or loses its uplink is torn down and built again.
 
 pub mod resolve;
+mod routes;
+mod schedule;
 pub mod uplink;
 pub mod wg_quick;
 
@@ -11,24 +13,26 @@ use crate::Result;
 use crate::config::{ClientConfig, Config};
 use crate::netcfg;
 use crate::server::peer_status;
-use crate::status::{self, ClientRole, ClientStatus};
+use crate::status::{self, ClientRole, ClientStatus, PeerStatus};
 use crate::tunnel::{self, PeerStats};
-use crate::wire::transport::BoundInterface;
+use crate::wire::transport::{BoundInterface, Initiation};
 use ipnetwork::Ipv4Network;
 use resolve::Lookup;
+use schedule::{Handshake, Keepalive, Lookups};
 use std::{
+    borrow::Cow,
     future::Future,
     net::SocketAddrV4,
     path::PathBuf,
     pin::{Pin, pin},
     time::{Duration, SystemTime},
 };
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::sync::watch;
+use tokio::time::Instant;
 use uplink::Uplink;
 
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-const HANDSHAKE_CHECK: Duration = Duration::from_secs(1);
 // A wall clock that ran this much further than the monotonic clock between
 // two looks at the uplink means the host slept, and the monotonic clock,
 // which WireGuard's timers run on, stood still meanwhile.
@@ -45,6 +49,22 @@ pub trait Device {
 
     /// What the device knows about the server.
     fn server(&self) -> impl Future<Output = Option<PeerStats>>;
+
+    /// Locally attempted handshakes for failure-driven TXT discovery.
+    fn initiations(&self) -> Option<watch::Receiver<Option<Initiation>>> {
+        None
+    }
+    /// Whether an inner IP packet crossed the TUN since the last sample.
+    fn take_traffic(&self) -> bool {
+        false
+    }
+    /// Apply the effective keepalive without interrupting the session.
+    fn set_keepalive(&self, _seconds: u16) -> impl Future<Output = Result<()>> {
+        std::future::ready(Err(crate::Error::new(
+            "TUNNEL_FAILED",
+            "the device cannot change keepalive at runtime",
+        )))
+    }
 
     /// Send the server's traffic to `endpoint` with a fresh handshake.
     fn point(&self, endpoint: SocketAddrV4) -> impl Future<Output = Result<()>>;
@@ -68,6 +88,18 @@ impl Device for tunnel::Client {
         tunnel::Client::server(self).await
     }
 
+    fn initiations(&self) -> Option<watch::Receiver<Option<Initiation>>> {
+        self.initiations()
+    }
+
+    fn take_traffic(&self) -> bool {
+        self.take_traffic()
+    }
+
+    async fn set_keepalive(&self, seconds: u16) -> Result<()> {
+        self.set_keepalive(seconds).await
+    }
+
     async fn point(&self, endpoint: SocketAddrV4) -> Result<()> {
         tunnel::Client::point(self, endpoint).await
     }
@@ -88,12 +120,14 @@ pub struct Options {
     pub dns_port: u16,
     /// How long one DNS server may take to answer.
     pub dns_timeout: Duration,
-    /// How often the record is looked up once there is an endpoint.
+    /// Healthy TXT refresh.
+    pub txt_every: Duration,
+    /// Hostname (A) refresh.
     pub lookup_every: Duration,
     /// How soon the record is looked up again while there is no endpoint.
-    /// The pause doubles up to `lookup_every`.
+    /// The pause doubles up to 60 seconds.
     pub retry_every: Duration,
-    /// How often the uplink is looked up.
+    /// Fallback when the kernel sends no uplink event.
     pub watch_every: Duration,
     pub status_every: Duration,
 }
@@ -103,10 +137,11 @@ impl Default for Options {
         Self {
             dns_port: 53,
             dns_timeout: Duration::from_secs(2),
+            txt_every: Duration::from_secs(600),
             lookup_every: Duration::from_secs(60),
             retry_every: Duration::from_secs(5),
-            watch_every: Duration::from_secs(5),
-            status_every: Duration::from_secs(10),
+            watch_every: Duration::from_secs(60),
+            status_every: Duration::from_secs(30),
         }
     }
 }
@@ -131,8 +166,13 @@ pub async fn run<D: Device>(
         client,
         options,
         find_uplink,
-        resolvers: resolve::resolvers(client, options.dns_port),
-        keepalive: tunnel::client_keepalive(server),
+        keepalive: Keepalive::new(
+            tunnel::client_keepalive(server),
+            client
+                .idle_pause_minutes
+                .map(|n| Duration::from_secs(u64::from(n.get()) * 60)),
+        ),
+        last_status: None,
         endpoint: server.endpoint.map(|addr| Endpoint {
             addr,
             since: SystemTime::now(),
@@ -155,8 +195,8 @@ struct Supervisor<'a, F> {
     client: &'a ClientConfig,
     options: &'a Options,
     find_uplink: F,
-    resolvers: Vec<SocketAddrV4>,
-    keepalive: u16,
+    keepalive: Keepalive,
+    last_status: Option<(Instant, ClientStatus)>,
     endpoint: Option<Endpoint>,
     looked_up: Option<SystemTime>,
     lookup_error: Option<String>,
@@ -196,6 +236,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         stop: impl Future<Output = ()>,
     ) -> Result<()> {
         let mut stop = pin!(stop);
+        let mut routes = routes::Monitor::new(self.options.watch_every);
         let mut uplink = self.uplink()?;
         let mut building = Instant::now();
         let mut device = tokio::select! {
@@ -206,7 +247,13 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         loop {
             let started = Instant::now();
             let exit = self
-                .serve(&mut device, &mut uplink, building, stop.as_mut())
+                .serve(
+                    &mut device,
+                    &mut uplink,
+                    &mut routes,
+                    building,
+                    stop.as_mut(),
+                )
                 .await;
             device.stop().await;
             let Exit::Died(reason) = exit else {
@@ -218,16 +265,24 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                 backoff = FIRST_BACKOFF;
             }
             (device, uplink) = loop {
-                self.write_status(None, None, None);
+                self.write_status(None, None, None, false);
                 let seen = self.uplink().ok();
                 tracing::info!(
                     "rebuilding the tunnel in {} s, or once the uplink changes",
                     backoff.as_secs()
                 );
-                tokio::select! {
-                    () = tokio::time::sleep(backoff) => {}
-                    () = self.uplink_changes(seen.as_ref()) => {}
-                    () = stop.as_mut() => return Ok(()),
+                let rebuild_at = Instant::now() + backoff;
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(rebuild_at) => break,
+                        () = routes.changed() => {
+                            if self.uplink().ok() != seen { break; }
+                        }
+                        () = tokio::time::sleep_until(self.status_deadline()) => {
+                            self.write_status(None, None, None, false);
+                        }
+                        () = stop.as_mut() => return Ok(()),
+                    }
                 }
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 let uplink = match self.uplink() {
@@ -237,9 +292,15 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                         continue;
                     }
                 };
+                // A rebuild while paused must start with keepalives disabled.
+                let mut config = Cow::Borrowed(self.config);
+                self.keepalive.update(Instant::now(), false);
+                if self.keepalive.effective != self.keepalive.configured {
+                    config.to_mut().peers[0].keepalive = Some(self.keepalive.effective);
+                }
                 building = Instant::now();
                 let built = tokio::select! {
-                    built = build(self.config, &uplink, self.endpoint()) => built,
+                    built = build(&config, &uplink, self.endpoint()) => built,
                     () = stop.as_mut() => return Ok(()),
                 };
                 match built {
@@ -251,66 +312,60 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         }
     }
 
-    /// Resolve once the uplink differs from `seen`.
-    async fn uplink_changes(&self, seen: Option<&Uplink>) {
-        loop {
-            tokio::time::sleep(self.options.watch_every).await;
-            if self.uplink().ok().as_ref() != seen {
-                return;
-            }
-        }
-    }
-
-    /// Run one tunnel, whose build began at `building`, until it dies, its
-    /// uplink changes, or `stop` resolves. A new address on the same uplink,
-    /// or a wake from sleep, only binds the socket again.
+    /// Run one device, using kernel events as hints to re-read the physical uplink.
     async fn serve<D: Device>(
         &mut self,
         device: &mut D,
         uplink: &mut Uplink,
+        routes: &mut routes::Monitor,
         building: Instant,
         mut stop: Pin<&mut impl Future<Output = ()>>,
     ) -> Exit {
-        let options = self.options;
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun} via {uplink}");
         let local = self.local_networks();
-        let mut lookup_at = Instant::now();
-        let mut watch =
-            tokio::time::interval_at(Instant::now() + options.watch_every, options.watch_every);
-        let mut status_tick = tokio::time::interval(options.status_every);
-        let mut handshake_tick = tokio::time::interval(HANDSHAKE_CHECK);
-        for tick in [&mut watch, &mut status_tick, &mut handshake_tick] {
-            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        }
+        let lookup = Lookup::of(self.client);
+        let mut dns = Lookups::new(matches!(lookup, Some(Lookup::Txt(_))), self.options);
+        let resolvers = resolve::resolvers(self.client, self.options.dns_port);
+        let mut query = None;
+        let mut initiations = device.initiations();
+        let mut handshake = Handshake::new(building);
+        let mut check_at = Instant::now();
+        let mut server = None;
         let mut clock = Clock::now();
-        // Since when the device waits for a handshake, and whether it was
-        // reported. A handshake can complete before the device's build or
-        // the change of its endpoint returns.
-        let mut pointed_at = building;
-        let mut greeted = false;
-        let mut retry = options.retry_every;
+        let mut slept = None;
         loop {
             tokio::select! {
                 () = device.failed() => {
                     return Exit::Died(format!("the WireGuard device on {tun} stopped, because its TUN or its UDP socket failed"));
                 }
                 () = stop.as_mut() => return Exit::Stopped,
-                () = tokio::time::sleep_until(lookup_at), if Lookup::of(self.client).is_some() => {
-                    let found = tokio::select! {
-                        found = self.lookup(&uplink.iface) => found,
-                        () = stop.as_mut() => return Exit::Stopped,
-                    };
-                    if let Some(endpoint) = found {
-                        (pointed_at, greeted) = (Instant::now(), false);
+                () = tokio::time::sleep_until(dns.at), if lookup.is_some() && query.is_none() => {
+                    let iface = uplink.iface.clone();
+                    let timeout = self.options.dns_timeout;
+                    let resolvers = &resolvers;
+                    query = lookup.map(|lookup| Box::pin(async move {
+                        (lookup, lookup.endpoint(&iface, resolvers, timeout).await)
+                    }));
+                    continue;
+                }
+                (lookup, answer) = async { query.as_mut().unwrap().await }, if query.is_some() => {
+                    query = None;
+                    let had_endpoint = self.endpoint.is_some();
+                    if let Some(endpoint) = self.accept_answer(lookup, answer) {
+                        let now = Instant::now();
+                        if had_endpoint {
+                            handshake.moved(now);
+                        }
+                        dns.recovered(now);
                         if let Err(error) = device.point(endpoint).await {
                             return Exit::Died(error.to_string());
                         }
-                        status_tick.reset_immediately();
+                        server = None;
                     }
-                    lookup_at = Instant::now() + self.next_lookup(&mut retry);
+                    dns.looked_up(Instant::now(), self.endpoint.is_some(), self.lookup_error.is_none());
                 }
-                _ = watch.tick() => {
+                () = routes.changed() => {
                     let now = match self.uplink() {
                         Ok(now) => now,
                         Err(error) => return Exit::Died(format!("lost the uplink {uplink}: {error}")),
@@ -319,79 +374,73 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                         return Exit::Died(format!("the uplink moved from {uplink} to {now}"));
                     }
                     if let (Some(was), Some(now)) = (&local, self.local_networks())
-                        && *was != now
-                    {
+                        && *was != now {
                         return Exit::Died("this host joined or left a network that the server routes; rebuilding the routes".to_owned());
                     }
-                    let why = match clock.slept() {
+                    let why = match slept.take().or_else(|| clock.slept(Clock::now())) {
                         Some(gap) => format!("woke after about {} s asleep", gap.as_secs()),
                         None if now.address != uplink.address => format!("the uplink is now {now}"),
                         None => continue,
                     };
                     tracing::info!("{why}; binding the UDP socket again");
-                    (pointed_at, greeted) = (Instant::now(), false);
+                    handshake.moved(Instant::now());
                     if let Err(error) = device.rebind().await {
                         return Exit::Died(error.to_string());
                     }
                     *uplink = now;
-                    lookup_at = Instant::now();
-                    status_tick.reset_immediately();
+                    query = None;
+                    dns = Lookups::new(matches!(lookup, Some(Lookup::Txt(_))), self.options);
+                    server = None;
                 }
-                _ = handshake_tick.tick(), if !greeted => {
-                    let since = pointed_at.elapsed();
-                    let shook = device.server().await.and_then(|server| server.last_handshake);
-                    if shook.is_some_and(|ago| ago <= since) {
-                        let endpoint = self.endpoint().map_or("no endpoint".to_owned(), |e| e.to_string());
-                        tracing::info!("handshake ok with the server at {endpoint}");
-                        greeted = true;
-                        status_tick.reset_immediately();
+                attempt = next_initiation(&mut initiations) => {
+                    if !attempt.retry {
+                        continue;
                     }
+                    handshake.retried(attempt.at, &mut dns);
                 }
-                _ = status_tick.tick() => {
-                    if let Some(tun) = device.tun()
-                        && BoundInterface::lookup(tun).is_err()
-                    {
+                () = tokio::time::sleep_until(check_at) => {
+                    if let Some(gap) = clock.slept(Clock::now()) {
+                        slept = Some(gap);
+                        routes.refresh();
+                    }
+                    if let Some(tun) = device.tun() && BoundInterface::lookup(tun).is_err() {
                         return Exit::Died(format!("the TUN {tun} is gone"));
                     }
-                    let server = device.server().await;
-                    let ago = server.as_ref().and_then(|server| server.last_handshake);
-                    let stale_after = Duration::from_secs(status::handshake_stale_after(self.keepalive));
-                    let stale = self.keepalive > 0
-                        && ago.unwrap_or(pointed_at.elapsed()) > stale_after;
-                    if stale && greeted {
-                        let endpoint = self.endpoint().map_or("no endpoint".to_owned(), |e| e.to_string());
-                        tracing::warn!("no handshake with the server at {endpoint} for {} s", stale_after.as_secs());
-                        // Only a handshake from now on is news.
-                        (pointed_at, greeted) = (Instant::now(), false);
+                    if let Some(seconds) = self.keepalive.update(Instant::now(), device.take_traffic()) {
+                        if let Err(error) = device.set_keepalive(seconds).await {
+                            return Exit::Died(error.to_string());
+                        }
+                        tracing::info!("persistent keepalive is now {seconds}s");
                     }
-                    self.write_status(device.tun(), Some(uplink), server);
+                    let sample = device.server().await;
+                    let ago = sample.as_ref().and_then(|s| s.last_handshake);
+                    server = sample.map(|s| peer_status(s, SystemTime::now()));
+                    let now = Instant::now();
+                    if let Some(endpoint) = self.endpoint()
+                        && handshake.sample(now, ago, self.keepalive.effective, &mut dns) {
+                        tracing::info!("handshake ok with the server at {endpoint}");
+                    }
+                    check_at = now + handshake.interval();
                 }
+                () = tokio::time::sleep_until(self.status_deadline()) => {}
             }
+            self.write_status(
+                device.tun(),
+                Some(uplink),
+                server.as_ref(),
+                dns.failure.is_some(),
+            );
         }
     }
 
-    /// How long until the next lookup. With an endpoint, the client asks
-    /// every `lookup_every`. Without one, it asks again soon, then less often
-    /// while the record stays missing: the pause `retry` doubles up to
-    /// `lookup_every`.
-    fn next_lookup(&self, retry: &mut Duration) -> Duration {
-        match self.endpoint {
-            Some(_) => self.options.lookup_every,
-            None => {
-                let next = (*retry * 2).min(self.options.lookup_every);
-                std::mem::replace(retry, next)
-            }
-        }
-    }
-
-    /// Ask the resolvers for the TXT record, or the A record of the server's
-    /// name, and return the endpoint it names when that is a new one. A
-    /// failed lookup keeps the endpoint.
-    async fn lookup(&mut self, iface: &BoundInterface) -> Option<SocketAddrV4> {
-        let lookup = Lookup::of(self.client)?;
+    /// Keep the last endpoint on a failed lookup, or return the new one.
+    fn accept_answer(
+        &mut self,
+        lookup: Lookup<'_>,
+        answer: Result<(SocketAddrV4, SocketAddrV4)>,
+    ) -> Option<SocketAddrV4> {
         let (kind, record) = (lookup.mode().record_type(), lookup.name());
-        let timeout = self.options.dns_timeout;
-        match lookup.endpoint(iface, &self.resolvers, timeout).await {
+        match answer {
             Err(error) => {
                 let kept = match self.endpoint() {
                     Some(endpoint) => format!("keeping {endpoint}"),
@@ -420,7 +469,19 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         }
     }
 
-    fn write_status(&self, tun: Option<&str>, uplink: Option<&Uplink>, server: Option<PeerStats>) {
+    fn status_deadline(&self) -> Instant {
+        self.last_status
+            .as_ref()
+            .map_or_else(Instant::now, |(at, _)| *at + self.options.status_every)
+    }
+
+    fn write_status(
+        &mut self,
+        tun: Option<&str>,
+        uplink: Option<&Uplink>,
+        server: Option<&PeerStatus>,
+        retrying: bool,
+    ) {
         let now = SystemTime::now();
         let lookup = Lookup::of(self.client);
         let status = ClientStatus {
@@ -441,14 +502,33 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                 .map(|endpoint| status::unix(endpoint.since)),
             looked_up: self.looked_up.map(status::unix),
             lookup_error: self.lookup_error.clone(),
-            keepalive: self.keepalive,
+            keepalive: self.keepalive.effective,
+            handshake_retrying: retrying,
             rebuilds: self.rebuilds,
-            server: server.map(|server| peer_status(server, now)),
+            server: server.cloned(),
         };
+        let now = Instant::now();
+        if let Some((at, old)) = &self.last_status
+            && now - *at < self.options.status_every
+            && old.same_client_state(&status)
+        {
+            return;
+        }
         if let Err(error) = status.write(&self.status) {
             tracing::warn!("{error}");
         }
+        self.last_status = Some((now, status));
     }
+}
+
+async fn next_initiation(events: &mut Option<watch::Receiver<Option<Initiation>>>) -> Initiation {
+    if let Some(rx) = events
+        && rx.changed().await.is_ok()
+        && let Some(event) = *rx.borrow_and_update()
+    {
+        return event;
+    }
+    std::future::pending().await
 }
 
 /// The wall clock and the monotonic clock at one look.
@@ -467,12 +547,30 @@ impl Clock {
 
     /// How much further the wall clock ran than the monotonic clock since
     /// the last look, when that much means the host slept.
-    fn slept(&mut self) -> Option<Duration> {
-        let now = Self::now();
+    fn slept(&mut self, now: Self) -> Option<Duration> {
         let wall = now.wall.duration_since(self.wall).unwrap_or_default();
         let monotonic = now.monotonic.duration_since(self.monotonic);
         *self = now;
         wall.checked_sub(monotonic)
             .filter(|gap| *gap >= SLEPT_AFTER)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_requires_a_new_wall_clock_gap_and_is_reported_once() {
+        let start = Clock::now();
+        let after = |wall, mono| Clock {
+            wall: start.wall + Duration::from_secs(wall),
+            monotonic: start.monotonic + Duration::from_secs(mono),
+        };
+        let mut clock = after(0, 0);
+        assert_eq!(clock.slept(after(60, 60)), None);
+        assert_eq!(clock.slept(after(95, 65)), Some(Duration::from_secs(30)));
+        assert_eq!(clock.slept(after(105, 75)), None);
+        assert_eq!(clock.slept(after(80, 85)), None);
     }
 }
