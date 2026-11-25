@@ -481,6 +481,7 @@ fn client_fixture(updated: u64) -> ClientStatus {
         looked_up: Some(updated - 20),
         lookup_error: None,
         keepalive: 25,
+        handshake_retrying: false,
         rebuilds: 0,
         server: Some(PeerStatus {
             key: "paDfvm0HLq…".into(),

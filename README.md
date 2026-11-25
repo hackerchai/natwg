@@ -17,8 +17,8 @@ WireGuard peers reach. natwg then:
 - writes a status file, and rebuilds the tunnel when STUN stops answering.
 
 The same binary is the client. `natwg client` keeps a tunnel to the server,
-reads the TXT record (or the A record) every 60 seconds and follows the
-server when its endpoint changes.
+follows the server when its endpoint changes, and refreshes TXT discovery
+when WireGuard retries a handshake.
 
 WireGuard runs inside the process through
 [gotatun](https://crates.io/crates/gotatun), so it needs no wireguard-go or
@@ -535,10 +535,17 @@ The client config has the client role and exactly one peer, the server:
 - `record` is the TXT record the server publishes. The client asks the
   `resolvers` in order and takes the first well-formed `"ip:port"`. It keeps the
   last endpoint when no resolver gives one. `resolvers` defaults to the list
-  above.
+  above. With a known endpoint the client refreshes TXT every 10 minutes.
+  An outgoing WireGuard handshake retry to the same endpoint (typically
+  about 5 seconds after initiation), or an overdue handshake with persistent
+  keepalive enabled, triggers an immediate lookup. While the failure lasts,
+  retries start at 5 seconds and double to a maximum of 60 seconds. Recovery
+  also depends on when the resolver serves the new answer. An unchanged TXT
+  answer leaves a healthy WireGuard roam in place. If the roamed session
+  fails, the client uses that answer to return to the advertised endpoint.
 - `server` (`"home.example.com:51830"`) takes the place of `record` for a
   server in [public mode](#public-mode-an-a-record). The client asks the
-  `resolvers` for the A record of the name, the same way and as often, dials
+  `resolvers` for the A record of the name every 60 seconds, dials
   the first public address at the port, and keeps the last endpoint when no
   resolver gives one. A config has `record` or `server`, not both.
   - The name is a host name of two labels or more from letters, digits and
@@ -555,9 +562,35 @@ The client config has the client role and exactly one peer, the server:
 - The WireGuard and DNS traffic leaves through the physical interface of the
   default route, past a VPN app such as Surge that owns the default route.
   `role.client.iface` pins an interface instead. The client follows a new
-  uplink (Wi-Fi, a hotspot) and a wake from sleep within seconds.
-- `keepalive` defaults to 25 seconds for a client; 0 turns it off.
-- `role.client.status_file` moves the status file.
+  uplink through macOS routing socket or Linux rtnetlink notifications. It
+  also checks the route every 60 seconds and rebinds its UDP socket on wake.
+- `peers[0].keepalive` defaults to 25 seconds, a good choice for a laptop
+  on Wi-Fi that should remain reachable. When tethered to a phone, set it to
+  0 to disable persistent keepalives, or try 120 to send them less often.
+  With keepalive enabled, even a late first TXT answer starts a handshake so
+  the server can send the first application packet. With keepalive off, the
+  laptop may need to send traffic first to establish or refresh its NAT mapping.
+- To pause keepalives automatically, set `role.client.idle_pause_minutes`
+  to a positive whole number. Omit it to keep the configured interval.
+  The client samples inner traffic received from the peer or addressed to
+  its allowed networks, including background application traffic. WireGuard
+  handshakes and empty keepalives travel outside the TUN. After the idle
+  interval it sets the peer's keepalive to 0. On the next sample with traffic
+  it restores the configured value. Normal WireGuard session rekeys and replies
+  can still occur while persistent keepalives are paused.
+- With keepalives off or paused, an old handshake alone is normal. New
+  traffic can use an existing session until WireGuard needs a handshake.
+  The client observes actual initiation retries and sends no test packets.
+  When it sees a pending handshake, the client updates its endpoint in place
+  so WireGuard can deliver queued packets. Traffic sent before the first
+  endpoint is known, or encrypted for the old address, can still require
+  retransmission.
+  The 10-minute TXT refresh still runs while idle.
+- The client checks the handshake every second until the first success on a
+  new device, then every 10 seconds. `role.client.status_file` selects the
+  file. Reachability, endpoint, keepalive and handshake changes update it.
+  A 30-second heartbeat refreshes byte totals. Status remains stale at 60
+  seconds.
 
 ```sh
 sudo natwg client --foreground   # in the terminal
@@ -566,8 +599,10 @@ natwg status                     # endpoint, handshake age, traffic
 ```
 
 `natwg status` exits 1 when the client has no tunnel, no endpoint, a failing
-TXT or A lookup, or no handshake for longer than a session can live, 235
-seconds with the default keepalive.
+TXT or A lookup, or is retrying TXT after a handshake failure. With an active
+keepalive it also reports a missing or overdue handshake (235 seconds with
+the default keepalive). The status file reports the effective keepalive,
+including 0 while paused.
 
 ### Move a wg-quick client to natwg
 

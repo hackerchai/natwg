@@ -321,6 +321,9 @@ pub struct ClientConfig {
     /// physical interface of the default route, followed as it changes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iface: Option<String>,
+    /// Pause persistent keepalives after this many minutes without inner IP traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_pause_minutes: Option<std::num::NonZeroU32>,
     /// Where the client writes its status (default: `status::client_path`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_file: Option<PathBuf>,
