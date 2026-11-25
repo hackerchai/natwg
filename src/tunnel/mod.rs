@@ -1,14 +1,18 @@
 //! The embedded WireGuard device. gotatun runs the protocol on the UDP socket
 //! that STUN shares. Only this module and `wire::transport` use gotatun types.
 
+mod activity;
 mod channel;
 
 use crate::config::{Config, DoctorConfig, PeerConfig, ServerConfig};
 use crate::keys::{Key, PublicKey};
 use crate::nat::{self, Nat, Rule};
 use crate::netcfg;
-use crate::wire::transport::{BoundInterface, BoundUdp, StunPort};
+use crate::wire::transport::{
+    BoundInterface, BoundUdp, HandshakeFlight, Initiation, SocketFlights, StunPort,
+};
 use crate::{Error, Result};
+use activity::{Activity, ClientTun};
 use channel::{ChannelRecv, ChannelSend};
 use gotatun::device::configure::PeerMut;
 use gotatun::device::{Device, DeviceBuilder, DeviceTransports, Peer};
@@ -20,9 +24,9 @@ use ipnetwork::{IpNetwork, Ipv4Network};
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 const PACKET_QUEUE: usize = 64;
 
@@ -75,9 +79,10 @@ impl Tunnel {
         let iface = BoundInterface::lookup(&server.iface)?;
         let tun = open_tun(&tun_config(server.instance.as_str()))?;
         let tun_name = tun.name().map_err(tun_unavailable)?;
-        let (device, stun) = device(
+        let (udp, stun) = BoundUdp::new(iface);
+        let device = device(
             &config.private_key,
-            iface,
+            udp,
             server.listen_port,
             peers,
             tun.clone(),
@@ -148,7 +153,9 @@ impl Tunnel {
 /// and the TUN has a route for each of the server's allowed IPs. Its UDP
 /// socket and port are its own, on the uplink it was started with.
 pub struct Client {
-    device: Device<(BoundUdp, TunDevice, TunDevice)>,
+    device: Device<(BoundUdp, ClientTun, ClientTun)>,
+    traffic: Option<Arc<Activity>>,
+    flights: Option<SocketFlights>,
     tun_name: String,
     server: x25519::PublicKey,
     handshakes: Handshakes,
@@ -171,7 +178,7 @@ impl Client {
         uplink: &BoundInterface,
         endpoint: Option<SocketAddrV4>,
     ) -> Result<Self> {
-        let (_, server) = config.client()?;
+        let (client, server) = config.client()?;
         let mut routes: Vec<Ipv4Network> = server.allowed_ips.iter().copied().map(subnet).collect();
         let local = netcfg::host_local_networks(&routes)?;
         for network in &local {
@@ -188,15 +195,16 @@ impl Client {
         let tun = open_tun(&tun_config(CLIENT_TUN))?;
         let tun_name = tun.name().map_err(tun_unavailable)?;
         let peer = client_peer(server, endpoint);
-        let (device, _) = device(
-            &config.private_key,
-            uplink.clone(),
-            0,
-            vec![peer],
-            tun.clone(),
+        let (mut udp, _) = BoundUdp::new(uplink.clone());
+        let flights = client.record.as_ref().map(|_| udp.observe_handshakes());
+        let traffic = client
+            .idle_pause_minutes
+            .map(|_| Arc::new(Activity::new(&server.allowed_ips)));
+        let tun = ClientTun {
             tun,
-        )
-        .await?;
+            traffic: traffic.clone(),
+        };
+        let device = device(&config.private_key, udp, 0, vec![peer], tun.clone(), tun).await?;
         let plan = netcfg::plan(
             &tun_name,
             config.interface.address,
@@ -211,6 +219,8 @@ impl Client {
             device,
             tun_name,
             server: public(server.public_key),
+            traffic,
+            flights,
             handshakes: Handshakes::default(),
         })
     }
@@ -231,10 +241,79 @@ impl Client {
         peer_stats(&self.device, &self.handshakes).await.pop()
     }
 
-    /// Send the server's traffic to `endpoint` from now on, with a fresh
-    /// handshake.
+    pub fn flights(&self) -> Option<watch::Receiver<HandshakeFlight>> {
+        self.flights.as_ref()?.borrow().clone()
+    }
+
+    pub fn take_traffic(&self) -> bool {
+        self.traffic.as_ref().is_some_and(|traffic| traffic.take())
+    }
+
+    pub async fn set_keepalive(&self, seconds: u16) -> Result<()> {
+        self.device
+            .write(async |device| {
+                device
+                    .modify_peer(&self.server, |peer| peer.set_keepalive(Some(seconds)))
+                    .await
+            })
+            .await
+            .map_err(|e| Error::new("TUNNEL_FAILED", e.to_string()))?
+            .then_some(())
+            .ok_or_else(|| Error::new("TUNNEL_FAILED", "the device lost its peer"))
+    }
+
+    /// Preserve a pending handshake and its queued user packets when a retry
+    /// discovers the move. Otherwise start with a fresh peer on the same socket.
     pub async fn point(&self, endpoint: SocketAddrV4) -> Result<()> {
-        point(&self.device, &self.server, endpoint).await
+        self.apply_endpoint(endpoint, None).await.map(drop)
+    }
+
+    /// Return to the advertised address only while this binding is still
+    /// failing on a different live endpoint. A response can race DNS.
+    pub async fn apply_endpoint(
+        &self,
+        endpoint: SocketAddrV4,
+        failed_since: Option<tokio::time::Instant>,
+    ) -> Result<bool> {
+        let flight = self.flights();
+        self.device
+            .write(async |device| {
+                let stats = device.peers().await.pop()?;
+                let mut peer = stats.peer;
+                let observed = flight.as_ref().map(|rx| *rx.borrow()).unwrap_or_default();
+                if let Some(since) = failed_since
+                    && (peer.endpoint == Some(endpoint.into())
+                        || observed.confirmed.is_some_and(|at| at >= since)
+                        || observed
+                            .pending
+                            .is_some_and(|i| i.at >= since && Some(i.destination) != peer.endpoint))
+                {
+                    return Some(false);
+                }
+                let pending = observed.pending.is_some_and(|i| {
+                    Some(i.destination) == peer.endpoint
+                        && i.at.elapsed() < Initiation::RETRY_WINDOW
+                });
+                let applied = if pending {
+                    // Keep gotatun's queued TUN packets while its handshake
+                    // retries on the new address.
+                    device
+                        .modify_peer(&self.server, |peer| {
+                            peer.set_endpoint(Some(endpoint.into()))
+                        })
+                        .await
+                } else {
+                    // Even a peer which never had an endpoint can be past
+                    // gotatun's 540 s expiry. Start its timers at discovery.
+                    device.remove_peer(&self.server).await;
+                    peer.endpoint = Some(endpoint.into());
+                    device.add_peer(peer)
+                };
+                applied.then_some(true)
+            })
+            .await
+            .map_err(|e| Error::new("TUNNEL_FAILED", e.to_string()))?
+            .ok_or_else(|| Error::new("TUNNEL_FAILED", "the device lost its peer"))
     }
 
     /// Bind the UDP socket again on the same interface and port, and start
@@ -327,8 +406,8 @@ impl Detached {
             packets: from_caller,
             mtu,
         };
-        let (device, stun) =
-            device(key, iface, port, peers, ChannelSend(to_caller), tun_rx).await?;
+        let (udp, stun) = BoundUdp::new(iface);
+        let device = device(key, udp, port, peers, ChannelSend(to_caller), tun_rx).await?;
         let detached = Self {
             device,
             outbound,
@@ -580,12 +659,12 @@ fn subnet(address: Ipv4Network) -> Ipv4Network {
 
 async fn device<Tx: IpSend, Rx: IpRecv>(
     key: &Key,
-    iface: BoundInterface,
+    udp: BoundUdp,
     port: u16,
     peers: Vec<Peer>,
     tun_tx: Tx,
     tun_rx: Rx,
-) -> Result<(Device<(BoundUdp, Tx, Rx)>, StunPort)> {
+) -> Result<Device<(BoundUdp, Tx, Rx)>> {
     // gotatun binds its socket only when it has a peer, and STUN needs that socket.
     if peers.is_empty() {
         return Err(Error::new(
@@ -593,9 +672,8 @@ async fn device<Tx: IpSend, Rx: IpRecv>(
             "the config has no peer and no doctor, so the tunnel would serve nobody",
         ));
     }
-    let name = iface.to_string();
-    let (udp, stun) = BoundUdp::new(iface);
-    let device = DeviceBuilder::new()
+    let name = udp.interface().to_string();
+    DeviceBuilder::new()
         .with_private_key(x25519::StaticSecret::from(key.to_bytes()))
         .with_ip_pair(tun_tx, tun_rx)
         .with_udp(udp)
@@ -608,8 +686,7 @@ async fn device<Tx: IpSend, Rx: IpRecv>(
                 Error::new("UDP_BIND", format!("{name} udp/{port}: {error}"))
             }
             error => Error::new("TUNNEL_FAILED", error.to_string()),
-        })?;
-    Ok((device, stun))
+        })
 }
 
 #[cfg(test)]

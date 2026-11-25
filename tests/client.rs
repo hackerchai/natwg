@@ -747,6 +747,7 @@ fn options(dns: SocketAddrV4) -> Options {
         dns_port: dns.port(),
         dns_timeout: Duration::from_millis(300),
         lookup_every: Duration::from_millis(300),
+        txt_every: Duration::from_millis(300),
         retry_every: Duration::from_millis(100),
         watch_every: Duration::from_millis(100),
         status_every: Duration::from_millis(100),
@@ -824,7 +825,13 @@ async fn the_client_follows_the_txt_record_when_the_server_moves() {
             reaches(&device, &mut second, b"to the second server", WITHIN).await,
             "the client follows the TXT record to the second server"
         );
-        let status = client_status(&status_file);
+        let status = client_status_until(&status_file, |state| {
+            state.endpoint == Some(second_at)
+                && state.server.as_ref().is_some_and(|s| {
+                    s.endpoint == Some(second_at.into()) && s.last_handshake.is_some()
+                })
+        })
+        .await;
         assert_eq!(status.endpoint, Some(second_at));
         assert_eq!(status.lookup_error, None);
         assert_eq!(status.rebuilds, 0);
@@ -835,9 +842,9 @@ async fn the_client_follows_the_txt_record_when_the_server_moves() {
     ran.unwrap();
 }
 
-/// The client status once `done` accepts it, polled for up to 10 s.
+/// The client status once `done` accepts it, polled for one steady handshake check plus scheduling slack.
 async fn client_status_until(path: &Path, done: impl Fn(&ClientStatus) -> bool) -> ClientStatus {
-    for _ in 0..200 {
+    for _ in 0..250 {
         if let Ok(Report::Client(status)) = Report::read(path)
             && done(&status)
         {
@@ -1050,4 +1057,123 @@ fn natwg_client_and_server_need_their_own_role() {
         };
         assert!(stderr.starts_with(expected), "{command}: {stderr}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fixed_endpoint_writes_status_on_first_handshake_then_heartbeat_despite_byte_changes() {
+    use std::os::unix::fs::MetadataExt;
+
+    struct Idle {
+        server: PublicKey,
+        shook: std::time::SystemTime,
+        samples: Arc<AtomicU32>,
+    }
+
+    impl Device for Idle {
+        async fn failed(&mut self) {
+            std::future::pending().await
+        }
+        fn tun(&self) -> Option<&str> {
+            Some(LOOPBACK)
+        }
+        async fn server(&self) -> Option<PeerStats> {
+            let sample = self.samples.fetch_add(1, Ordering::Relaxed);
+            Some(PeerStats {
+                public_key: self.server,
+                endpoint: Some(addr("127.0.0.1:51830").into()),
+                last_handshake: (sample > 0).then(|| self.shook.elapsed().unwrap()),
+                rx_bytes: u64::from(sample) * 32,
+                tx_bytes: u64::from(sample) * 32,
+            })
+        }
+        async fn point(&self, _: SocketAddrV4) -> natwg::Result<()> {
+            panic!("fixed endpoint was replaced")
+        }
+        async fn rebind(&self) -> natwg::Result<()> {
+            panic!("unchanged uplink was rebound")
+        }
+        async fn stop(self) {}
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let (_, mut config) = pair(&path);
+    let Role::Client(role) = &mut config.role else {
+        unreachable!()
+    };
+    role.record = None;
+    config.peers[0].endpoint = Some(addr("127.0.0.1:51830"));
+    let key = config.peers[0].public_key;
+    let samples = Arc::new(AtomicU32::new(0));
+    let build = async |_: &Config, _: &Uplink, _| {
+        Ok(Idle {
+            server: key,
+            shook: std::time::SystemTime::now(),
+            samples: samples.clone(),
+        })
+    };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let options = Options::default();
+    let running = client::run(
+        &config,
+        &options,
+        |_| Ok(loopback_uplink(Ipv4Addr::LOCALHOST)),
+        build,
+        async { stop_rx.await.unwrap() },
+    );
+    let check = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(samples.load(Ordering::Relaxed), 1);
+        let initial = fs::metadata(&path).unwrap().ino();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let first = fs::metadata(&path).unwrap().ino();
+        assert_ne!(first, initial, "first handshake publishes immediately");
+        assert_eq!(samples.load(Ordering::Relaxed), 2);
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert_eq!(samples.load(Ordering::Relaxed), 2);
+        let held = fs::File::open(&path).unwrap();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(samples.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            fs::metadata(&path).unwrap().ino(),
+            first,
+            "byte totals alone do not write"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            held.metadata().unwrap().ino()
+        );
+        assert!(client_status(&path).server.unwrap().rx >= 96);
+        stop_tx.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(running, check);
+    result.unwrap();
+}
+
+#[test]
+fn idle_pause_is_opt_in_and_does_not_override_a_configured_zero_keepalive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, client) = pair(&dir.path().join("status.json"));
+    let path = dir.path().join("client.json");
+    client.save(&path).unwrap();
+    let mut value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(value["role"]["client"].get("idle_pause_minutes").is_none());
+    value["peers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("keepalive");
+    let default: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(natwg::tunnel::client_keepalive(&default.peers[0]), 25);
+    value["role"]["client"]["idle_pause_minutes"] = json!(3);
+    value["peers"][0]["keepalive"] = json!(0);
+    let configured: Config = serde_json::from_value(value.clone()).unwrap();
+    configured.validate().unwrap();
+    assert_eq!(natwg::tunnel::client_keepalive(&configured.peers[0]), 0);
+    assert_eq!(
+        serde_json::to_value(configured).unwrap()["role"],
+        value["role"]
+    );
+    value["role"]["client"]["idle_pause_minutes"] = json!(0);
+    assert!(serde_json::from_value::<Config>(value).is_err());
 }

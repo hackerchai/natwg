@@ -408,12 +408,32 @@ pub struct ClientStatus {
     pub lookup_error: Option<String>,
     /// The persistent keepalive in seconds, 0 when it is off.
     pub keepalive: u16,
+    /// TXT discovery has observed a handshake failure on the current endpoint.
+    #[serde(default)]
+    pub handshake_retrying: bool,
     /// How many times natwg rebuilt a tunnel that died or lost its uplink.
     pub rebuilds: u32,
     pub server: Option<PeerStatus>,
 }
 
 impl ClientStatus {
+    /// Byte totals advance even on keepalives. Publish them on the heartbeat
+    /// or alongside a change in reachability, configuration or handshake.
+    pub(crate) fn same_client_state(&self, new: &Self) -> bool {
+        self.uplink == new.uplink
+            && self.uplink_address == new.uplink_address
+            && self.tun == new.tun
+            && self.endpoint == new.endpoint
+            && self.endpoint_since == new.endpoint_since
+            && self.lookup_error == new.lookup_error
+            && self.keepalive == new.keepalive
+            && self.handshake_retrying == new.handshake_retrying
+            && self.rebuilds == new.rebuilds
+            && self.latest_version == new.latest_version
+            && self.server.as_ref().map(|s| (s.endpoint, s.last_handshake))
+                == new.server.as_ref().map(|s| (s.endpoint, s.last_handshake))
+    }
+
     /// Atomically replace `path` with this status, readable by everyone.
     pub fn write(&self, path: &Path) -> Result<()> {
         write_public(path, self)
@@ -453,6 +473,8 @@ impl ClientStatus {
             self.lookup_error
                 .is_some()
                 .then(|| format!("the {} lookup failed", self.record_type())),
+            self.handshake_retrying
+                .then(|| "retrying TXT after a handshake failure".to_owned()),
             handshake_problem,
         ]
         .into_iter()
