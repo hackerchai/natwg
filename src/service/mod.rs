@@ -60,6 +60,16 @@ pub enum State {
 /// server or the client in `config`, and start it. A part that is already in place stays,
 /// so a second run with nothing changed keeps the running server.
 pub fn install(config: &Path) -> Result<String> {
+    install_service(config, false)
+}
+
+/// Init wrote new keys. A running service must load them even when its
+/// binary and unit already match, as when --force also changed the port.
+pub fn install_new_config(config: &Path) -> Result<String> {
+    install_service(config, true)
+}
+
+fn install_service(config: &Path, config_changed: bool) -> Result<String> {
     require_root()?;
     // Everything that can refuse the install runs before the host changes.
     let (service, status) = load(config)?;
@@ -95,9 +105,17 @@ pub fn install(config: &Path) -> Result<String> {
             manager::kick(&name)?;
             "started"
         }
+        State::Running { .. } if config_changed => {
+            manager::restart(&name)?;
+            "restarted"
+        }
         State::Running { .. } => "unchanged",
     };
-    let pid = wait_serving(&service, &status, None)?;
+    let old_pid = match before {
+        State::Running { pid, .. } if action == "restarted" => Some(pid),
+        _ => None,
+    };
+    let pid = wait_serving(&service, &status, old_pid)?;
     let changed = |changed| if changed { "written" } else { "unchanged" };
     let mut report = String::new();
     let _ = writeln!(report, "binary     {BINARY} ({})", changed(binary));
