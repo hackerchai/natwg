@@ -2,7 +2,7 @@
 //! host, renewed the way natwg.py renews it, and the discovery of that router
 //! (SSDP) with the one-off mappings `natwg detect` takes for a test.
 
-use crate::config::{Instance, ServerConfig};
+use crate::config::{Instance, PublishMode, ServerConfig};
 use crate::server::error_chain;
 use crate::wire::transport::{BoundInterface, bound_tcp_connect, bound_udp_socket};
 use crate::{Error, Result, netcfg};
@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::{
     net::UdpSocket,
-    sync::watch,
+    sync::{Notify, watch},
     time::{Instant, MissedTickBehavior},
 };
 use url::Url;
@@ -29,6 +29,10 @@ const TIMEOUT: Duration = Duration::from_secs(6);
 pub struct Lease {
     pub ok: bool,
     pub at: SystemTime,
+    /// The address the gateway holds on its WAN side, which a server with
+    /// publish `a` asks after each renewal that worked. None when it was not
+    /// asked or did not answer.
+    pub external_ip: Option<Ipv4Addr>,
 }
 
 /// The SOAP body that asks the router to forward UDP `port` to the same port
@@ -67,6 +71,8 @@ pub struct Upnp {
     lease_secs: u32,
     description: Instance,
     refresh: Duration,
+    /// Whether to ask the gateway for its WAN address after each renewal.
+    external: bool,
 }
 
 impl Upnp {
@@ -90,22 +96,50 @@ impl Upnp {
             lease_secs: config.lease_secs,
             description: server.instance.clone(),
             refresh: Duration::from_secs(config.refresh_secs.get()),
+            external: server.publish == PublishMode::A,
         }))
     }
 
-    /// Renew the lease now and every `refresh_secs`. Only a change between
-    /// success and failure is logged.
-    pub async fn run(self, state: watch::Sender<Option<Lease>>) -> Infallible {
+    /// Renew the lease now, every `refresh_secs`, and at once when `recheck`
+    /// is notified. With publish `a`, a renewal that worked also asks the
+    /// gateway for its WAN address. Only a change between success and
+    /// failure, or of that address, is logged.
+    pub async fn run(self, state: watch::Sender<Option<Lease>>, recheck: &Notify) -> Infallible {
         let mut tick = tokio::time::interval(self.refresh);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut asked_ok = true;
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                () = recheck.notified() => tick.reset(),
+            }
             let renewed = self.renew().await;
+            let external_ip = match (&renewed, self.external) {
+                (Ok(_), true) => match self.external_ip().await {
+                    Ok(ip) => {
+                        asked_ok = true;
+                        Some(ip)
+                    }
+                    Err(error) => {
+                        if std::mem::replace(&mut asked_ok, false) {
+                            tracing::warn!("{error}");
+                        }
+                        None
+                    }
+                },
+                _ => None,
+            };
             let lease = Lease {
                 ok: renewed.is_ok(),
                 at: SystemTime::now(),
+                external_ip,
             };
             let before = state.send_replace(Some(lease));
+            if let Some(ip) = external_ip
+                && before.and_then(|before| before.external_ip) != Some(ip)
+            {
+                tracing::info!("the UPnP gateway's WAN address is {ip}");
+            }
             if before.map(|before| before.ok) == Some(lease.ok) {
                 continue;
             }
@@ -115,6 +149,31 @@ impl Upnp {
                 Err(error) => tracing::warn!("UPnP mapping of udp/{port} failed: {error}"),
             }
         }
+    }
+
+    /// The gateway's WAN address, from GetExternalIPAddress on the control
+    /// URL.
+    async fn external_ip(&self) -> Result<Ipv4Addr> {
+        let what = format!("{} GetExternalIPAddress", self.control_url);
+        let response = self
+            .http
+            .post(&self.control_url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                r#"text/xml; charset="utf-8""#,
+            )
+            .header("SOAPAction", format!(r#""{SERVICE}#GetExternalIPAddress""#))
+            .body(soap_body(SERVICE, "GetExternalIPAddress", &[]))
+            .send()
+            .await
+            .map_err(|e| Error::new("UPNP_HTTP", format!("{what}: {}", error_chain(&e))))?;
+        let reply = read_capped(response, &what).await?;
+        element(&reply, "NewExternalIPAddress")
+            .and_then(|ip| ip.trim().parse().ok())
+            .ok_or_else(|| {
+                let reply: String = reply.trim().chars().take(200).collect();
+                Error::new("UPNP_REFUSED", format!("{what}: {reply}"))
+            })
     }
 
     async fn renew(&self) -> Result<Ipv4Addr> {

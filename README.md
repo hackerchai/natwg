@@ -9,15 +9,16 @@ WireGuard peers reach. natwg then:
 
 - refreshes that mapping with a STUN keepalive every 25 seconds;
 - publishes it as a Cloudflare DNS TXT record (`"ip:port"`), which the client
-  reads to find the server;
+  reads to find the server, or, on a network with a public IP, publishes that
+  IP as an A record ([public mode](#public-mode-an-a-record));
 - leases the port on the home router through UPnP;
 - routes the tunnel subnet and NATs it to each LAN (pf on macOS, nftables on
   Linux);
 - writes a status file, and rebuilds the tunnel when STUN stops answering.
 
 The same binary is the client. `natwg client` keeps a tunnel to the server,
-reads the TXT record every 60 seconds and follows the server when its mapping
-changes.
+reads the TXT record (or the A record) every 60 seconds and follows the
+server when its endpoint changes.
 
 WireGuard runs inside the process through
 [gotatun](https://crates.io/crates/gotatun), so it needs no wireguard-go or
@@ -131,7 +132,8 @@ knows:
   traffic flows.
 
 `natwg init` offers plain WireGuard mode, which needs a fixed endpoint, only
-for `address` and `upnp`.
+for `address` and `upnp`, and the server publishes an A record
+([public mode](#public-mode-an-a-record)) only in those two cases too.
 
 natwg runs every test through one UDP socket on the uplink, as the server
 does:
@@ -207,7 +209,7 @@ on Linux), owned by root with mode 0600. `natwg keys gen` prints a key pair, and
 
 ```sh
 sudo natwg service install   # a LaunchDaemon on macOS, a systemd unit on Linux
-natwg status                 # the mapping, the TXT record, NAT and UPnP
+natwg status                 # the mapping, the TXT or A record, NAT and UPnP
 natwg service status
 sudo natwg doctor loopback   # ping the tunnel and the LAN through a test peer
 ```
@@ -216,6 +218,72 @@ sudo natwg doctor loopback   # ping the tunnel and the LAN through a test peer
 `natwg probe stun|dns|txt|uplink` asks STUN and DNS servers through one
 interface without the server, and prints the uplink a client would pick.
 Run `natwg detect` first (see [Check the network](#check-the-network)).
+
+### Public mode: an A record
+
+On a network with a public IPv4 address, the server can publish that address
+as a Cloudflare A record instead of a TXT record. Clients, Surge and Clash
+then dial `name:listen_port`, as with any dynamic DNS name. Set
+`role.server.publish` to `"a"`, and `cloudflare.record` names the A record:
+
+```json
+"role": { "server": {
+  "iface": "eth0",
+  "listen_port": 51830,
+  "lan": ["10.73.0.0/24"],
+  "publish": "a",
+  "cloudflare": { "zone": "example.com", "record": "home.example.com", "token": "<token>" }
+}}
+```
+
+`publish` defaults to `"txt"`, the TXT record of the mapping, and a config
+without it works as before. Use public mode only where `natwg detect` says
+`supported (public)` with `public_by` `address` or `upnp`. natwg publishes an
+IP only when it confirms the IP itself, which it can do in two cases:
+
+- **`address`:** the uplink's own address is public. natwg reads it every 10
+  seconds and needs no STUN for it, so `role.server.stun` may go.
+- **`upnp`:** a router holds the public IP and forwards the listen port, and
+  natwg confirms all of it: the UPnP lease of the listen port
+  (`role.server.upnp`) works, the router's WAN address (GetExternalIPAddress)
+  is the IP that STUN sees, and the STUN mapping keeps the listen port. This
+  needs `stun` and `upnp`.
+
+Every other network uses TXT. natwg publishes no A record for:
+
+- **`port_kept`:** STUN sees a public IP that keeps the listen port, but no
+  UPnP gateway confirms a router. A carrier NAT that keeps the port looks the
+  same, and it can hand out another port later, which would leave the name
+  pointing at the wrong port. A port forwarded by hand looks the same too:
+  forward it through UPnP, or publish TXT.
+- a mapping whose port is not the listen port, as on a NAT1 network;
+- a router whose WAN address is not the IP that STUN sees, because another
+  NAT sits in front of it;
+- a private uplink without STUN.
+
+When natwg cannot confirm the IP, at start or later (when the ISP takes the
+public address away, say), it leaves the A record as it is. It never writes
+an IP it cannot confirm, and it does not fall back to TXT. `natwg status`
+says why and exits 1 with `no public IP`. To move such a server to TXT,
+remove `publish` (or set `"txt"`), give it `stun`, and give each client a
+`record` in place of its `server`.
+
+`natwg status` shows the mode, the name and the IP:
+
+```text
+public IP       : 45.77.0.10 by address
+published A     : home.example.com = 45.77.0.10 (3s ago), clients dial home.example.com:51830
+last STUN reply : off (no role.server.stun)
+upnp/nat        : off / ok
+```
+
+The A record has a TTL of 60 seconds, and natwg never has Cloudflare proxy
+it. `natwg peer add` gives a client of such a server
+`"server": "home.example.com:51830"` in place of a `record`.
+
+`NATWG_CLOUDFLARE_API`, for tests only, sends the server's Cloudflare calls,
+token and all, to another API base URL; the network lab points it at its fake
+API.
 
 ### Add a client
 
@@ -320,7 +388,12 @@ The client config has the client role and exactly one peer, the server:
   `resolvers` in order and takes the first well-formed `"ip:port"`. It keeps the
   last endpoint when no resolver gives one. `resolvers` defaults to the list
   above.
-- Without a `record`, the client dials `peers[0].endpoint` (`"ip:port"`).
+- `server` (`"home.example.com:51830"`) takes the place of `record` for a
+  server in [public mode](#public-mode-an-a-record). The client asks the
+  `resolvers` for the A record of the name, the same way and as often, dials
+  the first address at the port, and keeps the last endpoint when no resolver
+  gives one. A config has `record` or `server`, not both.
+- Without either, the client dials `peers[0].endpoint` (`"ip:port"`).
 - The client routes each of `allowed_ips` into its tunnel and refuses to start
   when another interface holds the tunnel address or one of those routes. A
   default route (`0.0.0.0/0`) is not supported.
@@ -338,8 +411,8 @@ natwg status                     # endpoint, handshake age, traffic
 ```
 
 `natwg status` exits 1 when the client has no tunnel, no endpoint, a failing
-TXT lookup, or no handshake for longer than a session can live, 235 seconds
-with the default keepalive.
+TXT or A lookup, or no handshake for longer than a session can live, 235
+seconds with the default keepalive.
 
 ### Move a wg-quick client to natwg
 

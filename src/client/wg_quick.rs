@@ -39,6 +39,7 @@ pub fn import(path: &Path, record: Option<String>, resolvers: Vec<Ipv4Addr>) -> 
         peers: vec![parsed.server],
         role: Role::Client(ClientConfig {
             record,
+            server: None,
             resolvers,
             iface: None,
             status_file: None,

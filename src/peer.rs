@@ -2,7 +2,9 @@
 //! next free tunnel address, and returns the config that client runs.
 
 use crate::client::{resolve::DEFAULT_RESOLVERS, wg_quick::SERVER_PEER};
-use crate::config::{ClientConfig, Config, Interface, PeerConfig, Role, Version1};
+use crate::config::{
+    ClientConfig, Config, HostPort, Interface, PeerConfig, PublishMode, Role, Version1,
+};
 use crate::keys::Key;
 use crate::tunnel::CLIENT_KEEPALIVE;
 use crate::{Error, Result};
@@ -14,7 +16,8 @@ const NAME_MAX: usize = 32;
 /// Add the client `name` to the server `config`: a fresh key pair and
 /// preshared key, and the lowest host of the tunnel subnet that is not the
 /// server's, the doctor's or inside a peer's allowed IPs. Returns the config
-/// of the new client, which finds the server through its TXT record and
+/// of the new client, which finds the server through what it publishes (the
+/// TXT record, or with publish `a` the A record at the listen port) and
 /// routes the tunnel subnet and every LAN to it.
 pub fn add(config: &mut Config, name: &str) -> Result<Config> {
     let server = config.server()?;
@@ -43,6 +46,17 @@ pub fn add(config: &mut Config, name: &str) -> Result<Config> {
     })?;
     let key = Key::generate()?;
     let preshared = Key::generate()?;
+    let record = server.cloudflare.record.clone();
+    let (record, dial) = match server.publish {
+        PublishMode::Txt => (Some(record), None),
+        PublishMode::A => {
+            let dial = HostPort {
+                host: record,
+                port: server.listen_port,
+            };
+            (None, Some(dial))
+        }
+    };
     let client = Config {
         version: Version1,
         private_key: key.clone(),
@@ -61,7 +75,8 @@ pub fn add(config: &mut Config, name: &str) -> Result<Config> {
             keepalive: Some(CLIENT_KEEPALIVE),
         }],
         role: Role::Client(ClientConfig {
-            record: Some(server.cloudflare.record.clone()),
+            record,
+            server: dial,
             resolvers: DEFAULT_RESOLVERS.to_vec(),
             iface: None,
             status_file: None,

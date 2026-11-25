@@ -109,6 +109,31 @@ fn the_client_config_reaches_the_tunnel_and_the_lan_through_the_record() {
 }
 
 #[test]
+fn a_client_of_a_server_with_publish_a_dials_the_name_at_the_listen_port() {
+    let mut value = server_json();
+    value["role"]["server"]["publish"] = json!("a");
+    value["role"]["server"]["cloudflare"]["record"] = json!("home-next.example.com");
+    let mut server = config(value);
+    let client = peer::add(&mut server, "tablet").unwrap();
+    client.validate().unwrap();
+    let Role::Client(role) = &client.role else {
+        panic!("peer add returns a client config")
+    };
+    assert_eq!(role.record, None);
+    assert_eq!(
+        role.server.as_ref().map(ToString::to_string).as_deref(),
+        Some("home-next.example.com:51831")
+    );
+    assert_eq!(role.resolvers.len(), 4);
+    let printed: Value = serde_json::from_str(&client.exposed()).unwrap();
+    assert_eq!(
+        printed["role"]["client"]["server"],
+        "home-next.example.com:51831"
+    );
+    assert!(printed["role"]["client"].get("record").is_none());
+}
+
+#[test]
 fn the_client_config_routes_the_tunnel_subnet_and_every_lan() {
     let routed = |lan: Value| {
         let mut value = server_json();
