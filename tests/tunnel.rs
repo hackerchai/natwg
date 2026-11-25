@@ -729,6 +729,7 @@ fn status_with(mapping: Option<SocketAddrV4>) -> Status {
         public_ip: None,
         public_by: None,
         public_error: None,
+        record_problem: None,
         upnp_ok: None,
         upnp_at: None,
         nat_ok: None,

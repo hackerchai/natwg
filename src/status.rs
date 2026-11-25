@@ -73,6 +73,11 @@ pub struct Status {
     /// record then stays as it was.
     #[serde(default)]
     pub public_error: Option<String>,
+    /// With publish `a`: the other records of the name that clients may
+    /// dial, more A records or an AAAA record, which the operator must
+    /// delete. natwg never deletes them.
+    #[serde(default)]
+    pub record_problem: Option<String>,
     /// None when the config has no UPnP section or the first lease is pending.
     pub upnp_ok: Option<bool>,
     pub upnp_at: Option<u64>,
@@ -236,6 +241,10 @@ impl Status {
             (!a && self.mapping.is_none(), "no public mapping".to_owned()),
             (a && self.public_ip.is_none(), "no public IP".to_owned()),
             (
+                self.record_problem.is_some(),
+                self.record_problem.clone().unwrap_or_default(),
+            ),
+            (
                 self.publish_error.is_some(),
                 format!("the {} publish failed", self.publish.record_type()),
             ),
@@ -301,6 +310,9 @@ impl Status {
                     named(record, or_none(self.published_ip.map(|p| p.to_string()))),
                     age(self.published_at)
                 ));
+                if let Some(problem) = &self.record_problem {
+                    lines.push(format!("other records   : ERROR: {problem}"));
+                }
                 if self.stun {
                     lines.push(mapping);
                     lines.push(stun);

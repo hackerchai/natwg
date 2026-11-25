@@ -3,6 +3,7 @@
 //! a VPN app hijacks on the default route.
 
 use crate::config::{ClientConfig, HostPort, PublishMode};
+use crate::detect::is_public;
 use crate::wire::dns::{self, Record, RecordKind};
 use crate::wire::transport::BoundInterface;
 use crate::{Error, Result};
@@ -88,12 +89,22 @@ fn usable(ip: Ipv4Addr) -> bool {
     !(ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast())
 }
 
-/// The first usable address among the A records of one answer.
+/// The first public address among the A records of one answer. The server
+/// publishes only public IPs, so a private, loopback or carrier-grade NAT
+/// address, or one of 198.18.0.0/15 that the fake-IP DNS of Surge and Clash
+/// hands out, is never the server's.
 pub fn first_address(records: &[Record]) -> Option<Ipv4Addr> {
-    records.iter().find_map(|record| match record {
-        Record::A(ip) => usable(*ip).then_some(*ip),
-        Record::Txt(_) => None,
-    })
+    addresses(records).into_iter().find(|&ip| is_public(ip))
+}
+
+fn addresses(records: &[Record]) -> Vec<Ipv4Addr> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            Record::A(ip) => Some(*ip),
+            Record::Txt(_) => None,
+        })
+        .collect()
 }
 
 /// The first well-formed endpoint among the TXT records of one answer.
@@ -139,9 +150,9 @@ pub async fn lookup(
 }
 
 /// Ask each of `resolvers` in turn for the A records of `server.host`
-/// through `iface`, and return the first usable address at `server.port`,
+/// through `iface`, and return the first public address at `server.port`,
 /// and the resolver that gave it. A resolver that fails or answers with no
-/// usable address is skipped.
+/// public address is skipped.
 pub async fn lookup_a(
     iface: &BoundInterface,
     resolvers: &[SocketAddrV4],
@@ -154,7 +165,16 @@ pub async fn lookup_a(
         match dns::resolve(iface, resolver, name, RecordKind::A, timeout).await {
             Ok(records) => match first_address(&records) {
                 Some(ip) => return Ok((SocketAddrV4::new(ip, server.port), resolver)),
-                None => failures.push(format!("{resolver} answered no usable address")),
+                None => {
+                    let shown: Vec<String> = addresses(&records)
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                    failures.push(format!(
+                        "{name} answered {} at {resolver}, not a public address (a fake-IP DNS?)",
+                        shown.join(", ")
+                    ));
+                }
             },
             Err(error) => failures.push(error.to_string()),
         }
@@ -165,7 +185,7 @@ pub async fn lookup_a(
     Err(Error::new(
         "A_NO_ADDRESS",
         format!(
-            "no DNS server gave an A record for {name}: {}",
+            "no DNS server gave a public A record for {name}: {}",
             failures.join("; ")
         ),
     ))

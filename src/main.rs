@@ -861,17 +861,33 @@ fn daemon(config: &Path, want: Option<Want>) -> Result<()> {
     })
 }
 
-/// The Cloudflare API the server calls: [`cloudflare::API`], or for tests
-/// NATWG_CLOUDFLARE_API, such as the fake API of the network lab. The token
-/// goes wherever it points, and only root sets the environment of the
-/// service.
+/// The Cloudflare API the server calls: [`cloudflare::API`], or in a debug
+/// build NATWG_CLOUDFLARE_API, such as the fake API of the network lab.
 fn cloudflare_api() -> String {
-    match std::env::var("NATWG_CLOUDFLARE_API") {
-        Ok(api) if !api.is_empty() => {
-            tracing::warn!("calling the Cloudflare API at {api}, from NATWG_CLOUDFLARE_API");
-            api
+    let set = std::env::var("NATWG_CLOUDFLARE_API").ok();
+    let (api, warning) = choose_api(set, cfg!(debug_assertions));
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+    api
+}
+
+/// The API base URL, and what to warn about. The token goes wherever the
+/// override points, so only a debug build, which tests use, honours it.
+fn choose_api(set: Option<String>, debug: bool) -> (String, Option<String>) {
+    match set.filter(|api| !api.is_empty()) {
+        Some(api) if debug => {
+            let warning = format!("calling the Cloudflare API at {api}, from NATWG_CLOUDFLARE_API");
+            (api, Some(warning))
         }
-        _ => cloudflare::API.to_owned(),
+        Some(_) => (
+            cloudflare::API.to_owned(),
+            Some(
+                "ignoring NATWG_CLOUDFLARE_API: it is for tests, and only a debug build honours it"
+                    .to_owned(),
+            ),
+        ),
+        None => (cloudflare::API.to_owned(), None),
     }
 }
 
@@ -1002,7 +1018,34 @@ async fn first_mapping(
 
 #[cfg(test)]
 mod tests {
-    use super::Stop;
+    use super::{Stop, choose_api};
+    use natwg::server::cloudflare;
+
+    #[test]
+    fn only_a_debug_build_sends_the_cloudflare_calls_elsewhere() {
+        let lab = Some("http://45.78.0.80/client/v4".to_owned());
+        let (api, warning) = choose_api(lab.clone(), true);
+        assert_eq!(api, "http://45.78.0.80/client/v4");
+        assert!(
+            warning
+                .unwrap()
+                .starts_with("calling the Cloudflare API at http://45.78.0.80")
+        );
+        let (api, warning) = choose_api(lab, false);
+        assert_eq!(api, cloudflare::API, "a release build ignores the override");
+        assert!(
+            warning
+                .unwrap()
+                .starts_with("ignoring NATWG_CLOUDFLARE_API")
+        );
+        for debug in [true, false] {
+            assert_eq!(choose_api(None, debug), (cloudflare::API.to_owned(), None));
+            assert_eq!(
+                choose_api(Some(String::new()), debug),
+                (cloudflare::API.to_owned(), None)
+            );
+        }
+    }
     use std::time::Duration;
 
     #[tokio::test]
