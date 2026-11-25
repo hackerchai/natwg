@@ -15,6 +15,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::Duration,
 };
+use tokio::time::Instant;
 use tokio::{
     net::UdpSocket,
     sync::{oneshot, watch},
@@ -108,6 +109,7 @@ pub fn bound_tcp_connect(
 /// gotatun.
 pub struct BoundUdp {
     iface: BoundInterface,
+    initiations: Option<watch::Sender<Option<Initiation>>>,
     socket: watch::Sender<Weak<UdpSocket>>,
     pending: Slot,
 }
@@ -124,6 +126,7 @@ impl BoundUdp {
         let pending = Slot::default();
         let udp = Self {
             iface,
+            initiations: None,
             socket: socket_tx,
             pending: pending.clone(),
         };
@@ -132,6 +135,33 @@ impl BoundUdp {
             pending,
         };
         (udp, stun)
+    }
+}
+
+/// A locally generated WireGuard initiation. A second one to the same
+/// endpoint within the retry window is evidence of an unanswered attempt.
+#[derive(Clone, Copy, Debug)]
+pub struct Initiation {
+    pub at: Instant,
+    pub destination: SocketAddr,
+    pub retry: bool,
+}
+
+impl Initiation {
+    // WireGuard retries in 5 s plus jitter. A new healthy session normally
+    // rekeys after at least 120 s.
+    pub(crate) const RETRY_WINDOW: Duration = Duration::from_secs(15);
+}
+
+impl BoundUdp {
+    pub(crate) fn interface(&self) -> &BoundInterface {
+        &self.iface
+    }
+
+    pub(crate) fn observe_initiations(&mut self) -> watch::Receiver<Option<Initiation>> {
+        let (tx, rx) = watch::channel(None);
+        self.initiations = Some(tx);
+        rx
     }
 }
 
@@ -150,7 +180,13 @@ impl UdpTransportFactory for BoundUdp {
             socket: socket.clone(),
             pending: self.pending.clone(),
         };
-        Ok((BoundSend(socket), recv))
+        Ok((
+            BoundSend {
+                socket,
+                initiations: self.initiations.clone(),
+            },
+            recv,
+        ))
     }
 }
 
@@ -175,17 +211,36 @@ async fn bind_retrying(iface: &BoundInterface, port: u16) -> io::Result<std::net
 }
 
 #[derive(Clone)]
-pub struct BoundSend(Arc<UdpSocket>);
+pub struct BoundSend {
+    socket: Arc<UdpSocket>,
+    initiations: Option<watch::Sender<Option<Initiation>>>,
+}
 
 impl UdpSend for BoundSend {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
-        self.0.send_to(&packet, destination).await.map(drop)
+        if let Some(events) = &self.initiations
+            && packet.starts_with(&1u32.to_le_bytes())
+        {
+            let at = Instant::now();
+            events.send_modify(|last| {
+                let retry = last.is_some_and(|i| {
+                    i.destination == destination
+                        && at.duration_since(i.at) < Initiation::RETRY_WINDOW
+                });
+                *last = Some(Initiation {
+                    at,
+                    destination,
+                    retry,
+                });
+            });
+        }
+        self.socket.send_to(&packet, destination).await.map(drop)
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-        self.0.local_addr().map(Some)
+        self.socket.local_addr().map(Some)
     }
 }
 

@@ -72,6 +72,7 @@ pub fn add(config: &mut Config, name: &str) -> Result<Config> {
             server: dial,
             resolvers: DEFAULT_RESOLVERS.to_vec(),
             iface: None,
+            idle_pause_minutes: None,
             status_file: None,
         }),
         update: None,
