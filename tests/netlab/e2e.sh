@@ -28,7 +28,10 @@ LAN_NET=10.88.0.0/24
 HOST_ON_LAN=10.88.0.1
 LAN_HOST=10.88.0.2
 TUNNEL_IP=10.66.66.1
-E2E=(public upnp public-forward nat1)
+E2E=(public upnp public-forward nat1 strays)
+# Another A record and an AAAA record of the name, for `strays`.
+EXTRA_A=45.77.0.98
+EXTRA_AAAA=2001:db8::1
 # The client looks the name up every 60 s, then handshakes.
 FOLLOW_LIMIT=100
 RESULT=""
@@ -41,6 +44,7 @@ e2e_describe() {
 	upnp) echo "a UPnP router owns $ROUTER_WAN; it moves to $NEW_ROUTER_WAN" ;;
 	public-forward) echo "a router forwards udp/$PORT and keeps it, no UPnP: refuse" ;;
 	nat1) echo "NAT1 maps udp/$PORT to :$NAT_PORT: refuse" ;;
+	strays) echo "public, the name proxied, with another A and an AAAA record" ;;
 	*) return 1 ;;
 	esac
 }
@@ -53,10 +57,14 @@ extras() {
 	ns inet ip addr add "$DNS/32" dev lo
 	case $1 in
 	public-forward | nat1) seed=(--record "$NAME=A:$STALE") ;;
+	strays)
+		seed=(--record "$NAME=A:$PUBLIC_HOST,proxied" --record "$NAME=A:$EXTRA_A"
+			--record "$NAME=AAAA:$EXTRA_AAAA")
+		;;
 	esac
 	start inet cloudflare "Cloudflare API on" "$LAB/cloudflare.py" --api "$API:80" \
 		--dns "$DNS:53" --zone "$ZONE" --token "$TOKEN" --log "$WORK/cloudflare.log" "${seed[@]}"
-	[ "$1" = public ] || return 0
+	[ "$1" = public ] || [ "$1" = strays ] || return 0
 	ns inet ip link add "$P-sw" type bridge
 	ns inet ip link set "$P-sw" up
 	ns inet ip addr del "$INET_GW/24" dev "$P-i0"
@@ -82,12 +90,12 @@ scenario, work, iface, port, zone, name, token, dns, stun, plain, router, lan = 
 server = {
     "iface": iface,
     "listen_port": int(port),
-    "lan": {"public": [lan], "nat1": []}.get(scenario, [router.rsplit(".", 1)[0] + ".0/24"]),
+    "lan": {"public": [lan], "strays": [lan], "nat1": []}.get(scenario, [router.rsplit(".", 1)[0] + ".0/24"]),
     "publish": "a",
     "cloudflare": {"zone": zone, "record": name, "token": token},
     "status_file": work + "/server.status.json",
 }
-if scenario != "public":
+if scenario not in ("public", "strays"):
     server["stun"] = {
         "servers": [],
         "fallback": [stun + ":3478", plain + ":3478"],
@@ -195,6 +203,7 @@ unhealthy() {
 }
 
 says() { field "$WORK/server.status.json" public_error | grep -qF "$1"; }
+names_strays() { field "$WORK/server.status.json" record_problem | grep -qF "$1"; }
 
 # Give the server's public IP a new address, as an ISP does.
 readdress() {
@@ -269,6 +278,7 @@ refusing() {
 	esac
 	daemon host server
 	check "the status says: $reason" wait_until 30 says "$reason" &&
+		check "the status shows the record holds $STALE" status_is server published_ip "$STALE" &&
 		check "natwg status exits 1: no public IP" unhealthy "no public IP" || return 1
 	# Two more STUN rounds and an address check, then nothing may have changed.
 	sleep 11
@@ -282,9 +292,28 @@ refusing() {
 run_scenario() {
 	case $SCENARIO in
 	public | upnp) publishing ;;
+	strays) strays ;;
 	*) refusing ;;
 	esac
 }
+
+# A record that holds the IP but is proxied is written again; the other
+# records of the name are a problem that names them, and natwg deletes none.
+strays() {
+	local others="A $EXTRA_A, AAAA $EXTRA_AAAA"
+	daemon host server
+	check "the proxied record is written again" wait_until 30 api_logged "^PUT A $NAME $PUBLIC_HOST$" &&
+		check "public by address" status_is server public_by address &&
+		check "the status names $others" wait_until 15 names_strays "also has $others" &&
+		check "natwg status exits 1 and names them" unhealthy "also has $others" || return 1
+	sleep 2
+	check "natwg deletes no record" not_deleted &&
+		check "no other write" only_one_write || return 1
+	RESULT="proxied record rewritten; $(field "$WORK/server.status.json" record_problem)"
+}
+
+not_deleted() { ! api_logged "^DELETE "; }
+only_one_write() { [ "$(grep -cE "^(POST|PUT) " "$WORK/cloudflare.log")" -eq 1 ]; }
 
 show_logs() {
 	local log
@@ -302,7 +331,8 @@ e2e_tests() {
 		e2e_describe "$SCENARIO" >/dev/null || die "no e2e scenario $SCENARIO"
 	done
 	for SCENARIO in "$@"; do
-		up "$SCENARIO"
+		# strays runs on the network of public.
+		up "${SCENARIO/#strays/public}"
 		rm -f "$WORK"/*.json
 		extras "$SCENARIO"
 		RESULT=""
@@ -350,4 +380,7 @@ e2e_main() {
 	e2e_tests "$@"
 }
 
-e2e_main "$@"
+# A probe script can source this file for its functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	e2e_main "$@"
+fi
