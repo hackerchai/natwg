@@ -10,7 +10,7 @@ use crate::nat::{self, Nat, Rule};
 use crate::netcfg;
 use crate::wire::transport::{BoundInterface, BoundUdp, Initiation, StunPort};
 use crate::{Error, Result};
-use activity::ClientTun;
+use activity::{Activity, ClientTun};
 use channel::{ChannelRecv, ChannelSend};
 use gotatun::device::configure::PeerMut;
 use gotatun::device::{Device, DeviceBuilder, DeviceTransports, Peer};
@@ -22,10 +22,7 @@ use ipnetwork::{IpNetwork, Ipv4Network};
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
-use std::sync::{
-    Arc, Mutex, PoisonError,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
@@ -155,7 +152,7 @@ impl Tunnel {
 /// socket and port are its own, on the uplink it was started with.
 pub struct Client {
     device: Device<(BoundUdp, ClientTun, ClientTun)>,
-    traffic: Option<Arc<AtomicBool>>,
+    traffic: Option<Arc<Activity>>,
     initiations: Option<watch::Receiver<Option<Initiation>>>,
     tun_name: String,
     server: x25519::PublicKey,
@@ -200,7 +197,7 @@ impl Client {
         let initiations = client.record.as_ref().map(|_| udp.observe_initiations());
         let traffic = client
             .idle_pause_minutes
-            .map(|_| Arc::new(AtomicBool::new(false)));
+            .map(|_| Arc::new(Activity::new(&server.allowed_ips)));
         let tun = ClientTun {
             tun,
             traffic: traffic.clone(),
@@ -247,9 +244,7 @@ impl Client {
     }
 
     pub fn take_traffic(&self) -> bool {
-        self.traffic
-            .as_ref()
-            .is_some_and(|traffic| traffic.swap(false, Ordering::Relaxed))
+        self.traffic.as_ref().is_some_and(|traffic| traffic.take())
     }
 
     pub async fn set_keepalive(&self, seconds: u16) -> Result<()> {
