@@ -174,8 +174,12 @@ unit directory, runtime sockets and systemctl in private mount namespaces.
 The daemon cases connect the first issued peer to the server and a LAN host
 on public, UPnP, NAT1, port-preserving and likely networks. The native cases
 use the generated wg-quick files with an independently configured A record
-and UDP forward. The service case exercises the installer with a systemctl
-stand-in that starts the installed server binary. The CLI case drives the
+and UDP forward. The native public default verifies that the physical uplink
+still carries WireGuard's endpoint. The service tests use a systemctl stand-in
+to start the installed binary and reload changed keys and ports with the
+command printed by init. The CLI case drives the
 wizard on a PTY, including its hidden token prompt and interruption. Negative
 cases check unsupported and inconclusive verdicts, a busy port, missing
-inputs, file collisions and key recovery after an initial TXT lookup fails.
+inputs, file collisions and first-peer key recovery after a missing or stale TXT
+answer. The CLI test runs the printed detect command with a nondefault port
+and the same private STUN servers.

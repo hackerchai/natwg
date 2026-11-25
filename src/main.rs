@@ -256,7 +256,11 @@ enum ServiceAction {
     /// natwg copies itself to /usr/local/libexec/natwg/natwg, and the service
     /// runs that copy. A part that is in place already stays, so a second
     /// run with nothing changed keeps the running server.
-    Install,
+    Install {
+        /// Restart an already running service so it reads the configuration from disk.
+        #[arg(long)]
+        reload_config: bool,
+    },
     /// Stop the service of --config, or of --instance, and remove it.
     ///
     /// The definition and the status file go. The binary and the config
@@ -860,7 +864,12 @@ fn peer_action(input: &Path, action: PeerAction) -> Result<()> {
 
 fn service_action(config: &Path, action: ServiceAction) -> Result<()> {
     let report = match action {
-        ServiceAction::Install => service::install(config)?,
+        ServiceAction::Install {
+            reload_config: true,
+        } => service::install_new_config(config)?,
+        ServiceAction::Install {
+            reload_config: false,
+        } => service::install(config)?,
         ServiceAction::Uninstall {
             instance: Some(instance),
             ..

@@ -207,7 +207,8 @@ Run `sudo natwg init` on the server. The wizard tests the uplink and listen
 port, then asks for the tunnel address, LANs, Cloudflare zone and record, and
 the API token with echo disabled. Use a token with Zone Read and DNS Edit
 permissions for that zone. The default listen port is 51830, the tunnel address
-is `10.66.66.1/24`, and the default LAN is the uplink's IPv4 subnet. Supply
+is `10.66.66.1/24`, and the default LAN is the uplink's IPv4 subnet when it excludes the public endpoint.
+On a directly public uplink, the default routes only the tunnel. Supply
 `--lan` for each network, or `--no-lan` for the tunnel alone.
 
 For example, this creates a server and saves the first device's private config
@@ -232,13 +233,17 @@ Put the token on a single line. The interactive service prompt defaults to no. P
 Init creates fresh server and doctor keys in the validated, root-owned config
 (mode 0600). `--config PATH` changes its destination. Existing files require
 `--force`, which replaces the keys and peer list. Back up profiles before
-reinitializing a server that has devices enrolled.
+reinitializing a server that has devices enrolled. When you defer service installation
+after `--force`, the printed `service install --reload-config` command starts a
+missing service or restarts an existing one with the new keys and port.
 
 Use `--peer NAME --format natwg|wg-quick|surge|clash` for a first device.
 `--out PATH` writes its profile with mode 0600. Without it, stdout carries
 only the private profile and stderr carries the wizard and verdict. Use
 `umask 077` before redirecting stdout. The first native-format export on a TXT
-server needs a published DNS answer. If DNS, service startup or delivery fails
+server requires the TXT answer to match the mapping seen on the selected port.
+When init starts the daemon, it waits for the answer to match its published endpoint.
+If DNS, service startup or delivery fails
 after enrollment, init prints the path to the peer's private JSON. Start the
 server, wait for its TXT record, then run the printed `config export` command.
 Move the recovery file to its device or remove it after successful delivery.
