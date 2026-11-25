@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/hackerchai/natwg/compare/v0.2.0...v0.3.0) (2026-11-25)
+
+
+### Features
+
+* add natwg config set for the subnet, the LANs and the routes
+* choose the tunnel subnet and any number of LANs, with natwg config set
+* let a server serve any number of LANs
+* self-update from the R2 download site with GitHub Releases fallback
+* self-update from the R2 download site with GitHub Releases fallback
+
+
+### Bug Fixes
+
+* keep addresses in place when the new subnet overlaps the old one
+* **update:** review findings on self-update
+
 ## [0.2.0](https://github.com/hackerchai/natwg/compare/v0.1.0...v0.2.0) (2026-11-24)
 
 
