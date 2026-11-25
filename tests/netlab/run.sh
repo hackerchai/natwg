@@ -108,11 +108,14 @@ servers() {
 	esac
 }
 
-# Stop what an earlier `up` left running and remove its work directory.
+# Stop what an earlier `up` or e2e.sh left running and remove its work
+# directory.
 down() {
 	local old
 	teardown
-	pkill -f "$LAB/(stun_server|igd|rogue)\.py" 2>/dev/null || true
+	pkill -f "$LAB/(stun_server|igd|rogue|cloudflare)\.py" 2>/dev/null || true
+	# natwg servers and clients that e2e.sh started from a work directory.
+	pkill -f -- "--config ${TMPDIR:-/tmp}/$P\." 2>/dev/null || true
 	if [ -f "$STATE" ]; then
 		old=$(cat "$STATE")
 		case $old in
@@ -128,10 +131,11 @@ teardown() {
 		kill "$pid" 2>/dev/null || true
 	done
 	PIDS=()
-	for name in "${NAMESPACES[@]}"; do
-		if ip netns list | grep -qw "$P-$name"; then
-			ip netns del "$P-$name"
-		fi
+	# Every namespace of the lab, with the ones e2e.sh adds.
+	for name in $(ip netns list | awk '{print $1}'); do
+		case $name in
+		"$P"-*) ip netns del "$name" ;;
+		esac
 	done
 }
 
@@ -507,4 +511,7 @@ main() {
 	run_tests "$@"
 }
 
-main "$@"
+# e2e.sh sources this file for its functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	main "$@"
+fi

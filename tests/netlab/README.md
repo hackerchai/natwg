@@ -81,11 +81,47 @@ routers of `public-forward`, `nat1`, `likely`, `ignores-change` and the UPnP
 scenarios hairpin: a datagram from the LAN to the router's public address
 comes back to the LAN from the router, so natwg's self test gets in.
 
+## Public mode end to end
+
+`e2e.sh` runs a real natwg server and a real natwg client in the lab, as
+root, with publish `a`:
+
+```sh
+cargo build
+sudo NATWG=target/debug/natwg tests/netlab/e2e.sh          # every scenario
+sudo NATWG=target/debug/natwg tests/netlab/e2e.sh upnp     # some of them
+tests/netlab/e2e.sh list
+```
+
+- `cloudflare.py`, on the internet, is a fake Cloudflare API on
+  `http://45.78.0.80/client/v4`, which natwg calls through
+  `NATWG_CLOUDFLARE_API`, and the authoritative DNS server of its zone on
+  45.78.0.53, which answers what the API holds. It logs every write and every
+  DNS answer.
+- The server runs in `nwl-host` and keeps the A record `home.example.net`.
+  `natwg peer add` writes the client's config, which must name the server as
+  `home.example.net:51830`. The client runs in `nwl-peer` with 45.78.0.53 as
+  its only resolver.
+- `conntrack.py` flushes a router's conntrack table after its WAN address
+  changes, as a reconnect does.
+
+| Scenario | The network | What must happen |
+|---|---|---|
+| `public` | the host owns 45.77.0.10, with no STUN; a LAN host, 10.88.0.2, shares the host's link through a bridge on the internet side that the internet does not route | A record 45.77.0.10 by `address`; a handshake; pings to 10.66.66.1 and 10.88.0.2. The host moves to 45.77.0.11: the record and the client follow, and the pings pass again. |
+| `upnp` | `masquerade` and the UPnP gateway; the router owns 45.77.0.2 | A record 45.77.0.2 by `upnp`: the lease works, GetExternalIPAddress agrees with STUN, and the port is kept. A handshake; pings to 10.66.66.1 and the router, 192.168.77.1, on the LAN. The router reconnects as 45.77.0.3 with an empty UPnP table: the record and the client follow. |
+| `public-forward` | the router forwards udp/51830 and keeps the port, without UPnP | No write: the record keeps 45.77.0.99, and `natwg status` exits 1 with `no public IP` and says natwg cannot confirm a router. |
+| `nat1` | NAT1 maps udp/51830 to :52830 | No write, as above: the port is not kept. |
+
+`e2e.sh` exits 1 when a check fails, prints the logs, and prints a Markdown
+table of the results. A run takes a few minutes, most of it waiting for the
+client's lookup, which comes every 60 s.
+
 ## Reuse it
 
 `run.sh up SCENARIO` builds one scenario and leaves it running, with its
-logs in a work directory it names. `run.sh down` stops its processes, removes
-its namespaces and that directory. In between, run anything in a namespace:
+logs in a work directory it names. `run.sh down` stops its processes, and
+the natwg daemons and fake API of an interrupted `e2e.sh`, removes every
+`nwl-` namespace and that directory. In between, run anything in a namespace:
 
 ```sh
 sudo tests/netlab/run.sh up nat1
