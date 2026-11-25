@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/hackerchai/natwg/compare/v0.2.0...v0.3.0) (2026-11-25)
+
+
+### Features
+
+* add natwg config set for the subnet, the LANs and the routes ([45359ad](https://github.com/hackerchai/natwg/commit/45359ad45767ec61b457555cff2c2e47abf48c0e))
+* choose the tunnel subnet and any number of LANs, with natwg config set ([4bdef97](https://github.com/hackerchai/natwg/commit/4bdef977ee14b7f105d4ecb45e72e049497aa426))
+* let a server serve any number of LANs ([cb40813](https://github.com/hackerchai/natwg/commit/cb40813b87a89f5b249de5718cc4eb0acec4757f))
+* self-update from the R2 download site with GitHub Releases fallback ([a82937b](https://github.com/hackerchai/natwg/commit/a82937b3f452ceb31acf61cb8107a74c141e4d65))
+* self-update from the R2 download site with GitHub Releases fallback ([8ba41cd](https://github.com/hackerchai/natwg/commit/8ba41cdf7da567e8afe3c06daaa164636def46db))
+
+
+### Bug Fixes
+
+* keep addresses in place when the new subnet overlaps the old one ([916f316](https://github.com/hackerchai/natwg/commit/916f3166e85a759dfa6bcaf3f4c62d2ad0a33bc3))
+* **update:** review findings on self-update ([290c4c2](https://github.com/hackerchai/natwg/commit/290c4c21e415985b94aa3d3cf6255e284a937106))
+
 ## [0.2.0](https://github.com/hackerchai/natwg/compare/v0.1.0...v0.2.0) (2026-11-24)
 
 
