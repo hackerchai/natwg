@@ -1,5 +1,5 @@
-//! Source NAT from the tunnel subnet onto the LAN, so LAN hosts answer tunnel
-//! peers without a route back to the tunnel.
+//! Source NAT from the tunnel subnet onto each LAN, so LAN hosts answer
+//! tunnel peers without a route back to the tunnel.
 
 pub mod nft;
 pub mod pf;
@@ -9,24 +9,34 @@ use crate::netcfg::{Step, Teardown, apply, read};
 use crate::{Error, Result};
 use ipnetwork::Ipv4Network;
 
-/// The one NAT rule of an instance. Traffic from `tunnel` to `lan` leaves
-/// through `iface` with the address of `iface`.
+/// The NAT rule of an instance. Traffic from `tunnel` to each of `lans`
+/// leaves through `iface` with the address of `iface`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     instance: Instance,
     iface: String,
     tunnel: Ipv4Network,
-    lan: Ipv4Network,
+    lans: Vec<Ipv4Network>,
 }
 
 impl Rule {
-    pub fn new(instance: &Instance, iface: &str, tunnel: Ipv4Network, lan: Ipv4Network) -> Self {
-        Self {
+    /// The rule for `lans`, or none when there is no LAN, because a server
+    /// without a LAN serves the tunnel only.
+    pub fn new(
+        instance: &Instance,
+        iface: &str,
+        tunnel: Ipv4Network,
+        lans: &[Ipv4Network],
+    ) -> Option<Self> {
+        if lans.is_empty() {
+            return None;
+        }
+        Some(Self {
             instance: instance.clone(),
             iface: iface.to_owned(),
             tunnel,
-            lan,
-        }
+            lans: lans.to_vec(),
+        })
     }
 
     /// Refuse an anchor or a table that holds a rule of someone else. Loading
