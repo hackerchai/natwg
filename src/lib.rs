@@ -9,6 +9,7 @@ pub mod server;
 pub mod service;
 pub mod status;
 pub mod tunnel;
+pub mod update;
 pub mod wire;
 
 #[derive(Debug)]

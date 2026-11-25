@@ -26,7 +26,28 @@ pub fn name(instance: &Instance) -> String {
 }
 
 pub fn definition_path(instance: &Instance) -> PathBuf {
-    Path::new(DAEMONS).join(format!("{}.plist", name(instance)))
+    definition_of(&name(instance))
+}
+
+/// The plist of the job `name`.
+pub fn definition_of(name: &str) -> PathBuf {
+    Path::new(DAEMONS).join(format!("{name}.plist"))
+}
+
+/// The config that a plist of [`definition`] passes to `natwg daemon`.
+pub fn config_of(plist: &str) -> Option<PathBuf> {
+    let arguments = plist
+        .split_once("<key>ProgramArguments</key>")?
+        .1
+        .split_once("</array>")?
+        .0;
+    let words: Vec<String> = arguments
+        .split("<string>")
+        .skip(1)
+        .map(|word| Some(unxml(word.split_once("</string>")?.0)))
+        .collect::<Option<_>>()?;
+    let at = words.iter().position(|word| word == "--config")?;
+    words.get(at + 1).map(PathBuf::from)
 }
 
 /// The directory of the logs, which launchd opens as root.
@@ -79,6 +100,13 @@ fn xml(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn unxml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn target(name: &str) -> String {

@@ -10,6 +10,8 @@ fn fixture(updated: u64) -> Status {
     Status {
         updated,
         pid: 4242,
+        version: Some("0.2.0".into()),
+        latest_version: None,
         iface: "en6".into(),
         listen_port: 51831,
         tun: Some("utun12".into()),
@@ -40,6 +42,8 @@ fn the_status_file_has_the_documented_fields() {
     let expected = json!({
         "updated": 1_000_000,
         "pid": 4242,
+        "version": "0.2.0",
+        "latest_version": null,
         "iface": "en6",
         "listen_port": 51831,
         "tun": "utun12",
@@ -150,6 +154,58 @@ fn natwg_status_prints_the_status_file_for_people() {
     ] {
         assert!(text.contains(line), "{line:?} is missing from\n{text}");
     }
+}
+
+#[test]
+fn natwg_status_names_a_newer_release_that_the_daemon_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let notice = "Update available: 0.2.0 → 0.3.1. Run sudo natwg update.";
+    let mut server = fixture(now());
+    server.latest_version = Some("0.3.1".into());
+    server.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "an update is no problem: {output:?}"
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.trim_end().ends_with(notice), "{text}");
+    let output = natwg_status(&["--json", "--status-file", path.to_str().unwrap()]);
+    let printed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(printed["latest_version"], "0.3.1");
+
+    let mut client = client_fixture(now());
+    client.latest_version = Some("0.3.1".into());
+    assert_eq!(
+        Report::Client(client.clone()).update_notice().as_deref(),
+        Some(notice)
+    );
+    // Nothing for the release the daemon runs, an older one or none.
+    for latest in [Some("0.2.0"), Some("0.1.9"), None] {
+        client.latest_version = latest.map(str::to_owned);
+        assert_eq!(Report::Client(client.clone()).update_notice(), None);
+        server.latest_version = latest.map(str::to_owned);
+        server.write(&path).unwrap();
+        let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("Update available"), "{text}");
+    }
+}
+
+#[test]
+fn a_status_without_versions_still_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let mut value = serde_json::to_value(fixture(1_000_000)).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("version");
+    object.remove("latest_version");
+    std::fs::write(&path, value.to_string()).unwrap();
+    let Report::Server(status) = Report::read(&path).unwrap() else {
+        panic!("a server status");
+    };
+    assert_eq!((status.version, status.latest_version), (None, None));
 }
 
 #[test]
@@ -272,6 +328,8 @@ fn client_fixture(updated: u64) -> ClientStatus {
         role: ClientRole::Client,
         updated,
         pid: 4343,
+        version: Some("0.2.0".into()),
+        latest_version: None,
         uplink: Some("en0".into()),
         uplink_address: Some("10.16.0.105".parse().unwrap()),
         tun: Some("utun13".into()),

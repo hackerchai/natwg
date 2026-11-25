@@ -425,6 +425,8 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
             role: ClientRole::Client,
             updated: status::unix(now),
             pid: std::process::id(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            latest_version: crate::update::latest(),
             uplink: uplink.map(|uplink| uplink.iface.to_string()),
             uplink_address: uplink.and_then(|uplink| uplink.address),
             tun: tun.map(str::to_owned),

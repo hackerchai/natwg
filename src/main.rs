@@ -14,7 +14,7 @@ use natwg::tunnel::{self, Tunnel};
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
-use natwg::{Error, Result, doctor, keys::Key, peer, service};
+use natwg::{Error, Result, doctor, keys::Key, peer, service, update};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
@@ -121,6 +121,35 @@ enum Action {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+    /// Install the newest natwg release and restart the natwg services.
+    ///
+    /// natwg downloads the release archive of this platform from the
+    /// download site, or from the GitHub Releases of hackerchai/natwg when
+    /// the site fails, and checks it against the release's manifest. It
+    /// replaces the service binary /usr/local/libexec/natwg/natwg and this
+    /// natwg, each with its owner and mode, and keeps the file it replaced
+    /// beside it as .natwg.previous. Then it restarts each natwg service
+    /// that runs, and waits until it serves again; when one does not, natwg
+    /// puts the previous binaries back and restarts the services again. A
+    /// stopped service stays stopped. An older service binary is brought to
+    /// the latest release even when this natwg is up to date. Nothing is
+    /// downgraded.
+    ///
+    /// The GitHub repository is private, so its releases need GH_TOKEN or
+    /// `gh auth login`. The `update` object of --config, when natwg can
+    /// read it, sets `url` and `repository`.
+    Update {
+        /// Only print the installed and the latest versions. Needs no root.
+        #[arg(long)]
+        check: bool,
+        /// The download site, an exact https:// origin with the same layout
+        /// (default: https://natwg-dl.hackerchai.com).
+        #[arg(long, value_name = "ORIGIN", env = "NATWG_UPDATE_URL")]
+        download_url: Option<String>,
+        /// Use the GitHub Releases of this repository alone.
+        #[arg(long, value_name = "OWNER/REPO", env = "NATWG_UPDATE_REPOSITORY")]
+        repository: Option<String>,
     },
     /// Run the server or the client of --config for a service manager, as
     /// `server --foreground` and `client --foreground` do.
@@ -438,6 +467,9 @@ fn run(cli: Cli) -> Result<()> {
                 );
             } else {
                 say!("{}", status.render(now).trim_end());
+                if let Some(notice) = status.update_notice() {
+                    say!("{notice}");
+                }
             }
             let problems = status.problems(now);
             if !problems.is_empty() {
@@ -453,6 +485,20 @@ fn run(cli: Cli) -> Result<()> {
                 },
         } => doctor_loopback(&cli.config, iface.as_deref(), endpoint, attempts)?,
         Action::Service { action } => service_action(&cli.config, action)?,
+        Action::Update {
+            check,
+            download_url,
+            repository,
+        } => {
+            // Root reads a root config; a check without root goes without.
+            let config = Config::load(&cli.config).ok().and_then(|c| c.update);
+            let config = config.unwrap_or_default();
+            update::run(&update::Request {
+                check,
+                site: download_url.or(config.url).as_deref(),
+                repository: repository.or(config.repository).as_deref(),
+            })?;
+        }
     }
     Ok(())
 }
@@ -674,6 +720,8 @@ fn daemon(config: &Path, want: Option<Want>) -> Result<()> {
         .log_internal_errors(false)
         .init();
     runtime(tokio::runtime::Builder::new_multi_thread())?.block_on(async {
+        // In the background, and never in the way of the tunnel.
+        update::spawn_checks(config.update.as_ref());
         let mut stop = Stop::listen()?;
         let stop = async move { stop.requested().await };
         match &config.role {
