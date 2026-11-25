@@ -7,15 +7,21 @@ nftables, as a home router does:
         --table nwl --log /tmp/igd.log
 
 - SSDP: answers M-SEARCH for an InternetGatewayDevice on 239.255.255.250:1900
-  with LOCATION http://LAN_IP:5000/igd.xml.
+  with LOCATION http://LAN_IP:5000/igd.xml. --no-ssdp leaves it out.
 - HTTP on LAN_IP:5000: the device description, and SOAP on /ctl for
   GetExternalIPAddress, GetSpecificPortMappingEntry, AddPortMapping and
   DeletePortMapping of WANIPConnection:1.
-- Each mapping is a DNAT rule in chain `upnp_pre` and a port-keeping SNAT rule
-  in chain `upnp_post` of `ip TABLE`; both chains are rebuilt on each change.
+- With --table, each mapping is a DNAT rule in chain `upnp_pre` and a
+  port-keeping SNAT rule in chain `upnp_post` of `ip TABLE`; both chains are
+  rebuilt on each change. Without it, nothing is forwarded.
+- A lease with a duration ends after it, as the standard says.
+- --permanent-only refuses a lease with a duration with error 725
+  (OnlyPermanentLeasesSupported), as some routers do.
+- --preset PORT:CLIENT holds a mapping from the start, made by someone else.
 
-Every SOAP call is appended to the log as "ACTION port" and the mappings left
-as "MAPPINGS n".
+Every SOAP call is appended to the log as "ACTION port" (AddPortMapping adds
+"lease=N" and, when refused, "refused=CODE"), each change as "MAPPINGS n",
+and each lease that ends as "EXPIRED port".
 """
 
 import argparse
@@ -84,8 +90,13 @@ def field(body, name):
 class Gateway:
     def __init__(self, args):
         self.args = args
-        self.mappings = {}  # external port -> (client, internal port, description)
+        # external port -> (client, internal port, description, lease seconds, generation)
+        self.mappings = {}
+        self.generation = 0
         self.lock = threading.Lock()
+        for preset in args.preset:
+            port, client = preset.split(":")
+            self.mappings[int(port)] = (client, int(port), "someone else", 0, 0)
 
     def log(self, line):
         with open(self.args.log, "a") as log:
@@ -93,8 +104,10 @@ class Gateway:
 
     def apply(self):
         table = self.args.table
+        if not table:
+            return
         commands = ["flush chain ip %s upnp_pre" % table, "flush chain ip %s upnp_post" % table]
-        for port, (client, internal, _) in sorted(self.mappings.items()):
+        for port, (client, internal, _, _, _) in sorted(self.mappings.items()):
             commands.append(
                 "add rule ip %s upnp_pre ip daddr %s udp dport %d dnat to %s:%d"
                 % (table, self.args.wan_ip, port, client, internal)
@@ -105,42 +118,67 @@ class Gateway:
             )
         subprocess.run(["nft", "-f", "-"], input="\n".join(commands) + "\n", text=True, check=True)
 
+    def changed(self):
+        self.apply()
+        self.log("MAPPINGS %d" % len(self.mappings))
+
+    def expire(self, port, generation):
+        with self.lock:
+            if self.mappings.get(port, (None,) * 5)[4] == generation:
+                del self.mappings[port]
+                self.log("EXPIRED %d" % port)
+                self.changed()
+
     def call(self, action, body):
         port = int(field(body, "NewExternalPort") or 0)
         with self.lock:
-            self.log("%s %d" % (action, port))
             if action == "GetExternalIPAddress":
+                self.log(action)
                 return response(action, "<NewExternalIPAddress>%s</NewExternalIPAddress>" % self.args.wan_ip)
             if action == "GetSpecificPortMappingEntry":
+                self.log("%s %d" % (action, port))
                 if port not in self.mappings:
                     return fault(714, "NoSuchEntryInArray")
-                client, internal, description = self.mappings[port]
+                client, internal, description, lease, _ = self.mappings[port]
                 return response(
                     action,
                     "<NewInternalPort>%d</NewInternalPort><NewInternalClient>%s</NewInternalClient>"
                     "<NewEnabled>1</NewEnabled><NewPortMappingDescription>%s</NewPortMappingDescription>"
-                    "<NewLeaseDuration>0</NewLeaseDuration>" % (internal, client, description),
+                    "<NewLeaseDuration>%d</NewLeaseDuration>" % (internal, client, description, lease),
                 )
             if action == "AddPortMapping":
+                lease = int(field(body, "NewLeaseDuration") or 0)
+                line = "%s %d lease=%d" % (action, port, lease)
+                if self.args.permanent_only and lease != 0:
+                    self.log(line + " refused=725")
+                    return fault(725, "OnlyPermanentLeasesSupported")
                 client = field(body, "NewInternalClient")
                 existing = self.mappings.get(port)
                 if existing and existing[0] != client:
+                    self.log(line + " refused=718")
                     return fault(718, "ConflictInMappingEntry")
+                self.log(line)
+                self.generation += 1
                 internal = int(field(body, "NewInternalPort"))
-                self.mappings[port] = (client, internal, field(body, "NewPortMappingDescription"))
-                self.apply()
-                self.log("MAPPINGS %d" % len(self.mappings))
+                description = field(body, "NewPortMappingDescription")
+                self.mappings[port] = (client, internal, description, lease, self.generation)
+                if lease:
+                    timer = threading.Timer(lease, self.expire, (port, self.generation))
+                    timer.daemon = True
+                    timer.start()
+                self.changed()
                 return response(action)
             if action == "DeletePortMapping":
+                self.log("%s %d" % (action, port))
                 if self.mappings.pop(port, None) is None:
                     return fault(714, "NoSuchEntryInArray")
-                self.apply()
-                self.log("MAPPINGS %d" % len(self.mappings))
+                self.changed()
                 return response(action)
+            self.log(action)
             return fault(401, "Invalid Action")
 
 
-def serve_http(gateway):
+def serve_http(gateway, ip):
     class Handler(http.server.BaseHTTPRequestHandler):
         def reply(self, status, text):
             data = text.encode()
@@ -151,6 +189,7 @@ def serve_http(gateway):
             self.wfile.write(data)
 
         def do_GET(self):
+            gateway.log("GET %s" % self.path)
             if self.path == "/igd.xml":
                 self.reply(200, DESCRIPTION)
             else:
@@ -165,7 +204,7 @@ def serve_http(gateway):
         def log_message(self, *_):
             pass
 
-    server = http.server.ThreadingHTTPServer((gateway.args.lan_ip, HTTP_PORT), Handler)
+    server = http.server.ThreadingHTTPServer((ip, HTTP_PORT), Handler)
     server.serve_forever()
 
 
@@ -191,15 +230,24 @@ def serve_ssdp(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--lan-ip", required=True)
-    parser.add_argument("--wan-ip", required=True)
-    parser.add_argument("--wan-if", required=True)
-    parser.add_argument("--table", required=True)
+    parser.add_argument("--lan-ip", required=True, help="where HTTP listens and SSDP joins")
+    parser.add_argument("--wan-ip", default="0.0.0.0")
+    parser.add_argument("--wan-if", default="")
+    parser.add_argument("--table", default="", help="the nft table to forward leases in")
     parser.add_argument("--log", required=True)
+    parser.add_argument("--no-ssdp", action="store_true")
+    parser.add_argument("--permanent-only", action="store_true")
+    parser.add_argument("--preset", action="append", default=[], metavar="PORT:CLIENT")
     args = parser.parse_args()
     gateway = Gateway(args)
     gateway.apply()
-    threading.Thread(target=serve_http, args=(gateway,), daemon=True).start()
+    if gateway.mappings:
+        gateway.log("MAPPINGS %d" % len(gateway.mappings))
+    if args.no_ssdp:
+        print("IGD on %s:%d" % (args.lan_ip, HTTP_PORT), file=sys.stderr, flush=True)
+        serve_http(gateway, args.lan_ip)
+        return
+    threading.Thread(target=serve_http, args=(gateway, args.lan_ip), daemon=True).start()
     print("IGD on %s:%d" % (args.lan_ip, HTTP_PORT), file=sys.stderr, flush=True)
     serve_ssdp(args)
 

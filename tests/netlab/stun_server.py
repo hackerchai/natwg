@@ -11,6 +11,9 @@ without OTHER-ADDRESS and ignores CHANGE-REQUEST:
 
     stun_server.py --plain 45.78.0.3 --plain 45.78.0.4 --port 3478
 
+--ignore-change keeps OTHER-ADDRESS in RFC 5780 answers but answers every
+request from where it was asked, as some public servers do.
+
 Every request is logged to stderr as one line.
 """
 
@@ -75,6 +78,7 @@ def main():
     parser.add_argument("--plain", action="append", default=[], metavar="IP")
     parser.add_argument("--port", type=int, default=3478)
     parser.add_argument("--alt-port", type=int, default=3479)
+    parser.add_argument("--ignore-change", action="store_true")
     args = parser.parse_args()
 
     sockets = {}
@@ -100,7 +104,7 @@ def main():
                 continue
             if args.rfc5780 and here[0] in args.rfc5780:
                 primary, alternate = args.rfc5780
-                flags = change_flags(request)
+                flags = 0 if args.ignore_change else change_flags(request)
                 ip = here[0]
                 if flags & CHANGE_IP:
                     ip = alternate if ip == primary else primary
