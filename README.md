@@ -86,8 +86,27 @@ the networks behind `role.server.iface` that clients reach:
 - natwg 0.2 wrote one LAN as a string (`"lan": "10.73.0.0/24"`). That form
   still loads, and natwg writes the list form from then on.
 
-A client routes only its own `allowed_ips`, so give each client the tunnel
-subnet and every LAN.
+`natwg config set` changes these settings in `--config`. It validates the
+result, replaces the file in one step, readable only by its owner, and prints
+what changed. `--dry-run` prints the redacted result and writes nothing.
+
+```sh
+sudo natwg config set lan 10.73.0.0/24 192.168.50.0/24   # server; no network clears the list
+sudo natwg config set address 10.66.70.1/24              # server or client
+sudo natwg config set allowed-ips 10.66.70.0/24 10.73.0.0/24 192.168.50.0/24   # client
+sudo natwg service restart                               # load the change
+```
+
+A server that moves to another subnet moves its peers and its doctor along.
+Each keeps its host offset, so 10.66.66.2 becomes 10.66.70.2, and natwg prints
+each old and new address. natwg refuses the move and writes nothing when one
+of them does not fit in the new subnet or would land on the server's new
+address. Each moved client must then take its new address and route the new
+subnet: on the client, run `natwg config set address 10.66.70.2/32` and
+`natwg config set allowed-ips` with the new subnet and the LANs.
+
+A client routes only its own `allowed_ips`. After `config set lan` on the
+server, give each client the new set with `config set allowed-ips`.
 
 ## Run the client
 

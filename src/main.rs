@@ -4,7 +4,9 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use clap::{Args, Parser, Subcommand};
+use ipnetwork::Ipv4Network;
 use natwg::client::{self, uplink};
+use natwg::config::set::{self, Setting};
 use natwg::config::{Config, Instance, Role};
 use natwg::server::{self, cloudflare};
 use natwg::status::{self, Report, Status};
@@ -55,7 +57,7 @@ enum Action {
         #[command(subcommand)]
         action: KeysAction,
     },
-    /// Show the configuration, or import a wg-quick client config.
+    /// Show or change the configuration, or import a wg-quick client config.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -185,8 +187,8 @@ enum ServiceAction {
 
 #[derive(Subcommand)]
 enum DoctorAction {
-    /// Ping the server's tunnel address and the first host of its LAN through
-    /// a WireGuard client inside this process. The client uses the doctor key
+    /// Ping the server's tunnel address and the first host of its first LAN,
+    /// if it has one, through a WireGuard client inside this process. The client uses the doctor key
     /// of the server config. A reply time is that of the first echo that got
     /// an answer, so it includes the WireGuard handshake.
     Loopback {
@@ -250,6 +252,50 @@ enum ConfigAction {
         /// Replace a doctor that the config has already.
         #[arg(long)]
         force: bool,
+    },
+    /// Change one setting of --config in place.
+    ///
+    /// natwg validates the result, then replaces --config in one step,
+    /// readable only by its owner. Restart the service to load the change:
+    /// sudo natwg service restart.
+    Set {
+        #[command(subcommand)]
+        setting: SetAction,
+        /// Print the redacted result without writing it.
+        #[arg(long, global = true)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SetAction {
+    /// The tunnel address of this host, whose prefix sets the tunnel subnet
+    /// (interface.address): 10.66.66.1/24 on a server, 10.66.66.2/32 on a
+    /// client.
+    ///
+    /// A server that moves to another subnet moves its peers and its doctor
+    /// along, each at the same host offset. It refuses when one of them does
+    /// not fit in the new subnet or would land on the new server address.
+    /// Each moved client must then take its new address and route the new
+    /// subnet.
+    Address {
+        #[arg(value_name = "ADDR/PREFIX")]
+        address: Ipv4Network,
+    },
+    /// The LAN networks of a server (role.server.lan). The server NATs its
+    /// clients into each of them out of role.server.iface. With none, it
+    /// serves the tunnel only.
+    ///
+    /// Clients route only their own allowed_ips, so give each the new set.
+    Lan {
+        #[arg(value_name = "CIDR")]
+        lans: Vec<Ipv4Network>,
+    },
+    /// The networks a client routes into the tunnel (peers[0].allowed_ips),
+    /// such as the tunnel subnet and the LANs of the server.
+    AllowedIps {
+        #[arg(value_name = "CIDR", required = true)]
+        networks: Vec<Ipv4Network>,
     },
 }
 
@@ -374,6 +420,9 @@ fn run(cli: Cli) -> Result<()> {
                 cli.config.display()
             );
         }
+        Action::Config {
+            action: ConfigAction::Set { setting, dry_run },
+        } => config_set(&cli.config, setting, dry_run)?,
         Action::Probe { action } => probe(action)?,
         Action::Server { foreground: _ } => daemon(&cli.config, Some(Want::Server))?,
         Action::Client { foreground: _ } => daemon(&cli.config, Some(Want::Client))?,
@@ -404,6 +453,50 @@ fn run(cli: Cli) -> Result<()> {
                 },
         } => doctor_loopback(&cli.config, iface.as_deref(), endpoint, attempts)?,
         Action::Service { action } => service_action(&cli.config, action)?,
+    }
+    Ok(())
+}
+
+fn config_set(path: &Path, action: SetAction, dry_run: bool) -> Result<()> {
+    let setting = match action {
+        SetAction::Address { address } => Setting::Address(address),
+        SetAction::Lan { lans } => Setting::Lan(lans),
+        SetAction::AllowedIps { networks } => Setting::AllowedIps(networks),
+    };
+    let mut config = Config::load(path)?;
+    let change = set::apply(&mut config, &setting)?;
+    if dry_run {
+        say!("{}", config.redacted());
+    }
+    if change.changed.is_empty() {
+        warn!(
+            "{} has this {} already; nothing to write",
+            path.display(),
+            setting.key()
+        );
+        return Ok(());
+    }
+    if !dry_run {
+        config.save(path)?;
+    }
+    for line in &change.changed {
+        // Under --dry-run, stdout holds only the redacted config.
+        if dry_run {
+            warn!("{line}");
+        } else {
+            say!("{line}");
+        }
+    }
+    for note in &change.notes {
+        warn!("{note}");
+    }
+    if dry_run {
+        warn!("Dry run: {} stays as it was", path.display());
+    } else {
+        warn!(
+            "Wrote {}; run sudo natwg service restart to load it",
+            path.display()
+        );
     }
     Ok(())
 }
