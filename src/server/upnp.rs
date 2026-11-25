@@ -28,6 +28,8 @@ const TIMEOUT: Duration = Duration::from_secs(6);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub ok: bool,
+    /// When the renewal began, so a renewal asked for at some time answers
+    /// for that time or later.
     pub at: SystemTime,
     /// The address the gateway holds on its WAN side, which a server with
     /// publish `a` asks after each renewal that worked. None when it was not
@@ -113,6 +115,7 @@ impl Upnp {
                 _ = tick.tick() => {}
                 () = recheck.notified() => tick.reset(),
             }
+            let at = SystemTime::now();
             let renewed = self.renew().await;
             let external_ip = match (&renewed, self.external) {
                 (Ok(_), true) => match self.external_ip().await {
@@ -131,7 +134,7 @@ impl Upnp {
             };
             let lease = Lease {
                 ok: renewed.is_ok(),
-                at: SystemTime::now(),
+                at,
                 external_ip,
             };
             let before = state.send_replace(Some(lease));

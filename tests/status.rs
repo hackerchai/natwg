@@ -31,6 +31,7 @@ fn fixture(updated: u64) -> Status {
         public_ip: None,
         public_by: None,
         public_error: None,
+        record_problem: None,
         upnp_ok: Some(true),
         upnp_at: Some(updated - 100),
         nat_ok: Some(true),
@@ -70,6 +71,7 @@ fn the_status_file_has_the_documented_fields() {
         "public_ip": null,
         "public_by": null,
         "public_error": null,
+        "record_problem": null,
         "upnp_ok": true,
         "upnp_at": 999_900,
         "nat_ok": true,
@@ -238,6 +240,7 @@ fn a_status_of_natwg_0_3_0_reads_as_publish_txt_with_stun() {
         "public_ip",
         "public_by",
         "public_error",
+        "record_problem",
     ] {
         object.remove(field);
     }
@@ -523,6 +526,25 @@ fn the_client_human_view_shows_the_endpoint_handshake_and_traffic() {
     let text = status.render(now);
     assert!(text.contains("from config"), "{text}");
     assert!(text.contains("TXT lookup      : off"), "{text}");
+}
+
+#[test]
+fn other_records_on_the_name_are_a_problem_that_names_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let problem = "home.example.com also has A 45.77.0.99, AAAA 2001:db8::1; delete them in Cloudflare: natwg keeps one A record and is IPv4-only, and clients may dial the others";
+    let mut status = publish_a(now());
+    status.record_problem = Some(problem.into());
+    assert!(
+        status
+            .render(status.updated)
+            .contains(&format!("other records   : ERROR: {problem}\n"))
+    );
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.trim(), format!("SERVER_UNHEALTHY: {problem}"));
 }
 
 #[test]

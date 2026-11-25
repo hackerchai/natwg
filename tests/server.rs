@@ -1,5 +1,5 @@
 use natwg::Result;
-use natwg::config::{CloudflareConfig, Config, ServerConfig, StunConfig};
+use natwg::config::{CloudflareConfig, Config, PublishMode, ServerConfig, StunConfig};
 use natwg::detect::PublicBy;
 use natwg::keys::Key;
 use natwg::server::cloudflare::{self, Content, Publish, Publisher, Record};
@@ -400,7 +400,7 @@ async fn a_missing_record_is_created_with_the_body_natwg_py_sends() {
         );
     let (_mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
     let (state_tx, mut state) = watch::channel(Publish::Idle);
-    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let publisher = Publisher::new(&cloudflare_config(), PublishMode::Txt, &api.url).unwrap();
     let check = async {
         published(&mut state, "203.0.113.9:7007").await;
         let create = Request {
@@ -430,7 +430,7 @@ async fn an_existing_record_is_updated_and_a_value_already_published_is_skipped(
         );
     let (mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
     let (state_tx, mut state) = watch::channel(Publish::Idle);
-    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let publisher = Publisher::new(&cloudflare_config(), PublishMode::Txt, &api.url).unwrap();
     let check = async {
         let first = published(&mut state, "203.0.113.9:7007").await;
         assert_eq!(
@@ -469,7 +469,7 @@ async fn a_record_that_holds_the_mapping_already_is_published_without_a_write() 
         );
     let (mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
     let (state_tx, mut state) = watch::channel(Publish::Idle);
-    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let publisher = Publisher::new(&cloudflare_config(), PublishMode::Txt, &api.url).unwrap();
     let check = async {
         published(&mut state, "203.0.113.9:7007").await;
         assert_eq!(api.taken(), [get(ZONES), get(LOOKUP)]);
@@ -495,7 +495,7 @@ async fn an_api_error_is_reported_without_the_token_and_tried_again_after_60_s()
     });
     let (_mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
     let (state_tx, mut state) = watch::channel(Publish::Idle);
-    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let publisher = Publisher::new(&cloudflare_config(), PublishMode::Txt, &api.url).unwrap();
     let check = async {
         assert_eq!(api.requests.recv().await.unwrap(), get(ZONES));
         let (error, retry_at) = failed(&mut state).await;
@@ -526,7 +526,7 @@ async fn a_zone_the_token_cannot_see_is_an_error() {
     });
     let (_mapping_tx, mapping_rx) = watch::channel(mapping("203.0.113.9:7007"));
     let (state_tx, mut state) = watch::channel(Publish::Idle);
-    let publisher = Publisher::new(&cloudflare_config(), &api.url).unwrap();
+    let publisher = Publisher::new(&cloudflare_config(), PublishMode::Txt, &api.url).unwrap();
     let check = async {
         let (error, _) = failed(&mut state).await;
         assert_eq!(
@@ -541,7 +541,7 @@ async fn a_zone_the_token_cannot_see_is_an_error() {
     }
 }
 
-const A_LOOKUP: &str = "/client/v4/zones/zone1/dns_records?type=A&name=home.example.com";
+const A_LOOKUP: &str = "/client/v4/zones/zone1/dns_records?name=home.example.com";
 
 fn a_config() -> CloudflareConfig {
     CloudflareConfig {
@@ -575,6 +575,48 @@ fn a_write(method: &str, target: &str, ip: &str) -> Request {
     }
 }
 
+/// A record of home.example.com as the Cloudflare API lists it.
+fn listed(id: &str, kind: &str, content: &str, proxied: bool, ttl: u32) -> Value {
+    json!({"id": id, "type": kind, "name": "home.example.com", "content": content, "proxied": proxied, "ttl": ttl})
+}
+
+/// A fake API whose zone lists `records` for home.example.com, and that
+/// takes every write. A PUT fails while `failing` is above zero, which each
+/// PUT counts down.
+fn zone_with(records: Value, failing: u32) -> MockApi {
+    let failing = AtomicU32::new(failing);
+    MockApi::start(
+        move |request| match (request.method.as_str(), request.target.as_str()) {
+            ("GET", ZONES) => ok(json!([{"id": "zone1"}])),
+            ("GET", A_LOOKUP) => ok(records.clone()),
+            ("POST", RECORDS) => ok(json!({"id": "rec1"})),
+            ("PUT", target) if target.starts_with(RECORDS) => {
+                let left = failing.load(Ordering::SeqCst);
+                if left > 0 {
+                    failing.store(left - 1, Ordering::SeqCst);
+                    return (
+                        500,
+                        json!({"success": false, "errors": [{"code": 1, "message": "boom"}]}),
+                    );
+                }
+                ok(json!({"id": "rec1"}))
+            }
+            _ => unknown(),
+        },
+    )
+}
+
+fn writes(requests: Vec<Request>) -> Vec<Request> {
+    requests
+        .into_iter()
+        .filter(|request| request.method != "GET")
+        .collect()
+}
+
+fn a_publisher(api: &MockApi) -> Publisher {
+    Publisher::new(&a_config(), PublishMode::A, &api.url).unwrap()
+}
+
 async fn published_a(state: &mut watch::Receiver<Publish>, value: &str) -> Record {
     let value = Content::A(ip(value));
     let state = state
@@ -585,20 +627,11 @@ async fn published_a(state: &mut watch::Receiver<Publish>, value: &str) -> Recor
 }
 
 #[tokio::test]
-async fn an_a_record_is_created_with_the_ip_never_proxied_and_then_kept_current() {
-    let mut api =
-        MockApi::start(
-            |request| match (request.method.as_str(), request.target.as_str()) {
-                ("GET", ZONES) => ok(json!([{"id": "zone1"}])),
-                ("GET", A_LOOKUP) => ok(json!([])),
-                ("POST", RECORDS) => ok(json!({"id": "rec1"})),
-                ("PUT", RECORD) => ok(json!({"id": "rec1"})),
-                _ => unknown(),
-            },
-        );
+async fn an_a_record_is_created_never_proxied_with_natwgs_ttl_and_then_kept_current() {
+    let mut api = zone_with(json!([]), 0);
     let (wanted_tx, wanted) = watch::channel(Some(Content::A(ip("45.77.0.10"))));
     let (state_tx, mut state) = watch::channel(Publish::Idle);
-    let publisher = Publisher::new(&a_config(), &api.url).unwrap();
+    let publisher = a_publisher(&api);
     let check = async {
         published_a(&mut state, "45.77.0.10").await;
         assert_eq!(
@@ -629,21 +662,124 @@ async fn an_a_record_is_created_with_the_ip_never_proxied_and_then_kept_current(
 }
 
 #[tokio::test]
-async fn an_a_record_that_holds_the_ip_already_is_published_without_a_write() {
-    let mut api =
-        MockApi::start(
-            |request| match (request.method.as_str(), request.target.as_str()) {
-                ("GET", ZONES) => ok(json!([{"id": "zone1"}])),
-                ("GET", A_LOOKUP) => ok(json!([{"id": "rec1", "content": "45.77.0.10"}])),
-                _ => unknown(),
-            },
-        );
+async fn an_a_record_that_holds_the_ip_as_natwg_writes_it_is_published_without_a_write() {
+    let mut api = zone_with(json!([listed("rec1", "A", "45.77.0.10", false, 60)]), 0);
     let (_wanted_tx, wanted) = watch::channel(Some(Content::A(ip("45.77.0.10"))));
     let (state_tx, mut state) = watch::channel(Publish::Idle);
-    let publisher = Publisher::new(&a_config(), &api.url).unwrap();
+    let publisher = a_publisher(&api);
     let check = async {
         published_a(&mut state, "45.77.0.10").await;
+        real_pause().await;
         assert_eq!(api.taken(), [get(ZONES), get(A_LOOKUP)]);
+    };
+    tokio::select! {
+        never = publisher.run(wanted, state_tx) => match never {},
+        () = check => {}
+    }
+}
+
+#[tokio::test]
+async fn a_proxied_record_or_one_with_another_ttl_is_written_again() {
+    // The dashboard creates an A record proxied with an automatic TTL (1),
+    // and Cloudflare's proxy carries no WireGuard.
+    for (proxied, ttl) in [(true, 1), (true, 60), (false, 1), (false, 300)] {
+        let mut api = zone_with(json!([listed("rec1", "A", "45.77.0.10", proxied, ttl)]), 0);
+        let (_wanted_tx, wanted) = watch::channel(Some(Content::A(ip("45.77.0.10"))));
+        let (state_tx, mut state) = watch::channel(Publish::Idle);
+        let publisher = a_publisher(&api);
+        let check = async {
+            published_a(&mut state, "45.77.0.10").await;
+            assert_eq!(
+                writes(api.taken()),
+                [a_write("PUT", RECORD, "45.77.0.10")],
+                "proxied {proxied}, ttl {ttl}"
+            );
+        };
+        tokio::select! {
+            never = publisher.run(wanted, state_tx) => match never {},
+            () = check => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn more_a_records_and_an_aaaa_record_are_named_and_left_to_the_operator() {
+    let mut api = zone_with(
+        json!([
+            listed("rec1", "A", "45.77.0.10", false, 60),
+            listed("rec2", "A", "45.77.0.99", false, 60),
+            listed("rec3", "AAAA", "2001:db8::1", false, 60),
+            listed("rec4", "TXT", "\"v=spf1 -all\"", false, 60),
+        ]),
+        0,
+    );
+    let (_wanted_tx, wanted) = watch::channel(Some(Content::A(ip("45.77.0.10"))));
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = a_publisher(&api);
+    let mut strays = publisher.strays();
+    let check = async {
+        published_a(&mut state, "45.77.0.10").await;
+        let stray = strays
+            .wait_for(Option::is_some)
+            .await
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(
+            stray.starts_with("home.example.com also has A 45.77.0.99, AAAA 2001:db8::1; delete them in Cloudflare"),
+            "{stray}"
+        );
+        real_pause().await;
+        assert_eq!(writes(api.taken()), [], "natwg deletes nothing");
+    };
+    tokio::select! {
+        never = publisher.run(wanted, state_tx) => match never {},
+        () = check => {}
+    }
+}
+
+#[tokio::test]
+async fn with_nothing_confirmed_the_record_is_read_and_never_written() {
+    let mut api = zone_with(json!([listed("rec1", "A", "45.77.0.99", true, 1)]), 0);
+    let (_wanted_tx, wanted) = watch::channel(None);
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = a_publisher(&api);
+    let check = async {
+        let record = published_a(&mut state, "45.77.0.99").await;
+        assert_eq!(record.value, Content::A(ip("45.77.0.99")));
+        assert_eq!(state.borrow().error(), None);
+        real_pause().await;
+        assert_eq!(
+            api.taken(),
+            [get(ZONES), get(A_LOOKUP)],
+            "a read and no write"
+        );
+    };
+    tokio::select! {
+        never = publisher.run(wanted, state_tx) => match never {},
+        () = check => {}
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_write_is_not_tried_again_once_nothing_is_confirmed() {
+    let mut api = zone_with(json!([listed("rec1", "A", "45.77.0.99", false, 60)]), 1);
+    let (wanted_tx, wanted) = watch::channel(Some(Content::A(ip("45.77.0.2"))));
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = a_publisher(&api);
+    let check = async {
+        let (error, _) = failed(&mut state).await;
+        assert!(error.contains("HTTP 500"), "{error}");
+        wanted_tx.send_replace(None);
+        published_a(&mut state, "45.77.0.99").await;
+        assert_eq!(state.borrow().error(), None, "no write is pending");
+        tokio::time::advance(cloudflare::RETRY * 2).await;
+        real_pause().await;
+        assert_eq!(
+            writes(api.taken()),
+            [a_write("PUT", RECORD, "45.77.0.2")],
+            "only the one write while 45.77.0.2 was confirmed"
+        );
     };
     tokio::select! {
         never = publisher.run(wanted, state_tx) => match never {},
@@ -1334,7 +1470,7 @@ async fn publish_a_leaves_the_record_alone_when_the_gateway_is_behind_another_na
                 .contains(&"no public IP".to_owned())
         );
         real_pause().await;
-        assert_eq!(api.taken(), [], "nothing is published");
+        assert_eq!(writes(api.taken()), [], "nothing is published");
     })
     .await;
 }
@@ -1361,7 +1497,7 @@ async fn publish_a_refuses_a_mapping_that_only_keeps_the_port() {
         assert_eq!(status.mapping, Some(mapped));
         assert_eq!(status.public_ip, None);
         real_pause().await;
-        assert_eq!(api.taken(), [], "nothing is published");
+        assert_eq!(writes(api.taken()), [], "nothing is published");
     })
     .await;
 }
@@ -1385,7 +1521,219 @@ async fn publish_a_without_stun_names_an_uplink_that_is_not_public() {
         assert!(!status.stun);
         assert_eq!((status.mapping, status.last_stun_ok), (None, None));
         real_pause().await;
-        assert_eq!(api.taken(), [], "nothing is published");
+        assert_eq!(writes(api.taken()), [], "nothing is published");
     })
     .await;
+}
+
+/// The tracker of publish `a` on loopback (127.0.0.1, not public), with
+/// STUN and UPnP, fed by hand.
+struct Tracker {
+    mapping: watch::Sender<Option<Mapping>>,
+    lease: watch::Sender<Option<upnp::Lease>>,
+    wanted: watch::Receiver<Option<Content>>,
+    public: watch::Receiver<Public>,
+    recheck: &'static tokio::sync::Notify,
+    /// Every value `wanted` took.
+    history: Arc<Mutex<Vec<Option<Content>>>>,
+}
+
+fn at_mapping(text: &str) -> Option<Mapping> {
+    Some(Mapping {
+        addr: addr(text),
+        since: std::time::SystemTime::now(),
+    })
+}
+
+/// A lease renewal that began now: `ok`, on a gateway whose WAN is `wan`.
+fn renewal(ok: bool, wan: Option<&str>) -> Option<upnp::Lease> {
+    Some(upnp::Lease {
+        ok,
+        at: std::time::SystemTime::now(),
+        external_ip: wan.map(ip),
+    })
+}
+
+fn track(first_mapping: &str, first_wan: &str) -> Tracker {
+    let server: &'static ServerConfig = Box::leak(Box::new(
+        serde_json::from_value(json!({
+            "iface": LOOPBACK,
+            "listen_port": 51830,
+            "lan": [],
+            "publish": "a",
+            "stun": {"servers": [], "fallback": [], "dns_server": "127.0.0.1"},
+            "upnp": {"control_url": "http://127.0.0.1:9/ctl", "lease_secs": 600, "refresh_secs": 300},
+            "cloudflare": {"zone": "example.com", "record": "home.example.com", "token": TOKEN},
+        }))
+        .unwrap(),
+    ));
+    let (mapping_tx, mapping_rx) = watch::channel(at_mapping(first_mapping));
+    let (lease_tx, lease_rx) = watch::channel(renewal(true, Some(first_wan)));
+    let (wanted_tx, wanted) = watch::channel(None);
+    let (public_tx, public) = watch::channel(Public::default());
+    let recheck: &'static tokio::sync::Notify = Box::leak(Box::default());
+    let history = Arc::new(Mutex::new(Vec::new()));
+    let (mut watcher, seen) = (wanted.clone(), history.clone());
+    tokio::spawn(async move {
+        while watcher.changed().await.is_ok() {
+            seen.lock().unwrap().push(*watcher.borrow_and_update());
+        }
+    });
+    tokio::spawn(async move {
+        let never = public::run(server, mapping_rx, lease_rx, wanted_tx, public_tx, recheck).await;
+        match never {}
+    });
+    Tracker {
+        mapping: mapping_tx,
+        lease: lease_tx,
+        wanted,
+        public,
+        recheck,
+        history,
+    }
+}
+
+impl Tracker {
+    async fn confirmed(&mut self, value: &str) {
+        let value = ip(value);
+        self.public
+            .wait_for(|public| public.ip() == Some(value))
+            .await
+            .unwrap();
+        self.wanted
+            .wait_for(|wanted| *wanted == Some(Content::A(value)))
+            .await
+            .unwrap();
+    }
+
+    fn ever_wanted(&self, value: &str) -> bool {
+        self.history
+            .lock()
+            .unwrap()
+            .contains(&Some(Content::A(ip(value))))
+    }
+}
+
+async fn settle() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn asked_again(recheck: &tokio::sync::Notify) -> bool {
+    tokio::time::timeout(Duration::from_millis(50), recheck.notified())
+        .await
+        .is_ok()
+}
+
+#[tokio::test(start_paused = true)]
+async fn losing_the_confirmation_leaves_the_publisher_nothing_to_write() {
+    let mut t = track("45.77.0.2:51830", "45.77.0.2");
+    t.confirmed("45.77.0.2").await;
+    t.lease.send_replace(renewal(false, None));
+    t.public.wait_for(|p| p.error().is_some()).await.unwrap();
+    t.wanted.wait_for(Option::is_none).await.unwrap();
+    // The router reconnects as .3 while UPnP is down; the port is kept.
+    t.mapping.send_replace(at_mapping("45.77.0.3:51830"));
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert!(t.public.borrow().ip().is_none());
+    assert_eq!(*t.wanted.borrow(), None);
+    assert!(!t.ever_wanted("45.77.0.3"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mapping_on_another_port_is_never_published_after_the_gateway_answers() {
+    let mut t = track("45.77.0.2:51830", "45.77.0.2");
+    t.confirmed("45.77.0.2").await;
+    t.mapping.send_replace(at_mapping("45.77.0.3:52830"));
+    settle().await;
+    assert!(
+        asked_again(t.recheck).await,
+        "a mismatch asks the gateway again"
+    );
+    t.lease.send_replace(renewal(true, Some("45.77.0.3")));
+    let error = t
+        .public
+        .wait_for(|p| p.error().is_some())
+        .await
+        .unwrap()
+        .error()
+        .unwrap()
+        .to_owned();
+    assert!(
+        error.contains("does not keep the listen port 51830"),
+        "{error}"
+    );
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert_eq!(*t.wanted.borrow(), None);
+    assert!(!t.ever_wanted("45.77.0.3"));
+}
+
+/// A new mapping and an ordinary renewal that began before it reach the
+/// tracker in the same poll: whichever change wakes it, the gateway is
+/// asked again, nothing is confirmed meanwhile, and the status keeps its
+/// verdict until the answer.
+#[tokio::test(start_paused = true)]
+async fn a_new_mapping_asks_the_gateway_again_whichever_change_wakes_the_tracker() {
+    for run in 0..200 {
+        let mut t = track("45.77.0.2:51830", "45.77.0.2");
+        t.confirmed("45.77.0.2").await;
+        t.mapping.send_replace(at_mapping("45.77.0.3:51830"));
+        t.lease.send_replace(renewal(true, Some("45.77.0.2")));
+        settle().await;
+        assert!(asked_again(t.recheck).await, "run {run}: no recheck");
+        assert_eq!(*t.wanted.borrow(), None, "run {run}");
+        assert_eq!(
+            t.public.borrow().ip(),
+            Some(ip("45.77.0.2")),
+            "run {run}: no false reason while the gateway is asked"
+        );
+        t.lease.send_replace(renewal(true, Some("45.77.0.3")));
+        t.confirmed("45.77.0.3").await;
+        assert_eq!(t.public.borrow().by(), Some(PublicBy::Upnp));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recheck_that_gets_no_answer_ends_after_its_limit() {
+    let mut t = track("45.77.0.2:51830", "45.77.0.2");
+    t.confirmed("45.77.0.2").await;
+    t.mapping.send_replace(at_mapping("45.77.0.3:51830"));
+    settle().await;
+    assert!(asked_again(t.recheck).await);
+    tokio::time::sleep(public::RECHECK_LIMIT + public::ADDRESS_EVERY).await;
+    let error = t.public.borrow().error().unwrap_or_default().to_owned();
+    assert!(
+        error.contains("WAN address 45.77.0.2 is not 45.77.0.3"),
+        "{error}"
+    );
+    assert_eq!(*t.wanted.borrow(), None);
+}
+
+/// The first write of a confirmed IP fails; then the confirmation is lost.
+/// The publisher must not write the old IP when its retry comes.
+#[tokio::test(start_paused = true)]
+async fn a_retry_never_writes_an_ip_that_is_no_longer_confirmed() {
+    let mut api = zone_with(json!([listed("rec1", "A", "45.77.0.99", false, 60)]), 3);
+    let mut t = track("45.77.0.2:51830", "45.77.0.2");
+    let (state_tx, mut state) = watch::channel(Publish::Idle);
+    let publisher = a_publisher(&api);
+    let wanted = t.wanted.clone();
+    tokio::spawn(async move {
+        let never = publisher.run(wanted, state_tx).await;
+        match never {}
+    });
+    t.confirmed("45.77.0.2").await;
+    failed(&mut state).await;
+    t.lease.send_replace(renewal(false, None));
+    t.public.wait_for(|p| p.error().is_some()).await.unwrap();
+    let before = writes(api.taken());
+    assert_eq!(before, [a_write("PUT", RECORD, "45.77.0.2")]);
+    tokio::time::advance(cloudflare::RETRY + Duration::from_secs(1)).await;
+    real_pause().await;
+    assert_eq!(
+        writes(api.taken()),
+        [],
+        "no write while nothing is confirmed"
+    );
 }

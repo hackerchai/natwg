@@ -95,7 +95,8 @@ pub async fn run<D: Device>(
     let (lease_tx, lease) = watch::channel(None);
     let (wanted_tx, wanted) = watch::channel(None::<Content>);
     let (public_tx, public) = watch::channel(Public::default());
-    let publisher = Publisher::new(&server.cloudflare, cloudflare_api)?;
+    let publisher = Publisher::new(&server.cloudflare, server.publish, cloudflare_api)?;
+    let strays = publisher.strays();
     let upnp = Upnp::new(server)?;
     let recheck = Notify::new();
     let track = public::run(
@@ -114,6 +115,7 @@ pub async fn run<D: Device>(
         publish,
         lease,
         public,
+        strays,
         rebuilds: 0,
     };
     tokio::select! {
@@ -143,6 +145,8 @@ struct Supervisor<'a> {
     publish: watch::Receiver<Publish>,
     lease: watch::Receiver<Option<Lease>>,
     public: watch::Receiver<Public>,
+    /// With publish `a`, the other records of the name that clients may dial.
+    strays: watch::Receiver<Option<String>>,
     rebuilds: u32,
 }
 
@@ -238,7 +242,7 @@ impl Supervisor<'_> {
         // once instead of at the next tick.
         let mut mapping = self.mapping.subscribe();
         let (mut publish, mut lease) = (self.publish.clone(), self.lease.clone());
-        let mut public = self.public.clone();
+        let (mut public, mut strays) = (self.public.clone(), self.strays.clone());
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun}, udp/{}", server.listen_port);
         loop {
@@ -256,6 +260,7 @@ impl Supervisor<'_> {
                 Ok(()) = publish.changed() => status_tick.reset_immediately(),
                 Ok(()) = lease.changed() => status_tick.reset_immediately(),
                 Ok(()) = public.changed() => status_tick.reset_immediately(),
+                Ok(()) = strays.changed() => status_tick.reset_immediately(),
                 _ = status_tick.tick() => {
                     if let Some(tun) = device.tun()
                         && BoundInterface::lookup(tun).is_err()
@@ -331,6 +336,7 @@ impl Supervisor<'_> {
             public_ip: public.ip(),
             public_by: public.by(),
             public_error: public.error().map(str::to_owned),
+            record_problem: self.strays.borrow().clone(),
             upnp_ok: lease.map(|lease| lease.ok),
             upnp_at: lease.map(|lease| status::unix(lease.at)),
             nat_ok,

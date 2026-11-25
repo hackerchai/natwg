@@ -237,7 +237,9 @@ then dial `name:listen_port`, as with any dynamic DNS name. Set
 ```
 
 `publish` defaults to `"txt"`, the TXT record of the mapping, and a config
-without it works as before. Use public mode only where `natwg detect` says
+without it works as before. With `"a"`, `cloudflare.record` must be a host
+name that clients can dial: letters, digits and hyphens, two labels or more,
+and no trailing dot (so no `_wg-home…`). Use public mode only where `natwg detect` says
 `supported (public)` with `public_by` `address` or `upnp`. natwg publishes an
 IP only when it confirms the IP itself, which it can do in two cases:
 
@@ -263,8 +265,9 @@ Every other network uses TXT. natwg publishes no A record for:
 
 When natwg cannot confirm the IP, at start or later (when the ISP takes the
 public address away, say), it leaves the A record as it is. It never writes
-an IP it cannot confirm, and it does not fall back to TXT. `natwg status`
-says why and exits 1 with `no public IP`. To move such a server to TXT,
+an IP it cannot confirm, not even one it confirmed a moment before and failed
+to write, and it does not fall back to TXT. `natwg status` shows what the
+record holds, says why natwg leaves it, and exits 1 with `no public IP`. To move such a server to TXT,
 remove `publish` (or set `"txt"`), give it `stun`, and give each client a
 `record` in place of its `server`.
 
@@ -278,12 +281,22 @@ upnp/nat        : off / ok
 ```
 
 The A record has a TTL of 60 seconds, and natwg never has Cloudflare proxy
-it. `natwg peer add` gives a client of such a server
+it: Cloudflare's proxy carries no WireGuard. natwg reads every record of the
+name at start and every 5 minutes.
+
+- An A record that holds the IP but is proxied, or has another TTL, natwg
+  writes again. The Cloudflare dashboard creates A records proxied.
+- More A records than the one natwg keeps, or an AAAA record, are a problem
+  that `natwg status` names, with exit 1: clients may dial them, and natwg is
+  IPv4-only. Delete them in Cloudflare; natwg never deletes a record.
+
+`natwg peer add` gives a client of such a server
 `"server": "home.example.com:51830"` in place of a `record`.
 
-`NATWG_CLOUDFLARE_API`, for tests only, sends the server's Cloudflare calls,
-token and all, to another API base URL; the network lab points it at its fake
-API.
+`NATWG_CLOUDFLARE_API` is for tests only. It sends the server's Cloudflare
+calls, token and all, to another API base URL, and only a debug build
+honours it; a release build ignores it and logs a warning. The network lab
+points it at its fake API.
 
 ### Add a client
 
@@ -391,8 +404,15 @@ The client config has the client role and exactly one peer, the server:
 - `server` (`"home.example.com:51830"`) takes the place of `record` for a
   server in [public mode](#public-mode-an-a-record). The client asks the
   `resolvers` for the A record of the name, the same way and as often, dials
-  the first address at the port, and keeps the last endpoint when no resolver
-  gives one. A config has `record` or `server`, not both.
+  the first public address at the port, and keeps the last endpoint when no
+  resolver gives one. A config has `record` or `server`, not both.
+  - The name is a host name of two labels or more from letters, digits and
+    hyphens, without a trailing dot, and the port has plain digits from 1 to
+    65535.
+  - The server publishes only public IPs, so the client takes only a public
+    address. A private, loopback or carrier-grade NAT address, or one of
+    198.18.0.0/15, which the fake-IP DNS of Surge and Clash hands out, counts
+    as a failed lookup, and `natwg status` says which address came back.
 - Without either, the client dials `peers[0].endpoint` (`"ip:port"`).
 - The client routes each of `allowed_ips` into its tunnel and refuses to start
   when another interface holds the tunnel address or one of those routes. A

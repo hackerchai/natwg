@@ -326,7 +326,9 @@ pub struct ClientConfig {
     pub status_file: Option<PathBuf>,
 }
 
-/// A DNS name and a port, written `"name:port"`.
+/// A host name and a port, written `"name:port"`: the server of a client in
+/// public mode. The name is an RFC 1123 host name of two labels or more,
+/// without a trailing dot, and the port has plain digits from 1 to 65535.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct HostPort {
@@ -338,17 +340,77 @@ impl TryFrom<String> for HostPort {
     type Error = String;
 
     fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
-        let invalid = || format!("{text:?} is not \"name:port\" with a port from 1 to 65535");
-        let (host, port) = text.rsplit_once(':').ok_or_else(invalid)?;
-        let port: u16 = port.parse().map_err(|_| invalid())?;
-        if host.is_empty() || port == 0 {
-            return Err(invalid());
+        let (host, port) = text
+            .rsplit_once(':')
+            .ok_or_else(|| format!("{text:?} is not \"name:port\""))?;
+        let port = plain_port(port).ok_or_else(|| {
+            format!("{text:?} has no port from 1 to 65535 of plain digits after the colon")
+        })?;
+        if host.parse::<Ipv4Addr>().is_ok() {
+            return Err(format!(
+                "{text:?} names an address; dial it with peers[0].endpoint \"{host}:{port}\" instead"
+            ));
+        }
+        if let Err(why) = host_name(host) {
+            return Err(format!("{text:?} is not \"name:port\": {why}"));
         }
         Ok(Self {
             host: host.to_owned(),
             port,
         })
     }
+}
+
+/// A port of plain digits from 1 to 65535: no sign and no leading zero.
+fn plain_port(text: &str) -> Option<u16> {
+    let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if !digits || text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok().filter(|&port| port != 0)
+}
+
+/// Whether `name` is an RFC 1123 host name that clients can dial: labels of
+/// 1 to 63 characters from A-Z, a-z, 0-9 and '-', none starting or ending
+/// with '-', two labels or more, a top-level label that is not all digits,
+/// 253 characters at most, and no trailing dot. Otherwise, why not.
+pub fn host_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("the name is empty".to_owned());
+    }
+    if name.ends_with('.') {
+        return Err(format!("{name:?} ends with a dot; leave it out"));
+    }
+    if name.len() > 253 {
+        return Err(format!("{name:?} is longer than 253 characters"));
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    for label in &labels {
+        let plain = label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !(1..=63).contains(&label.len())
+            || !plain
+            || label.starts_with('-')
+            || label.ends_with('-')
+        {
+            return Err(format!(
+                "{name:?} has the label {label:?}; a label has 1 to 63 characters from A-Z, a-z, 0-9 and '-', and starts and ends with a letter or a digit"
+            ));
+        }
+    }
+    if labels.len() < 2 {
+        return Err(format!(
+            "{name:?} is a single label; name the host in full, such as home.example.com"
+        ));
+    }
+    if labels
+        .last()
+        .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(format!("{name:?} ends with an all-digit label"));
+    }
+    Ok(())
 }
 
 impl FromStr for HostPort {
@@ -461,9 +523,9 @@ impl Config {
             PublishMode::Txt => {}
             PublishMode::A => {
                 let record = &server.cloudflare.record;
-                if !is_dns_name(record) {
+                if let Err(why) = host_name(record) {
                     return Err(format!(
-                        "cloudflare.record {record:?} is not a DNS name, and with publish a clients dial it"
+                        "cloudflare.record is not a host name that clients can dial, which publish a needs: {why}"
                     ));
                 }
                 if server.listen_port == 0 {
@@ -557,16 +619,6 @@ impl Config {
             && !is_dns_name(record)
         {
             return Err(format!("role.client.record {record:?} is not a DNS name"));
-        }
-        if let Some(HostPort { host, port }) = &client.server {
-            if host.parse::<Ipv4Addr>().is_ok() {
-                return Err(format!(
-                    "role.client.server {host:?} is an address; dial it with peers[0].endpoint \"{host}:{port}\" instead"
-                ));
-            }
-            if !is_dns_name(host) {
-                return Err(format!("role.client.server {host:?} is not a DNS name"));
-            }
         }
         if let Some(iface) = &client.iface
             && !is_iface_name(iface)

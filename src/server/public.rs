@@ -20,15 +20,19 @@ use crate::server::upnp::Lease;
 use std::{
     convert::Infallible,
     net::{Ipv4Addr, SocketAddrV4},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     sync::{Notify, watch},
-    time::MissedTickBehavior,
+    time::{Instant, MissedTickBehavior},
 };
 
 /// How often publish `a` reads the uplink's addresses.
 pub const ADDRESS_EVERY: Duration = Duration::from_secs(10);
+
+/// How long publish `a` waits for the gateway to answer a recheck before it
+/// judges with what it has. A renewal takes at most two requests of 6 s.
+pub const RECHECK_LIMIT: Duration = Duration::from_secs(30);
 
 /// The public IP that publish `a` keeps in the A record.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -156,11 +160,16 @@ fn addresses(iface: &str) -> Vec<Ipv4Addr> {
 
 /// Keep `wanted`, the value the publisher writes, current. With publish
 /// `txt` that is the STUN mapping. With publish `a` it is the public IP,
-/// read again every [`ADDRESS_EVERY`] and on each new mapping or lease;
-/// `public` tells the status where it came from, or why there is none, and
-/// then `wanted` keeps the last good IP, so the record stays as it is. A
-/// mapping that moves away from the gateway's WAN address notifies
+/// judged again every [`ADDRESS_EVERY`] and on each new mapping or lease,
+/// and none while no IP is confirmed, so the publisher never writes an IP
+/// that natwg does not confirm now. `public` tells the status where the IP
+/// came from, or why there is none.
+///
+/// A mapping that moves away from the gateway's WAN address notifies
 /// `recheck`, which renews the lease and asks that address again at once.
+/// Until a renewal that began after the notice answers, or
+/// [`RECHECK_LIMIT`] passes, nothing is confirmed and the status keeps its
+/// verdict.
 pub async fn run(
     server: &ServerConfig,
     mut mapping: watch::Receiver<Option<Mapping>>,
@@ -178,19 +187,22 @@ pub async fn run(
             }
         }
     }
+    let set = |value: Option<Content>| {
+        wanted.send_if_modified(|wanted| std::mem::replace(wanted, value) != value);
+    };
     let mut tick = tokio::time::interval(ADDRESS_EVERY);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // Whether the gateway was asked again and has not answered yet.
-    let mut rechecking = false;
+    // The mapping judged last, so a move is told by value, whichever
+    // change woke the loop.
+    let mut judged: Option<SocketAddrV4> = None;
+    // When the gateway was asked again, and until when to wait for it.
+    let mut asked: Option<(SystemTime, Instant)> = None;
     loop {
-        let moved = tokio::select! {
-            _ = tick.tick() => false,
-            Ok(()) = mapping.changed() => true,
-            Ok(()) = lease.changed() => {
-                rechecking = false;
-                false
-            }
-        };
+        tokio::select! {
+            _ = tick.tick() => {}
+            Ok(()) = mapping.changed() => {}
+            Ok(()) = lease.changed() => {}
+        }
         let addresses = addresses(&server.iface);
         let seen = Seen {
             iface: &server.iface,
@@ -201,18 +213,25 @@ pub async fn run(
             upnp: server.upnp.is_some(),
             lease: *lease.borrow_and_update(),
         };
+        let moved = seen.mapping != std::mem::replace(&mut judged, seen.mapping);
+        if let Some((at, until)) = asked
+            && (seen.lease.is_some_and(|lease| lease.at >= at) || Instant::now() >= until)
+        {
+            asked = None;
+        }
         // Only a new mapping asks again, so a gateway that disagrees for
-        // good is not asked in a loop. Until it answers, the IP it last
-        // confirmed stands.
+        // good is not asked in a loop.
         let external = seen.lease.and_then(|lease| lease.external_ip);
         if moved
+            && seen.addresses.iter().all(|&ip| !is_public(ip))
             && let (Some(mapping), Some(external)) = (seen.mapping, external)
             && *mapping.ip() != external
         {
             recheck.notify_one();
-            rechecking = true;
+            asked = Some((SystemTime::now(), Instant::now() + RECHECK_LIMIT));
         }
-        if rechecking {
+        if asked.is_some() {
+            set(None);
             continue;
         }
         let now = self::public(&seen);
@@ -220,10 +239,7 @@ pub async fn run(
         if before != now {
             report(&now);
         }
-        if let Some(ip) = now.ip() {
-            let value = Some(Content::A(ip));
-            wanted.send_if_modified(|wanted| std::mem::replace(wanted, value) != value);
-        }
+        set(now.ip().map(Content::A));
     }
 }
 
