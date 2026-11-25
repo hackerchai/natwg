@@ -126,19 +126,12 @@ pub async fn run<D: Device>(
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
     let (client, server) = config.client()?;
-    let resolvers = match &client.resolvers[..] {
-        [] => &resolve::DEFAULT_RESOLVERS[..],
-        configured => configured,
-    };
     let supervisor = Supervisor {
         config,
         client,
         options,
         find_uplink,
-        resolvers: resolvers
-            .iter()
-            .map(|&ip| SocketAddrV4::new(ip, options.dns_port))
-            .collect(),
+        resolvers: resolve::resolvers(client, options.dns_port),
         keepalive: tunnel::client_keepalive(server),
         endpoint: server.endpoint.map(|addr| Endpoint {
             addr,

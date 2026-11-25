@@ -277,12 +277,16 @@ fn an_open_config_directory_becomes_private_and_passes_no_acl_to_a_new_config() 
     }))
     .unwrap();
     let inherited = natwg.join("inherited.json");
-    config.save(&inherited).unwrap();
+    fs::write(&inherited, config.exposed()).unwrap();
+    fs::set_permissions(&inherited, fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(
         Config::load(&inherited).unwrap_err().code,
         "CONFIG_UNSAFE",
         "a config written into the open directory inherits its ACL"
     );
+
+    config.save(&inherited).unwrap();
+    assert_eq!(Config::load(&inherited).unwrap(), config);
 
     make_private_dir(&natwg).unwrap();
     assert_eq!(mode(&natwg), 0o700);

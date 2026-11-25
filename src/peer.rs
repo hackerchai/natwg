@@ -21,14 +21,7 @@ const NAME_MAX: usize = 32;
 /// routes the tunnel subnet and every LAN to it.
 pub fn add(config: &mut Config, name: &str) -> Result<Config> {
     let server = config.server()?;
-    if !is_name(name) {
-        return Err(Error::new(
-            "PEER_NAME_INVALID",
-            format!(
-                "expected a peer name of 1 to {NAME_MAX} characters from A-Z, a-z, 0-9, '.', '_' and '-'"
-            ),
-        ));
-    }
+    validate_name(name)?;
     if config.peers.iter().any(|peer| peer.name == name) {
         return Err(Error::new(
             "PEER_EXISTS",
@@ -162,9 +155,19 @@ fn next_address(config: &Config) -> Option<Ipv4Addr> {
     })
 }
 
-fn is_name(name: &str) -> bool {
-    (1..=NAME_MAX).contains(&name.len())
+pub(crate) fn validate_name(name: &str) -> Result<()> {
+    if (1..=NAME_MAX).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "PEER_NAME_INVALID",
+            format!(
+                "expected a peer name of 1 to {NAME_MAX} characters from A-Z, a-z, 0-9, '.', '_' and '-'"
+            ),
+        ))
+    }
 }

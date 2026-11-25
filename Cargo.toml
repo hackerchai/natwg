@@ -18,6 +18,7 @@ flate2 = "1"
 getrandom = "0.3"
 gotatun = { version = "=0.10.3", default-features = false, features = ["device", "ring", "tun"] }
 hex = "0.4"
+humantime = "2"
 ipnetwork = { version = "0.21", features = ["serde"] }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
