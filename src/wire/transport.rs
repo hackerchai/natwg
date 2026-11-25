@@ -87,6 +87,21 @@ pub fn bound_udp_socket(iface: &BoundInterface, port: u16) -> io::Result<std::ne
     Ok(socket.into())
 }
 
+/// A blocking TCP connection to `address` through `iface`, for a request
+/// that cannot wait for a runtime, such as a cleanup while a panic unwinds.
+pub fn bound_tcp_connect(
+    iface: &BoundInterface,
+    address: SocketAddrV4,
+    timeout: Duration,
+) -> io::Result<std::net::TcpStream> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.bind_device_by_index_v4(Some(iface.index))?;
+    socket.connect_timeout(&address.into(), timeout)?;
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
+    Ok(socket.into())
+}
+
 /// gotatun's UDP transport on one interface. Every socket it binds also carries
 /// STUN. The answer to the pending Binding request goes to the [`StunPort`],
 /// other Binding success responses are dropped, and everything else goes to

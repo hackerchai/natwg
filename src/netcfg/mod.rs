@@ -185,27 +185,71 @@ pub fn read(argv: &[&str]) -> Result<String> {
 
 /// Every IPv4 address of every interface, with the name of the interface.
 pub fn ipv4_addresses() -> std::io::Result<Vec<(String, Ipv4Addr)>> {
+    Ok(ipv4_networks()?
+        .into_iter()
+        .map(|(name, network)| (name, network.ip()))
+        .collect())
+}
+
+/// Every IPv4 address of every interface with its prefix, and the name of
+/// the interface.
+pub fn ipv4_networks() -> std::io::Result<Vec<(String, Ipv4Network)>> {
     let mut list = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut list) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let ipv4 = |address: *const libc::sockaddr| {
+        let address = unsafe { address.as_ref() }?;
+        if i32::from(address.sa_family) != libc::AF_INET {
+            return None;
+        }
+        let address = unsafe { &*std::ptr::from_ref(address).cast::<libc::sockaddr_in>() };
+        Some(Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)))
+    };
     let mut found = Vec::new();
     let mut entry = list;
     while let Some(current) = unsafe { entry.as_ref() } {
         entry = current.ifa_next;
-        let address = current.ifa_addr;
-        if address.is_null() || i32::from(unsafe { (*address).sa_family }) != libc::AF_INET {
+        let Some(address) = ipv4(current.ifa_addr) else {
             continue;
-        }
+        };
+        let prefix = ipv4(current.ifa_netmask).map_or(32, |mask| mask.to_bits().leading_ones());
         let name = unsafe { CStr::from_ptr(current.ifa_name) };
-        let address = unsafe { &*address.cast::<libc::sockaddr_in>() };
-        found.push((
-            name.to_string_lossy().into_owned(),
-            Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)),
-        ));
+        if let Ok(network) = Ipv4Network::new(address, prefix as u8) {
+            found.push((name.to_string_lossy().into_owned(), network));
+        }
     }
     unsafe { libc::freeifaddrs(list) };
     Ok(found)
+}
+
+/// The default gateway through `iface`, if it has one. A VPN app that owns
+/// the default route does not hide it.
+pub fn default_gateway(iface: &str) -> Option<Ipv4Addr> {
+    #[cfg(target_os = "macos")]
+    let listing = read(&["route", "-n", "get", "-ifscope", iface, "default"]).ok()?;
+    #[cfg(not(target_os = "macos"))]
+    let listing = read(&["ip", "-4", "route", "show", "default", "dev", iface]).ok()?;
+    gateway_in(&listing)
+}
+
+/// The gateway in what `route -n get default` (macOS) or
+/// `ip -4 route show default` (Linux) prints.
+pub fn gateway_in(listing: &str) -> Option<Ipv4Addr> {
+    listing.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        let mut previous = words.next()?;
+        if previous == "gateway:" {
+            return words.next()?.parse().ok();
+        }
+        for word in words {
+            if previous == "via" {
+                return word.parse().ok();
+            }
+            previous = word;
+        }
+        None
+    })
 }
 
 /// The networks among `routes` that hold an address of an interface that is

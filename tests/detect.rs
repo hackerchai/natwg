@@ -3,8 +3,8 @@
 //! way each kind of NAT would let their answers through.
 
 use natwg::detect::{
-    self, Answer, ChangeTest, Filtering, Kind, Mapping, Observations, Probe, Request, SelfTest,
-    UpnpMode, Verdict, classify, is_public,
+    self, Answer, ChangeTest, Filtering, Kind, Mapping, Observations, Probe, PublicBy, Request,
+    SelfTest, UpnpMode, Verdict, classify, is_public,
 };
 use std::{
     collections::HashSet,
@@ -71,6 +71,7 @@ fn seen(answers: Vec<Answer>, tests: Vec<ChangeTest>, self_test: SelfTest) -> Ob
         change_tests: tests,
         self_test,
         gateway_ip: None,
+        upnp_forwarded: false,
     }
 }
 
@@ -211,10 +212,66 @@ fn a_host_with_its_public_address_is_supported_public() {
     let assessment = classify(&observed);
     assert_eq!(assessment.verdict, Verdict::Supported);
     assert_eq!(assessment.kind, Some(Kind::Public));
+    assert_eq!(assessment.public_by, Some(PublicBy::Address));
     assert_eq!(assessment.mapping, Mapping::NoNat);
-    // With filtering untested, a public address still counts.
-    observed.change_tests.clear();
-    assert_eq!(classify(&observed).kind, Some(Kind::Public));
+}
+
+#[test]
+fn a_public_address_with_untested_filtering_is_only_likely() {
+    // A stateful firewall in front of the host filters like NAT3, and only
+    // an RFC 5780 server can show it.
+    let mut observed = seen(agreeing("45.77.0.10:51830"), vec![], SelfTest::Skipped);
+    observed.local = addr("45.77.0.10:51830");
+    let assessment = classify(&observed);
+    assert_eq!(assessment.verdict, Verdict::Likely);
+    assert_eq!(assessment.kind, None);
+    assert_eq!(assessment.mapping, Mapping::NoNat);
+    let reason = assessment.reason.unwrap();
+    assert!(reason.contains("public address"), "{reason}");
+    assert!(
+        reason.contains("no RFC 5780 STUN server ran the filtering test"),
+        "{reason}"
+    );
+    assert!(reason.contains("firewall"), "{reason}");
+}
+
+#[test]
+fn servers_inside_the_nat_make_the_result_inconclusive() {
+    // A STUN server on the LAN sees the host's own private address.
+    let observed = seen(
+        answers(&[("10.73.0.1:3478", LOCAL)]),
+        vec![],
+        SelfTest::Skipped,
+    );
+    let assessment = classify(&observed);
+    assert_eq!(assessment.verdict, Verdict::Inconclusive);
+    assert_eq!(assessment.verdict.exit_code(), 2);
+    assert_ne!(assessment.mapping, Mapping::NoNat);
+    let reason = assessment.reason.unwrap();
+    assert!(reason.contains("inside a NAT"), "{reason}");
+    assert!(assessment.fix.unwrap().contains("--server"));
+    // Its own change tests say nothing of the NAT either.
+    let tested = seen(
+        answers(&[("10.73.0.1:3478", LOCAL), ("10.73.0.2:3479", LOCAL)]),
+        vec![ChangeTest {
+            server: addr("10.73.0.1:3478"),
+            other: addr("10.73.0.2:3479"),
+            ip_and_port: answered("10.73.0.2:3479"),
+            port: answered("10.73.0.1:3479"),
+        }],
+        SelfTest::Skipped,
+    );
+    assert_eq!(classify(&tested).verdict, Verdict::Inconclusive);
+}
+
+#[test]
+fn answers_from_inside_the_nat_are_left_out() {
+    // A LAN server beside two internet servers: no NAT4 from the mismatch.
+    let mut mixed = agreeing(MAPPED);
+    mixed.extend(answers(&[("192.168.77.1:3478", LOCAL)]));
+    let assessment = classify(&seen(mixed, vec![eif()], SelfTest::Received));
+    assert_eq!(assessment.mapping, Mapping::EndpointIndependent);
+    assert_eq!(assessment.verdict, Verdict::Supported);
 }
 
 #[test]
@@ -247,12 +304,22 @@ fn a_forwarded_port_on_a_public_address_is_supported_public() {
     let assessment = classify(&observed);
     assert_eq!(assessment.verdict, Verdict::Supported);
     assert_eq!(assessment.kind, Some(Kind::Public));
-    // The gateway agrees on its WAN address.
+    // No gateway confirmed it: a full-cone NAT that keeps the port looks
+    // the same.
+    assert_eq!(assessment.public_by, Some(PublicBy::PortKept));
+    // The gateway forwards the port and owns the address.
     let gateway = Observations {
         gateway_ip: Some("45.77.0.9".parse().unwrap()),
+        upnp_forwarded: true,
         ..observed.clone()
     };
-    assert_eq!(classify(&gateway).kind, Some(Kind::Public));
+    assert_eq!(classify(&gateway).public_by, Some(PublicBy::Upnp));
+    // A gateway that owns the address but forwards nothing confirms nothing.
+    let unforwarded = Observations {
+        upnp_forwarded: false,
+        ..gateway
+    };
+    assert_eq!(classify(&unforwarded).public_by, Some(PublicBy::PortKept));
 }
 
 #[test]
@@ -262,10 +329,38 @@ fn a_kept_port_behind_carrier_nat_is_nat1() {
         gateway_ip: Some("100.64.0.42".parse().unwrap()),
         ..seen(agreeing("45.77.0.9:51830"), vec![eif()], SelfTest::Received)
     };
-    assert_eq!(classify(&observed).kind, Some(Kind::Nat1));
-    // A kept port on a private address is no public endpoint either.
-    let private = seen(agreeing("10.1.0.1:51830"), vec![eif()], SelfTest::Received);
-    assert_eq!(classify(&private).kind, Some(Kind::Nat1));
+    let assessment = classify(&observed);
+    assert_eq!(assessment.kind, Some(Kind::Nat1));
+    assert_eq!(assessment.public_by, None);
+}
+
+#[test]
+fn contradicting_change_answers_from_one_server_leave_filtering_unknown() {
+    // The other IP and port got in, but the other port alone did not: a NAT
+    // that opens for some senders only, not endpoint-independent filtering.
+    let odd = test_with(answered("111.206.174.2:3479"), Probe::Silent);
+    assert!(detect::classify::inconsistent(&odd));
+    assert_eq!(detect::classify::filtering(&[odd]), Filtering::Unknown);
+    // Nor does a NAT3 answer from another server outweigh it.
+    let nat3 = ChangeTest {
+        server: addr("138.201.243.186:3478"),
+        other: addr("138.201.243.187:3479"),
+        ip_and_port: Probe::Silent,
+        port: Probe::Silent,
+    };
+    assert_eq!(
+        detect::classify::filtering(&[odd, nat3]),
+        Filtering::Unknown
+    );
+    // A consistent server still proves endpoint-independent filtering.
+    assert_eq!(
+        detect::classify::filtering(&[odd, eif()]),
+        Filtering::EndpointIndependent
+    );
+    let assessment = classify(&seen(agreeing(MAPPED), vec![odd], SelfTest::NotReceived));
+    assert_eq!(assessment.verdict, Verdict::Likely);
+    let reason = assessment.reason.unwrap();
+    assert!(reason.contains("not from its other port"), "{reason}");
 }
 
 #[test]
@@ -367,6 +462,8 @@ fn exit_codes_match_the_verdicts() {
     assert_eq!(Verdict::Supported.exit_code(), 0);
     assert_eq!(Verdict::Unsupported.exit_code(), 1);
     assert_eq!(Verdict::Likely.exit_code(), 2);
+    assert_eq!(Verdict::Inconclusive.exit_code(), 2);
+    assert_eq!(detect::ERROR_EXIT, 3);
 }
 
 // --- The socket flow against fake STUN servers on loopback. ---
@@ -687,17 +784,20 @@ async fn a_symmetric_nat_is_unsupported() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn no_nat_is_supported_public() {
+async fn servers_beside_the_host_are_inconclusive() {
+    // Servers on loopback see lo's own private address: they sit inside
+    // whatever NAT the host is behind, so they cannot see the public side.
     let net = fake_net(Nat::None, Dialect::Rfc5780, IPS).await;
     let detection = detect_on(&net).await;
-    // lo's address is not public, but the mapping is the socket itself.
     assert_eq!(
-        detection.mapping.behaviour,
-        Mapping::NoNat,
+        detection.verdict,
+        Verdict::Inconclusive,
         "{}",
         detection.render()
     );
-    assert_eq!(detection.summary, "supported (public)");
+    assert_eq!(detection.summary, "inconclusive");
+    assert_eq!(detection.exit_code(), 2);
+    assert_eq!(detection.mapping.behaviour, Mapping::Unknown);
     assert_eq!(detection.self_test, SelfTest::Skipped);
 }
 
@@ -740,7 +840,7 @@ async fn every_nat_against_single_ip_servers() {
     // Loopback on macOS has one address, so these run everywhere.
     let one = [Ipv4Addr::LOCALHOST; 3];
     for (nat, dialect, summary) in [
-        (Nat::None, Dialect::Rfc5780, "supported (public)"),
+        (Nat::None, Dialect::Rfc5780, "inconclusive"),
         (Nat::FullCone, Dialect::Rfc3489, "likely"),
         (Nat::FullCone, Dialect::IgnoresChange, "likely"),
         (Nat::Restricted, Dialect::Rfc5780, "likely"),
@@ -801,7 +901,9 @@ async fn the_json_names_every_part_init_reads() {
     let detection = detect_on(&net).await;
     let json = serde_json::to_value(&detection).unwrap();
     for key in [
+        "schema",
         "verdict",
+        "public_by",
         "kind",
         "summary",
         "reason",
@@ -816,11 +918,61 @@ async fn the_json_names_every_part_init_reads() {
     ] {
         assert!(json.get(key).is_some(), "{key} missing from {json}");
     }
+    assert_eq!(json["schema"], 1);
     assert_eq!(json["verdict"], "likely");
+    assert_eq!(json["public_by"], serde_json::Value::Null);
     assert_eq!(json["upnp"]["state"], "off");
     assert_eq!(json["upnp"]["mode"], "off");
     assert_eq!(json["uplink"]["iface"], LOOPBACK);
     assert_eq!(json["uplink"]["public"], false);
     assert_eq!(json["mapping"]["endpoint"], PUBLIC_MAPPING);
-    assert_eq!(json["filtering"]["tests"][0]["ip_and_port"], "not_run");
+    // A probe has one shape whatever its result.
+    let test = &json["filtering"]["tests"][0];
+    assert_eq!(
+        test["ip_and_port"],
+        serde_json::json!({"result": "not_run", "from": null})
+    );
+    assert_eq!(
+        test["port"],
+        serde_json::json!({"result": "answered", "from": net.other.to_string()})
+    );
+}
+
+#[test]
+fn every_probe_result_has_the_same_json_shape() {
+    for (probe, expected) in [
+        (
+            answered("111.206.174.2:3479"),
+            serde_json::json!({"result": "answered", "from": "111.206.174.2:3479"}),
+        ),
+        (
+            Probe::Silent,
+            serde_json::json!({"result": "silent", "from": null}),
+        ),
+        (
+            Probe::NotRun,
+            serde_json::json!({"result": "not_run", "from": null}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(probe).unwrap(), expected);
+    }
+    for (verdict, name) in [
+        (Verdict::Supported, "supported"),
+        (Verdict::Likely, "likely"),
+        (Verdict::Inconclusive, "inconclusive"),
+        (Verdict::Unsupported, "unsupported"),
+    ] {
+        assert_eq!(serde_json::to_value(verdict).unwrap(), name);
+    }
+}
+
+#[tokio::test]
+async fn run_until_stops_with_interrupted() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut asked = request(&[v4(silent.local_addr().unwrap())]);
+    asked.timeout = Duration::from_secs(5);
+    let stopped = detect::run_until(&asked, async { "the caller's stop".to_owned() }).await;
+    let error = stopped.unwrap_err();
+    assert_eq!(error.code, "INTERRUPTED");
+    assert!(error.message.contains("the caller's stop"), "{error}");
 }
