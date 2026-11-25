@@ -387,9 +387,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                         match applied {
                             Err(error) => return Exit::Died(error.to_string()),
                             Ok(true) => {
-                                if old.is_some() {
-                                    handshake.moved(now);
-                                }
+                                handshake.moved(now);
                                 dns.recovered(now);
                                 server = None;
                             }

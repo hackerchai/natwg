@@ -102,7 +102,12 @@ class ClientLab:
             assert self.packets("wire") == 0 and not self.handshake(), "disabled keepalive initiated traffic"
             assert self.ping(timeout=10), "the single first demand packet was lost"
             ready = self.wait(self.handshake, 2, "first demand handshake")
-        return {"keepalive": keepalive, "first_usable_txt_s": round(answered-first, 2),
+        # Waiting for an address is not time spent trying that peer. A fresh
+        # endpoint with a successful handshake must leave DNS on its healthy cadence.
+        time.sleep(6)
+        usable = self.txt().count(f"DNS TXT {NAME} {WIRE}:{PORT}")
+        assert usable == 1, self.txt()
+        return {"keepalive": keepalive, "usable_txt_answers": usable, "first_usable_txt_s": round(answered-first, 2),
                 "txt_to_authenticated_s": round(ready-answered, 2), "receive_first": bool(keepalive),
                 "client_initiations": self.packets("init"), "dns_queries": len(self.txt())}
 
