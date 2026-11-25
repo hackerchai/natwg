@@ -81,7 +81,7 @@ fn special_ranges_are_not_public() {
         "0.1.2.3",
         "10.24.0.4",
         "100.64.0.1",
-        "100.87.135.127",
+        "100.64.0.42",
         "100.127.255.254",
         "127.0.0.1",
         "169.254.1.1",
@@ -109,7 +109,7 @@ fn special_ranges_are_not_public() {
         "100.128.0.0",
         "172.15.255.255",
         "172.32.0.0",
-        "183.192.36.226",
+        "9.9.9.9",
         "198.17.255.255",
         "198.20.0.0",
         "223.5.5.5",
@@ -326,7 +326,7 @@ fn a_forwarded_port_on_a_public_address_is_supported_public() {
 fn a_kept_port_behind_carrier_nat_is_nat1() {
     // The gateway's WAN address is carrier NAT, which only kept the port.
     let observed = Observations {
-        gateway_ip: Some("100.87.135.127".parse().unwrap()),
+        gateway_ip: Some("100.64.0.42".parse().unwrap()),
         ..seen(agreeing("45.77.0.9:51830"), vec![eif()], SelfTest::Received)
     };
     let assessment = classify(&observed);

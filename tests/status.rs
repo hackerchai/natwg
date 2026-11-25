@@ -17,14 +17,14 @@ fn fixture(updated: u64) -> Status {
         iface: "en6".into(),
         listen_port: 51831,
         tun: Some("utun12".into()),
-        mapping: Some("183.192.36.226:7105".parse().unwrap()),
+        mapping: Some("203.0.113.7:52830".parse().unwrap()),
         mapping_since: Some(updated - 300),
         stun: true,
         last_stun_ok: Some(updated - 5),
         stun_misses: 0,
         publish: PublishMode::Txt,
         record: Some("_wg-home.example.com".into()),
-        published: Some("183.192.36.226:7105".parse().unwrap()),
+        published: Some("203.0.113.7:52830".parse().unwrap()),
         published_ip: None,
         published_at: Some(updated - 290),
         publish_error: None,
@@ -57,14 +57,14 @@ fn the_status_file_has_the_documented_fields() {
         "iface": "en6",
         "listen_port": 51831,
         "tun": "utun12",
-        "mapping": "183.192.36.226:7105",
+        "mapping": "203.0.113.7:52830",
         "mapping_since": 999_700,
         "stun": true,
         "last_stun_ok": 999_995,
         "stun_misses": 0,
         "publish": "txt",
         "record": "_wg-home.example.com",
-        "published": "183.192.36.226:7105",
+        "published": "203.0.113.7:52830",
         "published_ip": null,
         "published_at": 999_710,
         "publish_error": null,
@@ -108,8 +108,8 @@ fn the_human_view_shows_each_part_with_its_age() {
     let now = 1_000_004;
     let text = fixture(1_000_000).render(now);
     let expected = "\
-public endpoint : 183.192.36.226:7105 (since 304s ago)
-published TXT   : _wg-home.example.com = 183.192.36.226:7105 (294s ago)
+public endpoint : 203.0.113.7:52830 (since 304s ago)
+published TXT   : _wg-home.example.com = 203.0.113.7:52830 (294s ago)
 last STUN reply : 9s ago, misses=0
 Surge/Clash configs exported before 1970-01-12T13:41:40Z may point at an old endpoint; export them again.
 upnp/nat        : ok / ok
@@ -165,8 +165,8 @@ fn natwg_status_prints_the_status_file_for_people() {
     assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8(output.stdout).unwrap();
     for line in [
-        "public endpoint : 183.192.36.226:7105 (since 30",
-        "published TXT   : _wg-home.example.com = 183.192.36.226:7105 (29",
+        "public endpoint : 203.0.113.7:52830 (since 30",
+        "published TXT   : _wg-home.example.com = 203.0.113.7:52830 (29",
         "upnp/nat        : ok / ok",
         "peer paDfvm0HLq… endpoint=10.24.0.9:51820",
         "status written  : ",
@@ -254,7 +254,7 @@ fn a_status_of_natwg_0_3_0_reads_as_publish_txt_with_stun() {
     assert!(
         status
             .render(1_000_004)
-            .contains("published TXT   : 183.192.36.226:7105 (294s ago)"),
+            .contains("published TXT   : 203.0.113.7:52830 (294s ago)"),
         "a status without the record name shows the value alone"
     );
 }
@@ -476,7 +476,7 @@ fn client_fixture(updated: u64) -> ClientStatus {
         tun: Some("utun13".into()),
         record: Some("_wg-home.example.com".into()),
         record_type: Some(PublishMode::Txt),
-        endpoint: Some("183.192.36.226:7105".parse().unwrap()),
+        endpoint: Some("203.0.113.7:52830".parse().unwrap()),
         endpoint_since: Some(updated - 300),
         looked_up: Some(updated - 20),
         lookup_error: None,
@@ -485,7 +485,7 @@ fn client_fixture(updated: u64) -> ClientStatus {
         rebuilds: 0,
         server: Some(PeerStatus {
             key: "paDfvm0HLq…".into(),
-            endpoint: Some("183.192.36.226:7105".parse().unwrap()),
+            endpoint: Some("203.0.113.7:52830".parse().unwrap()),
             last_handshake: Some(updated - 40),
             rx: 4096,
             tx: 8192,
@@ -498,7 +498,7 @@ fn the_client_status_file_is_tagged_with_its_role() {
     let status = client_fixture(1_000_000);
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["role"], "client");
-    assert_eq!(value["endpoint"], "183.192.36.226:7105");
+    assert_eq!(value["endpoint"], "203.0.113.7:52830");
     assert_eq!(value["server"]["last_handshake"], 1_000_000 - 40);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("client.status.json");
@@ -514,9 +514,9 @@ fn the_client_human_view_shows_the_endpoint_handshake_and_traffic() {
     let now = 1_000_000;
     let text = client_fixture(now).render(now + 3);
     for line in [
-        "server endpoint : 183.192.36.226:7105 from TXT _wg-home.example.com (since 303s ago)",
+        "server endpoint : 203.0.113.7:52830 from TXT _wg-home.example.com (since 303s ago)",
         "TXT lookup      : 23s ago",
-        "handshake       : 43s ago, peer paDfvm0HLq… endpoint=183.192.36.226:7105 rx=4096 tx=8192, keepalive 25s",
+        "handshake       : 43s ago, peer paDfvm0HLq… endpoint=203.0.113.7:52830 rx=4096 tx=8192, keepalive 25s",
         "tunnel          : utun13 via en0 (10.16.0.105), rebuilds=0",
         "status written  : 3s ago",
     ] {

@@ -310,7 +310,7 @@ async fn add_delete_and_the_external_address_round_trip() {
     let (igd, calls) = fake_gateway(|action, _| match action {
         "GetExternalIPAddress" => ok(
             action,
-            "<NewExternalIPAddress>100.87.135.127</NewExternalIPAddress>",
+            "<NewExternalIPAddress>100.64.0.42</NewExternalIPAddress>",
         ),
         "AddPortMapping" | "DeletePortMapping" => ok(action, ""),
         _ => fault(401, "Invalid Action"),
@@ -318,7 +318,7 @@ async fn add_delete_and_the_external_address_round_trip() {
     .await;
     assert_eq!(
         igd.external_ip().await.unwrap(),
-        "100.87.135.127".parse::<std::net::Ipv4Addr>().unwrap()
+        "100.64.0.42".parse::<std::net::Ipv4Addr>().unwrap()
     );
     igd.add(51899, "10.24.0.4".parse().unwrap(), "natwg detect", 120)
         .await
