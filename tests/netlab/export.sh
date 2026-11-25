@@ -53,7 +53,7 @@ proxies() {
 }
 
 public_exports() {
-	local started
+	local started instance table=natwg_wgquick_natwg
 	extras public --record "$NAME=A:$PUBLIC_HOST"
 	server_config public
 	issue laptop natwg "$WORK/client.json"
@@ -66,13 +66,15 @@ public_exports() {
 	[[ $(stat -c %a "$WORK/home.conf") = 600 ]]
 	[[ $(grep -Fc '[Peer]' "$WORK/home.conf") = 3 ]]
 
-	ns host nft add table inet natwg
-	ns host nft add chain inet natwg existing
+	ns host sysctl -qw net.ipv4.ip_forward=0
+	ns host nft add table inet "$table"
+	ns host nft add chain inet "$table" existing
 	if ns host wg-quick up "$WORK/home.conf" >"$WORK/collision.log" 2>&1; then
 		die "wg-quick took an occupied table"
 	fi
-	ns host nft list chain inet natwg existing >/dev/null
-	ns host nft delete table inet natwg
+	[[ $(ns host sysctl -n net.ipv4.ip_forward) = 0 ]]
+	ns host nft list chain inet "$table" existing >/dev/null
+	ns host nft delete table inet "$table"
 	ns host wg-quick up "$WORK/home.conf"
 	started=$(date +%s)
 	client_up
@@ -80,15 +82,33 @@ public_exports() {
 	api_logged "^DNS A $NAME $PUBLIC_HOST"
 	ns peer wg-quick down "$WORK/mobile.conf"
 	ns host wg-quick down "$WORK/home.conf"
-	if ns host nft list table inet natwg >/dev/null 2>&1; then
+	if ns host nft list table inet "$table" >/dev/null 2>&1; then
 		die "wg-quick left its table behind"
 	fi
 	ns host wg-quick up "$WORK/home.conf"
-	ns host nft add chain inet natwg added_later
+	ns host nft add chain inet "$table" added_later
 	if ns host wg-quick down "$WORK/home.conf" >"$WORK/changed.log" 2>&1; then
 		die "wg-quick removed a changed table"
 	fi
-	ns host nft list chain inet natwg added_later >/dev/null
+	ns host nft list chain inet "$table" added_later >/dev/null
+	for instance in 2026 10home ip; do
+		python3 - "$WORK/server.json" "$instance" <<'PYTHON'
+import json, sys
+path, instance = sys.argv[1:]
+with open(path) as f:
+    config = json.load(f)
+config["role"]["server"]["instance"] = instance
+with open(path, "w") as f:
+    json.dump(config, f)
+PYTHON
+		ns host "$NATWG" config export --config "$WORK/server.json" --format wg-quick --out "$WORK/home.conf" --force
+		ns host wg-quick up "$WORK/home.conf"
+		ns host nft list table inet "natwg_wgquick_$instance" >/dev/null
+		ns host wg-quick down "$WORK/home.conf"
+		if ns host nft list table inet "natwg_wgquick_$instance" >/dev/null 2>&1; then
+			die "wg-quick left the table for $instance behind"
+		fi
+	done
 	echo "public: wg-quick removed its own table and preserved both foreign chains in collision tests"
 }
 
@@ -125,7 +145,8 @@ PY
 	grep -Fq "server: \"$ROUTER_WAN\"" "$WORK/tablet.yaml"
 	grep -Fq "port: $NAT_PORT" "$WORK/tablet.yaml"
 	for f in mobile.conf phone.conf tablet.yaml; do
-		grep -Eq '^# TXT snapshot at [0-9T:Z-]+; export again when the mapping changes\.$' "$WORK/$f"
+		grep -Fxq '# TXT record _wg.example.net' "$WORK/$f"
+		grep -Eq '^# Snapshot at [0-9T:Z-]+\. Export again when the mapping changes\.$' "$WORK/$f"
 	done
 	"$NATWG" status --status-file "$WORK/server.status.json" | grep -F 'Surge/Clash configs exported before'
 	started=$(date +%s)
@@ -147,6 +168,17 @@ PY
 	started=$(date +%s)
 	client_up
 	traffic "$ROUTER_LAN" "$ROUTER_WAN:$new_port" "$started"
+	ns peer wg-quick down "$WORK/mobile.conf"
+	# A recipient keeping only the native profile can read its record, resolve
+	# the new port and reconnect using the original client identity.
+	local record answer
+	record=$(awk '$1 == "#" && $2 == "TXT" && $3 == "record" {print $4}' "$WORK/first.conf")
+	answer=$(ns peer "$NATWG" probe txt "$record" --iface "$P-p0" --dns "$DNS")
+	[[ $answer = "$ROUTER_WAN:$new_port" ]]
+	sed "s/^Endpoint = .*/Endpoint = $answer/" "$WORK/first.conf" >"$WORK/mobile.conf"
+	started=$(date +%s)
+	client_up
+	traffic "$ROUTER_LAN" "$answer" "$started"
 	ns peer wg-quick down "$WORK/mobile.conf"
 	stop_daemons
 }

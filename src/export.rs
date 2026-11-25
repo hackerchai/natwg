@@ -46,12 +46,12 @@ pub async fn render(
     let mut text = String::new();
     let (host, port) = match resolve::Lookup::of(client) {
         Some(resolve::Lookup::A(host)) => (host.host.clone(), host.port),
-        Some(lookup @ resolve::Lookup::Txt(_)) => {
+        Some(lookup @ resolve::Lookup::Txt(record)) => {
             let address = snapshot(lookup, client, origin).await?;
             let at = humantime::format_rfc3339_seconds(SystemTime::now());
             writeln!(
                 text,
-                "# TXT snapshot at {at}; export again when the mapping changes."
+                "# TXT record {record}\n# Snapshot at {at}. Export again when the mapping changes."
             )
             .unwrap();
             (address.ip().to_string(), address.port())
