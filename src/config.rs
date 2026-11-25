@@ -1,6 +1,8 @@
 //! The natwg configuration is one JSON file, readable only by its owner, that holds
 //! the keys, the peers, and either the server or the client role.
 
+pub mod set;
+
 use crate::keys::{self, Key, PublicKey, Secret};
 use crate::wire::dns::{self, RecordKind};
 use crate::{Error, Result};
