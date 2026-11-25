@@ -9,13 +9,11 @@ pub(super) fn firewall(server: &ServerConfig, subnet: Ipv4Network) -> String {
     let forwarding = "net.inet.ip.forwarding";
     #[cfg(not(target_os = "macos"))]
     let forwarding = "net.ipv4.ip_forward";
-    writeln!(
-        hooks,
-        "PostUp = sysctl -w {forwarding}=1 && test \"$(sysctl -n {forwarding})\" = 1"
-    )
-    .unwrap();
+    let enable = format!(r#"sysctl -w {forwarding}=1 && test "$(sysctl -n {forwarding})" = 1"#);
     if let Some(rule) = Rule::new(&server.instance, &server.iface, subnet, &server.lan) {
-        nat_hooks(&mut hooks, server, &rule);
+        nat_hooks(&mut hooks, server, &rule, &enable);
+    } else {
+        hook(&mut hooks, "PostUp", &enable);
     }
     hooks
 }
@@ -33,29 +31,26 @@ fn rule_input(rules: &str) -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn nat_hooks(text: &mut String, server: &ServerConfig, rule: &Rule) {
-    let table = &server.instance;
-    let rules = crate::nat::nft::table(rule);
+fn nat_hooks(text: &mut String, server: &ServerConfig, rule: &Rule, enable: &str) {
+    let table = format!("natwg_wgquick_{}", server.instance);
+    let rules = crate::nat::nft::table(rule, &table);
     // Exclusive create and installation of all rules are one nft transaction.
     let create = rule_input(&format!("create table inet {table}\n{rules}"));
-    hook(text, "PostUp", &format!("{create} | nft -f -"));
     let expected = rule_input(&rules);
+    let remove = format!(
+        r#"current=$(nft list table inet {table}) && [[ "$current" = "$({expected})" ]] && nft delete table inet {table} || {{ echo 'Refusing to remove changed nftables table inet {table}' >&2; exit 1; }}"#
+    );
+    hook(text, "PostUp", &format!("{create} | nft -f -"));
     hook(
         text,
-        "PostDown",
-        &format!(
-            r#"
-        current=$(nft list table inet {table}) &&
-        [[ "$current" = "$({expected})" ]] &&
-        nft delete table inet {table} ||
-        {{ echo 'Refusing to remove changed nftables table inet {table}' >&2; exit 1; }}
-    "#
-        ),
+        "PostUp",
+        &format!("{enable} || {{ {remove}; exit 1; }}"),
     );
+    hook(text, "PostDown", &remove);
 }
 
 #[cfg(target_os = "macos")]
-fn nat_hooks(text: &mut String, server: &ServerConfig, rule: &Rule) {
+fn nat_hooks(text: &mut String, server: &ServerConfig, rule: &Rule, enable: &str) {
     let anchor = crate::nat::pf::anchor(&server.instance);
     let input = rule_input(&crate::nat::pf::text(rule));
     let state = format!("/var/run/natwg-wg-quick-{}", server.instance);
@@ -79,6 +74,8 @@ fn nat_hooks(text: &mut String, server: &ServerConfig, rule: &Rule) {
         read -r token < {state}/token; [[ $token =~ ^[0-9]+$ ]];
         trap 'pfctl -X "$token"; rm -f {state}/token; rmdir {state}' EXIT;
         {input} | pfctl -a {anchor} -N -f -;
+        trap 'pfctl -a {anchor} -F nat; pfctl -X "$token"; rm -f {state}/token; rmdir {state}' EXIT;
+        {enable} || exit 1;
         trap - EXIT)
     "#
         ),

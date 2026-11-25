@@ -488,7 +488,8 @@ fn run(cli: Cli) -> Result<()> {
             action: ConfigAction::Export { format, output },
         } => {
             let config = Config::load(&cli.config)?;
-            output.write(&cli.config, &config, format, "natwg", None)?;
+            let text = output.render(&cli.config, &config, format, "natwg", None)?;
+            output.write(&text)?;
         }
         Action::Config {
             action: ConfigAction::Show,
@@ -519,10 +520,11 @@ fn run(cli: Cli) -> Result<()> {
         Action::Config {
             action: ConfigAction::Doctor { force },
         } => {
-            let _lock = lock_config_dir(&cli.config)?;
-            let mut config = Config::load(&cli.config)?;
+            let path = config_target(&cli.config)?;
+            let _lock = lock_config_dir(&path)?;
+            let mut config = Config::load(&path)?;
             let doctor = config.add_doctor(force)?;
-            config.save(&cli.config)?;
+            config.save(&path)?;
             say!(
                 "doctor {} public key {}",
                 doctor.address,
@@ -643,12 +645,14 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn config_set(path: &Path, action: SetAction, dry_run: bool) -> Result<()> {
+fn config_set(input: &Path, action: SetAction, dry_run: bool) -> Result<()> {
     let setting = match action {
         SetAction::Address { address } => Setting::Address(address),
         SetAction::Lan { lans } => Setting::Lan(lans),
         SetAction::AllowedIps { networks } => Setting::AllowedIps(networks),
     };
+    let target = config_target(input)?;
+    let path = target.as_path();
     let _lock = lock_config_dir(path)?;
     let mut config = Config::load(path)?;
     let change = set::apply(&mut config, &setting)?;
@@ -688,6 +692,12 @@ fn config_set(path: &Path, action: SetAction, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+// Update the same file the daemon reads, including when --config is a symlink.
+fn config_target(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
+        .map_err(|e| Error::new("CONFIG_UNREADABLE", format!("{}: {e}", path.display())))
+}
+
 // The config itself is replaced by rename. Lock its stable parent while a
 // read/modify/write command chooses an address and delivers the private key.
 fn lock_config_dir(path: &Path) -> Result<File> {
@@ -704,14 +714,14 @@ fn lock_config_dir(path: &Path) -> Result<File> {
 }
 
 impl ExportOutput {
-    fn write(
+    fn render(
         &self,
         input: &Path,
         config: &Config,
         format: Format,
         name: &str,
         origin: Option<&natwg::config::ServerConfig>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let storage = |e: io::Error| Error::new("EXPORT_OUTPUT", e.to_string());
         let dest = match self.out.as_deref() {
             Some(path) => match path.metadata() {
@@ -738,10 +748,22 @@ impl ExportOutput {
                 "the output refers to the input config; choose a separate file",
             ));
         }
-        let text = runtime(tokio::runtime::Builder::new_current_thread())?
-            .block_on(export::render(config, format, name, origin))?;
+        if let Some(path) = &self.out
+            && !self.force
+            && path.symlink_metadata().is_ok()
+        {
+            return Err(Error::new(
+                "CONFIG_EXISTS",
+                format!("{} exists already; --force replaces it", path.display()),
+            ));
+        }
+        runtime(tokio::runtime::Builder::new_current_thread())?
+            .block_on(export::render(config, format, name, origin))
+    }
+
+    fn write(&self, text: &str) -> Result<()> {
         if let Some(path) = &self.out {
-            natwg::config::write_private(path, &text, self.force)?;
+            natwg::config::write_private(path, text, self.force)?;
             warn!(
                 "Wrote {} (mode 0600; contains a private key)",
                 path.display()
@@ -751,13 +773,45 @@ impl ExportOutput {
             stdout
                 .write_all(text.as_bytes())
                 .and_then(|()| stdout.flush())
-                .map_err(storage)?;
+                .map_err(|e| Error::new("EXPORT_OUTPUT", e.to_string()))?;
         }
+        Ok(())
+    }
+
+    fn enroll(&self, input: &Path, before: &Config, after: &Config, text: &str) -> Result<()> {
+        let Some(path) = &self.out else {
+            self.write(text)?;
+            return after.save(input);
+        };
+        // Sync the new identity before enrolling it. Delay replacing any existing
+        // profile (which may hold the only copy of a private key) until the server saves.
+        let stage = natwg::config::stage_private(path, text)?;
+        after.save(input)?;
+        if let Err((error, mut stage)) = natwg::config::publish_private(stage, path, self.force) {
+            if let Err(rollback) = before.save(input) {
+                stage.disable_cleanup(true);
+                return Err(Error::new(
+                    "ENROLL_RECOVERY",
+                    format!(
+                        "{error}; restoring {} failed: {rollback}; the new private profile is at {}",
+                        input.display(),
+                        stage.path().display()
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+        warn!(
+            "Wrote {} (mode 0600; contains a private key)",
+            path.display()
+        );
         Ok(())
     }
 }
 
-fn peer_action(path: &Path, action: PeerAction) -> Result<()> {
+fn peer_action(input: &Path, action: PeerAction) -> Result<()> {
+    let target = config_target(input)?;
+    let path = target.as_path();
     let _lock = match action {
         PeerAction::List => None,
         _ => Some(lock_config_dir(path)?),
@@ -776,9 +830,10 @@ fn peer_action(path: &Path, action: PeerAction) -> Result<()> {
             format,
             output,
         } => {
+            let before = config.clone();
             let client = peer::add(&mut config, &name)?;
-            output.write(path, &client, format, &name, Some(config.server()?))?;
-            config.save(path)?;
+            let profile = output.render(path, &client, format, &name, Some(config.server()?))?;
+            output.enroll(path, &before, &config, &profile)?;
             let address = client.interface.address;
             warn!(
                 "Added peer {name} at {address} to {}; sudo natwg service restart loads it",

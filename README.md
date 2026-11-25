@@ -352,7 +352,11 @@ sudo natwg config export --config roaming-phone.json --format surge --out roamin
   TXT answer. Re-export the device's client JSON when the mapping changes.
   A direct `peer add --format surge|clash|wg-quick` also takes a snapshot.
   If that exported profile is your only copy, retain its keys and update
-  the endpoint from the current TXT answer. For 24 hours after first seeing
+  the endpoint from the TXT name in its first comment. Run
+  `dig +short TXT <record-name>` and use the returned `IPv4:port` for
+  wg-quick’s `Endpoint` or Surge’s peer `endpoint`. In mihomo, put the IPv4
+  address in `server` and the number in `port`. Reload the profile.
+  For 24 hours after first seeing
   a mapping, `natwg status` shows the UTC cutoff for older snapshots. A
   server restart starts that observation period again.
 - **Surge and Clash (mihomo)** route the tunnel subnet and configured LANs
@@ -382,7 +386,7 @@ including the doctor if configured. Re-export after changing the peer list.
 
 The hooks enable IPv4 forwarding and apply source NAT to the listed LANs
 through the configured uplink. Linux needs nftables and creates the
-instance's own table. macOS uses the `com.apple/<instance>` pf anchor and
+`inet natwg_wgquick_<instance>` table. macOS uses the `com.apple/<instance>` pf anchor and
 holds a pf enable reference while the tunnel is up. Teardown removes the
 exported rules and leaves system IP forwarding enabled. An occupied
 nftables table or an occupied pf NAT anchor stops setup. If someone changes

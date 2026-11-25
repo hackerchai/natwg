@@ -743,6 +743,12 @@ impl Config {
 
 /// Atomically publish secret text after the owner-only file is fully written.
 pub fn write_private(path: &Path, text: &str, replace: bool) -> Result<()> {
+    let stage = stage_private(path, text)?;
+    publish_private(stage, path, replace).map_err(|(err, _)| err)
+}
+
+/// Prepare and sync the complete secret beside its destination before committing it.
+pub fn stage_private(path: &Path, text: &str) -> Result<tempfile::NamedTempFile> {
     let storage =
         |e: std::io::Error| Error::new("CONFIG_STORAGE", format!("{}: {e}", path.display()));
     let dir = path
@@ -754,7 +760,10 @@ pub fn write_private(path: &Path, text: &str, replace: bool) -> Result<()> {
         .mode(0o700)
         .create(dir)
         .map_err(storage)?;
-    let mut stage = tempfile::NamedTempFile::new_in(dir).map_err(storage)?;
+    let mut stage = tempfile::Builder::new()
+        .prefix(".natwg-pending-")
+        .tempfile_in(dir)
+        .map_err(storage)?;
     stage
         .as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))
@@ -764,19 +773,30 @@ pub fn write_private(path: &Path, text: &str, replace: bool) -> Result<()> {
         .write_all(text.as_bytes())
         .and_then(|()| stage.as_file().sync_all())
         .map_err(storage)?;
+    Ok(stage)
+}
+
+/// On failure the caller still owns the staged key and can recover it.
+pub fn publish_private(
+    stage: tempfile::NamedTempFile,
+    path: &Path,
+    replace: bool,
+) -> std::result::Result<(), (Error, tempfile::NamedTempFile)> {
     let persisted = if replace {
         stage.persist(path)
     } else {
         stage.persist_noclobber(path)
     };
-    persisted.map_err(|e| match e.error.kind() {
-        std::io::ErrorKind::AlreadyExists => Error::new(
-            "CONFIG_EXISTS",
-            format!("{} exists already; --force replaces it", path.display()),
-        ),
-        _ => storage(e.error),
-    })?;
-    Ok(())
+    persisted.map(|_| ()).map_err(|e| {
+        let error = match e.error.kind() {
+            std::io::ErrorKind::AlreadyExists => Error::new(
+                "CONFIG_EXISTS",
+                format!("{} exists already; --force replaces it", path.display()),
+            ),
+            _ => Error::new("CONFIG_STORAGE", format!("{}: {}", path.display(), e.error)),
+        };
+        (error, e.file)
+    })
 }
 
 /// A name of labels from A-Z, a-z, 0-9, '-' and '_' that fits a DNS query.

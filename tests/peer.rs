@@ -546,6 +546,91 @@ fn a_failed_txt_snapshot_cannot_silently_fall_back_to_a_stale_endpoint() {
 }
 
 #[test]
+fn peer_edits_follow_a_symlink_and_keep_the_daemon_config_in_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.json");
+    let original = public_server(&path);
+    let aliases = dir.path().join("aliases");
+    fs::create_dir(&aliases).unwrap();
+    let alias = aliases.join("active.json");
+    std::os::unix::fs::symlink("../server.json", &alias).unwrap();
+    let new = natwg(&alias, &["add", "watch"]);
+    assert!(new.status.success());
+    let client: Config = serde_json::from_slice(&new.stdout).unwrap();
+    let enrolled = Config::load(&path).unwrap();
+    assert_eq!(
+        enrolled.peers.last().unwrap().public_key,
+        client.private_key.public_key()
+    );
+    assert!(alias.is_symlink());
+    assert!(natwg(&alias, &["remove", "watch"]).status.success());
+    assert!(alias.is_symlink());
+    assert_eq!(Config::load(&path).unwrap(), original);
+}
+
+#[test]
+fn failed_server_save_preserves_the_previous_client_profile_under_force() {
+    // Root bypasses the directory permissions used for this failure.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let server_dir = dir.path().join("server");
+    fs::create_dir(&server_dir).unwrap();
+    let path = server_dir.join("server.json");
+    public_server(&path);
+    let out = dir.path().join("device.conf");
+    let out_args = [
+        "--out",
+        out.to_str().unwrap(),
+        "--format",
+        "wg-quick",
+        "--force",
+    ];
+    assert!(
+        natwg(&path, &[&["add", "old"][..], &out_args].concat())
+            .status
+            .success()
+    );
+    let old_server = fs::read(&path).unwrap();
+    let old_profile = fs::read(&out).unwrap();
+    fs::set_permissions(&server_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let failed = natwg(&path, &[&["add", "new"][..], &out_args].concat());
+    fs::set_permissions(&server_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("CONFIG_STORAGE"));
+    assert!(fs::read(&out).unwrap() == old_profile);
+    assert!(fs::read(&path).unwrap() == old_server);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_immutable_profile_rolls_back_enrollment_after_the_server_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = dir.path().join("server.json");
+    let original = public_server(&server);
+    let out = dir.path().join("device.conf");
+    fs::write(&out, "existing private profile").unwrap();
+    let immutable = |flag| {
+        Command::new("chflags")
+            .arg(flag)
+            .arg(&out)
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(immutable("uchg"));
+    let result = natwg(
+        &server,
+        &["add", "watch", "--out", out.to_str().unwrap(), "--force"],
+    );
+    assert!(immutable("nouchg"));
+    assert!(!result.status.success());
+    assert_eq!(Config::load(&server).unwrap(), original);
+    assert_eq!(fs::read_to_string(out).unwrap(), "existing private profile");
+}
+
+#[test]
 fn concurrent_enrollments_persist_both_device_identities() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("server.json");
@@ -608,12 +693,22 @@ esac
     )
     .unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+    let sysctl = dir.path().join("sysctl");
+    fs::write(
+        &sysctl,
+        r#"#!/bin/bash
+case "$1" in
+    -w) test ! -e fail_forward && echo 1 > forwarding ;;
+    -n) cat forwarding ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&sysctl, fs::Permissions::from_mode(0o700)).unwrap();
+    let forwarding = dir.path().join("forwarding");
+    fs::write(&forwarding, "0").unwrap();
     let run = |phase: &str| {
-        for line in config
-            .lines()
-            .filter_map(|l| l.strip_prefix(phase))
-            .filter(|l| l.contains("pfctl"))
-        {
+        for line in config.lines().filter_map(|l| l.strip_prefix(phase)) {
             let hook = line.replace("/var/run/natwg-wg-quick-natwg_next", "./lease");
             let result = Command::new("/bin/bash")
                 .args(["-e", "-o", "pipefail", "-c", &hook])
@@ -631,8 +726,16 @@ esac
     fs::write(&rules, "foreign NAT rule\n").unwrap();
     assert!(!run("PostUp = "));
     assert_eq!(fs::read_to_string(&rules).unwrap(), "foreign NAT rule\n");
+    assert_eq!(fs::read_to_string(&forwarding).unwrap(), "0");
     fs::write(&rules, "").unwrap();
+    fs::write(dir.path().join("fail_forward"), "").unwrap();
+    assert!(!run("PostUp = "));
+    assert!(!dir.path().join("enabled").exists());
+    assert!(!dir.path().join("lease").exists());
+    assert_eq!(fs::read_to_string(&rules).unwrap(), "");
+    fs::remove_file(dir.path().join("fail_forward")).unwrap();
     assert!(run("PostUp = "));
+    assert_eq!(fs::read_to_string(&forwarding).unwrap().trim(), "1");
     let own = fs::read_to_string(&rules).unwrap();
     assert_eq!(own.lines().count(), 2);
     // Parse exactly the generated translation rules, without loading them.
