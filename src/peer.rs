@@ -15,7 +15,7 @@ const NAME_MAX: usize = 32;
 /// preshared key, and the lowest host of the tunnel subnet that is not the
 /// server's, the doctor's or inside a peer's allowed IPs. Returns the config
 /// of the new client, which finds the server through its TXT record and
-/// routes the tunnel subnet and the LAN to it.
+/// routes the tunnel subnet and every LAN to it.
 pub fn add(config: &mut Config, name: &str) -> Result<Config> {
     let server = config.server()?;
     if !is_name(name) {
@@ -43,11 +43,6 @@ pub fn add(config: &mut Config, name: &str) -> Result<Config> {
     })?;
     let key = Key::generate()?;
     let preshared = Key::generate()?;
-    let tunnel = Ipv4Network::new(
-        config.interface.address.network(),
-        config.interface.address.prefix(),
-    )
-    .expect("the prefix of a network is a valid prefix");
     let client = Config {
         version: Version1,
         private_key: key.clone(),
@@ -59,7 +54,9 @@ pub fn add(config: &mut Config, name: &str) -> Result<Config> {
             name: SERVER_PEER.to_owned(),
             public_key: config.private_key.public_key(),
             preshared_key: Some(preshared.clone()),
-            allowed_ips: vec![tunnel, server.lan],
+            allowed_ips: std::iter::once(config.interface.subnet())
+                .chain(server.lan.iter().copied())
+                .collect(),
             endpoint: None,
             keepalive: Some(CLIENT_KEEPALIVE),
         }],

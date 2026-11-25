@@ -205,6 +205,113 @@ fn the_tunnel_subnet_and_the_lan_must_not_overlap() {
     }
 }
 
+fn lans_of(config: &Config) -> Vec<String> {
+    let Role::Server(server) = &config.role else {
+        panic!("expected a server config")
+    };
+    server.lan.iter().map(ToString::to_string).collect()
+}
+
+#[test]
+fn the_lan_loads_from_a_list_or_from_the_one_string_that_natwg_0_2_wrote() {
+    let with_lan = |lan: Option<Value>| {
+        let mut value = server_json();
+        let server = value["role"]["server"].as_object_mut().unwrap();
+        match lan {
+            Some(lan) => server.insert("lan".to_owned(), lan),
+            None => server.remove("lan"),
+        };
+        load_value(&value)
+    };
+    for (lan, expected) in [
+        (Some(json!("10.73.0.0/24")), &["10.73.0.0/24"][..]),
+        (Some(json!(["10.73.0.0/24"])), &["10.73.0.0/24"]),
+        (
+            Some(json!(["10.73.0.0/24", "192.168.50.0/24"])),
+            &["10.73.0.0/24", "192.168.50.0/24"],
+        ),
+        (Some(json!([])), &[]),
+        (None, &[]),
+    ] {
+        let config = with_lan(lan.clone()).unwrap();
+        assert_eq!(lans_of(&config), expected, "{lan:?}");
+    }
+    for lan in [
+        json!("10.73.0.0/33"),
+        json!(["10.73.0.0/24", "lan"]),
+        json!(24),
+        json!({ "lan": "10.73.0.0/24" }),
+    ] {
+        assert_eq!(
+            with_lan(Some(lan.clone())).unwrap_err().code,
+            "CONFIG_INVALID",
+            "{lan}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let config = load_value(&server_json()).unwrap();
+    config.save(&path).unwrap();
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        saved["role"]["server"]["lan"],
+        json!(["10.73.0.0/24"]),
+        "natwg writes the list form"
+    );
+    assert_eq!(Config::load(&path).unwrap(), config);
+}
+
+fn with_lans(lans: &[&str]) -> impl FnOnce(&mut Value) {
+    let lans = json!(lans);
+    move |config| config["role"]["server"]["lan"] = lans
+}
+
+#[test]
+fn every_lan_lies_outside_the_tunnel_subnet_and_apart_from_the_others() {
+    for lans in [
+        &[][..],
+        &["10.73.0.0/24", "192.168.50.0/24", "172.16.0.0/12"],
+        &["10.73.0.0/24", "10.73.1.0/24"],
+        &["10.66.67.0/24"],
+    ] {
+        validated(with_lans(lans)).unwrap_or_else(|e| panic!("{lans:?}: {e}"));
+    }
+    for (lans, field, why) in [
+        (
+            &["10.73.0.0/24", "10.66.66.128/25"][..],
+            "interface.address",
+            "role.server.lan[1] 10.66.66.128/25 overlap",
+        ),
+        (
+            &["10.0.0.0/8"],
+            "interface.address",
+            "role.server.lan[0] 10.0.0.0/8 overlap",
+        ),
+        (
+            &["10.73.0.0/24", "10.73.0.0/24"],
+            "role.server.lan[1]",
+            "overlaps role.server.lan[0] 10.73.0.0/24",
+        ),
+        (
+            &["192.168.50.0/24", "10.73.0.0/16", "10.73.5.0/24"],
+            "role.server.lan[2]",
+            "overlaps role.server.lan[1] 10.73.0.0/16",
+        ),
+        (
+            &["10.73.0.0/24", "0.0.0.0/0"],
+            "role.server.lan[1]",
+            "default route",
+        ),
+    ] {
+        let error = validated(with_lans(lans)).unwrap_err();
+        assert!(
+            error.starts_with(field) && error.contains(why),
+            "{lans:?}: {error}"
+        );
+    }
+}
+
 #[test]
 fn the_mtu_must_be_between_576_and_9000() {
     for mtu in [576, 1380, 9000] {

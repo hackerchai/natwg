@@ -117,11 +117,11 @@ pub struct Probe {
     pub reply: Option<Duration>,
 }
 
-/// Ping the server's tunnel address and the first host of its LAN from a
-/// client that runs in this process and dials `endpoint` through `iface`, or
-/// through the server's interface. Each target gets one echo request a second
-/// until it replies, `attempts` at most. A reply from the LAN proves that the
-/// server forwards and translates tunnel traffic.
+/// Ping the server's tunnel address and the first host of its first LAN, if
+/// it has one, from a client that runs in this process and dials `endpoint`
+/// through `iface`, or through the server's interface. Each target gets one
+/// echo request a second until it replies, `attempts` at most. A reply from
+/// the LAN proves that the server forwards and translates tunnel traffic.
 pub async fn loopback(
     config: &Config,
     iface: Option<&str>,
@@ -135,11 +135,17 @@ pub async fn loopback(
             "the server config has no doctor section with a private key and a tunnel address",
         )
     })?;
-    let lan_host = server.lan.nth(1).unwrap_or(server.lan.network());
-    let mut probes = [config.interface.address.ip(), lan_host].map(|target| Probe {
-        target,
-        reply: None,
-    });
+    let lan_host = server
+        .lan
+        .first()
+        .map(|lan| lan.nth(1).unwrap_or(lan.network()));
+    let mut probes: Vec<Probe> = std::iter::once(config.interface.address.ip())
+        .chain(lan_host)
+        .map(|target| Probe {
+            target,
+            reply: None,
+        })
+        .collect();
     let mut client = Detached::doctor(config, doctor, iface, endpoint).await?;
     let id = std::process::id() as u16;
     let mut sent = Vec::new();
@@ -178,5 +184,5 @@ pub async fn loopback(
             }
         }
     }
-    Ok(probes.to_vec())
+    Ok(probes)
 }

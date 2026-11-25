@@ -1,12 +1,12 @@
 //! On Linux, NAT is the nftables table `inet <instance>` with one masquerade
-//! rule.
+//! rule per LAN.
 
 use super::{Rule, printed};
 use crate::config::Instance;
 use crate::netcfg::Step;
 
-/// Replace the table of the instance with one that holds the rule, then turn
-/// IP forwarding on.
+/// Replace the table of the instance with one that holds the rules, then
+/// turn IP forwarding on.
 pub fn up(rule: &Rule) -> Vec<Step> {
     let load = format!("{}{}", delete(&rule.instance), table(rule));
     vec![Step::new(&["nft", "-f", "-"]).stdin(load), forwarding()]
@@ -33,15 +33,21 @@ fn table(rule: &Rule) -> String {
         instance,
         iface,
         tunnel,
-        lan,
+        lans,
     } = rule;
-    let (tunnel, lan) = (printed(*tunnel), printed(*lan));
+    let tunnel = printed(*tunnel);
+    let masquerade: String = lans
+        .iter()
+        .map(|lan| {
+            let lan = printed(*lan);
+            format!("\t\toifname \"{iface}\" ip saddr {tunnel} ip daddr {lan} masquerade\n")
+        })
+        .collect();
     format!(
         "table inet {instance} {{
 	chain postrouting {{
 		type nat hook postrouting priority srcnat; policy accept;
-		oifname \"{iface}\" ip saddr {tunnel} ip daddr {lan} masquerade
-	}}
+{masquerade}	}}
 }}
 "
     )

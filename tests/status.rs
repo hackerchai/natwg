@@ -254,6 +254,19 @@ fn natwg_status_exits_0_when_upnp_is_off() {
     assert!(output.status.success(), "{output:?}");
 }
 
+#[test]
+fn natwg_status_exits_0_when_a_server_without_a_lan_has_nat_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("status.json");
+    let mut status = fixture(now());
+    status.nat_ok = None;
+    status.write(&path).unwrap();
+    let output = natwg_status(&["--status-file", path.to_str().unwrap()]);
+    assert!(output.status.success(), "{output:?}");
+    let shown = String::from_utf8(output.stdout).unwrap();
+    assert!(shown.contains("upnp/nat        : ok / off"), "{shown}");
+}
+
 fn client_fixture(updated: u64) -> ClientStatus {
     ClientStatus {
         role: ClientRole::Client,

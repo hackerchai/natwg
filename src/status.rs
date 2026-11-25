@@ -40,7 +40,8 @@ pub struct Status {
     /// None when the config has no UPnP section or the first lease is pending.
     pub upnp_ok: Option<bool>,
     pub upnp_at: Option<u64>,
-    /// None while no tunnel runs.
+    /// None while no tunnel runs, and for a server without a LAN, which
+    /// loads no NAT rule.
     pub nat_ok: Option<bool>,
     /// How many times natwg rebuilt a tunnel that died.
     pub rebuilds: u32,
@@ -169,8 +170,9 @@ impl Status {
 
     /// What this status shows to be wrong at `now`, for people to read.
     /// None of it holds while the server serves: the status is fresh, a
-    /// tunnel runs with its NAT rule, there is a public mapping, the last TXT
-    /// publish worked, and UPnP did not fail. UPnP that is off is fine.
+    /// tunnel runs, its NAT rule works, there is a public mapping, the last
+    /// TXT publish worked, and UPnP did not fail. UPnP that is off is fine,
+    /// and so is NAT that is off because the server has no LAN.
     pub fn problems(&self, now: u64) -> Vec<String> {
         let age = now.saturating_sub(self.updated);
         let tunnel = self.tun.is_some();
@@ -178,7 +180,7 @@ impl Status {
             (age > STALE_AFTER, format!("the status is {age}s old")),
             (!tunnel, "no tunnel runs".to_owned()),
             (
-                tunnel && self.nat_ok != Some(true),
+                tunnel && self.nat_ok == Some(false),
                 "NAT is not ok".to_owned(),
             ),
             (self.mapping.is_none(), "no public mapping".to_owned()),
