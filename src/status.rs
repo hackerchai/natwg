@@ -290,6 +290,18 @@ impl Status {
                     age(self.published_at)
                 ));
                 lines.push(stun);
+                // mapping_since also starts anew after a daemon restart.
+                if let Some(since) = self.mapping_since
+                    && self.mapping.is_some()
+                    && now.checked_sub(since).is_some_and(|age| age < 24 * 60 * 60)
+                    && let Some(time) =
+                        UNIX_EPOCH.checked_add(std::time::Duration::from_secs(since))
+                    && since < 253_402_300_800
+                // RFC 3339 ends in year 9999
+                {
+                    let at = humantime::format_rfc3339_seconds(time);
+                    lines.push(format!("Surge/Clash configs exported before {at} may point at an old endpoint; export them again."));
+                }
             }
             PublishMode::A => {
                 let public = match (self.public_ip, self.public_by) {

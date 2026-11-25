@@ -312,6 +312,82 @@ config, or writes it to `--out` readable only by its owner. That file holds the
 client's private key, so move it to the client privately. The new client routes
 the tunnel subnet and every LAN of the server.
 
+### Export WireGuard, Surge and Clash clients
+
+Give **each device or app its own peer**. A natwg laptop, a phone running
+Surge and a tablet running Clash each need a different private key and
+tunnel address. Reusing one identity on two devices makes the server send
+traffic to whichever device handshook last.
+
+```sh
+sudo natwg peer add laptop --out laptop.json
+sudo natwg peer add phone --format surge --out phone.conf
+sudo natwg peer add tablet --format clash --out tablet.yaml
+sudo natwg peer add travel --format wg-quick --out travel.conf
+sudo natwg service restart
+```
+
+The default format, `natwg`, is the client JSON with DNS discovery intact.
+`peer add` is the one time the server can deliver the new device's private
+key. Use `--out` to write a mode **0600** file and transfer it privately.
+Without `--out`, the private key goes to stdout. Shell redirection uses your
+shell's file permissions. Existing files require `--force`.
+
+To refresh or convert the same device later, keep its natwg client JSON in
+private storage. For example, issue a phone as JSON and export its Surge
+profile from that file:
+
+```sh
+sudo natwg peer add roaming-phone --out roaming-phone.json
+sudo natwg config export --config roaming-phone.json --format surge --out roaming-phone.conf
+# After the server's NAT mapping changes:
+sudo natwg config export --config roaming-phone.json --format surge --out roaming-phone.conf --force
+```
+
+- **Public mode** keeps the configured hostname and port, such as
+  `home.example.com:51830`. A client with only a static endpoint keeps its
+  IPv4 address and port.
+- **NAT1** needs a running natwg server to maintain and publish the mapping.
+  wg-quick, Surge and mihomo receive a timestamped snapshot of the current
+  TXT answer. Re-export the device's client JSON when the mapping changes.
+  A direct `peer add --format surge|clash|wg-quick` also takes a snapshot.
+  If that exported profile is your only copy, retain its keys and update
+  the endpoint from the current TXT answer. For 24 hours after first seeing
+  a mapping, `natwg status` shows the UTC cutoff for older snapshots. A
+  server restart starts that observation period again.
+- **Surge and Clash (mihomo)** route the tunnel subnet and configured LANs
+  to WireGuard. Other traffic uses the final direct rule. To add the export
+  to an existing profile, merge the proxy and WireGuard settings and place
+  the exported IP-CIDR rules before broader rules. Keep your existing final
+  rule. Surge accepts tunnel MTUs from 576 to 1420. See the
+  [Surge WireGuard manual](https://manual.nssurge.com/policies/wireguard.html)
+  and [mihomo WireGuard reference](https://wiki.metacubex.one/en/config/proxies/wg/).
+
+### Export a plain WireGuard server
+
+On the intended server OS, export a public-mode server config
+(`role.server.publish = "a"`) after adding its devices:
+
+```sh
+sudo natwg config export --config server.json --format wg-quick --out home.conf
+sudo wg-quick up ./home.conf
+sudo wg-quick down ./home.conf
+```
+
+Use a reachable fixed UDP port. Arrange DNS and any router port forwarding
+separately while running plain WireGuard. Stop any natwg instance serving
+this port and subnet before bringing up wg-quick. The export contains the
+server's private key and the public identity of every configured peer,
+including the doctor if configured. Re-export after changing the peer list.
+
+The hooks enable IPv4 forwarding and apply source NAT to the listed LANs
+through the configured uplink. Linux needs nftables and creates the
+instance's own table. macOS uses the `com.apple/<instance>` pf anchor and
+holds a pf enable reference while the tunnel is up. Teardown removes the
+exported rules and leaves system IP forwarding enabled. An occupied
+nftables table or an occupied pf NAT anchor stops setup. If someone changes
+its rules while the tunnel is up, teardown reports the conflict.
+
 ### Choose the tunnel subnet and the LANs
 
 The server's `interface.address` is its tunnel address, and the prefix sets the

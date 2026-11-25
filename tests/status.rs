@@ -111,6 +111,7 @@ fn the_human_view_shows_each_part_with_its_age() {
 public endpoint : 203.0.113.7:52830 (since 304s ago)
 published TXT   : _wg-home.example.com = 203.0.113.7:52830 (294s ago)
 last STUN reply : 9s ago, misses=0
+Surge/Clash configs exported before 1970-01-12T13:41:40Z may point at an old endpoint; export them again.
 upnp/nat        : ok / ok
 tunnel          : utun12 on en6 udp/51831, rebuilds=1
 peer paDfvm0HLq… endpoint=10.73.0.9:51820 handshake=16s ago rx=1024 tx=2048
@@ -652,4 +653,18 @@ fn natwg_status_of_a_healthy_client_exits_0_and_prints_json_as_written() {
         output.status.success(),
         "without a keepalive an old handshake is no problem: {output:?}"
     );
+}
+
+#[test]
+fn the_snapshot_notice_only_applies_to_a_recent_txt_mapping() {
+    let now = 1_000_000;
+    let mut status = fixture(now);
+    status.mapping_since = Some(now - 24 * 3600);
+    assert!(!status.render(now).contains("Surge/Clash"));
+    status.mapping_since = Some(now - 1);
+    status.publish = PublishMode::A;
+    assert!(!status.render(now).contains("Surge/Clash"));
+    status.publish = PublishMode::Txt;
+    status.mapping = None;
+    assert!(!status.render(now).contains("Surge/Clash"));
 }

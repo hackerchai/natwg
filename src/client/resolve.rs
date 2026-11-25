@@ -21,6 +21,15 @@ pub const DEFAULT_RESOLVERS: [Ipv4Addr; 4] = [
     Ipv4Addr::new(8, 8, 8, 8),
 ];
 
+/// Configured DNS servers in lookup order, or the client's defaults.
+pub fn resolvers(client: &ClientConfig, port: u16) -> Vec<SocketAddrV4> {
+    let ips = match &client.resolvers[..] {
+        [] => &DEFAULT_RESOLVERS[..],
+        configured => configured,
+    };
+    ips.iter().map(|&ip| SocketAddrV4::new(ip, port)).collect()
+}
+
 // A TXT value is quoted in an error only up to this length.
 const SHOWN: usize = 64;
 
