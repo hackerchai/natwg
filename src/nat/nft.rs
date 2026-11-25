@@ -8,7 +8,11 @@ use crate::netcfg::Step;
 /// Replace the table of the instance with one that holds the rules, then
 /// turn IP forwarding on.
 pub fn up(rule: &Rule) -> Vec<Step> {
-    let load = format!("{}{}", delete(&rule.instance), table(rule));
+    let load = format!(
+        "{}{}",
+        delete(&rule.instance),
+        table(rule, rule.instance.as_str())
+    );
     vec![Step::new(&["nft", "-f", "-"]).stdin(load), forwarding()]
 }
 
@@ -28,12 +32,12 @@ fn delete(instance: &Instance) -> String {
 }
 
 // Each line reads as `nft list table` prints it, so `foreign` compares lines.
-fn table(rule: &Rule) -> String {
+pub(crate) fn table(rule: &Rule, name: &str) -> String {
     let Rule {
-        instance,
         iface,
         tunnel,
         lans,
+        ..
     } = rule;
     let tunnel = printed(*tunnel);
     let masquerade: String = lans
@@ -44,7 +48,7 @@ fn table(rule: &Rule) -> String {
         })
         .collect();
     format!(
-        "table inet {instance} {{
+        "table inet {name} {{
 	chain postrouting {{
 		type nat hook postrouting priority srcnat; policy accept;
 {masquerade}	}}
@@ -65,7 +69,7 @@ pub fn listed(tables: &str, instance: &Instance) -> bool {
 /// loads.
 pub fn holds(listing: &str, rule: &Rule) -> bool {
     let printed: Vec<&str> = listing.lines().map(str::trim).collect();
-    table(rule)
+    table(rule, rule.instance.as_str())
         .lines()
         .all(|line| printed.contains(&line.trim()))
 }
@@ -73,7 +77,7 @@ pub fn holds(listing: &str, rule: &Rule) -> bool {
 /// The first line of what `nft list table` prints that is not a line of the
 /// table [`up`] loads. An empty table has no such line.
 pub fn foreign<'a>(listing: &'a str, rule: &Rule) -> Option<&'a str> {
-    let own = table(rule);
+    let own = table(rule, rule.instance.as_str());
     listing
         .lines()
         .map(str::trim)

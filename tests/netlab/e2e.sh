@@ -52,10 +52,12 @@ e2e_describe() {
 # The fake Cloudflare API and DNS server on the internet, and for `public` a
 # LAN host on the host's link that the internet cannot route to.
 extras() {
-	local seed=()
+	local scenario=$1
+	shift
+	local seed=("$@")
 	ns inet ip addr add "$API/32" dev lo
 	ns inet ip addr add "$DNS/32" dev lo
-	case $1 in
+	case $scenario in
 	public-forward | nat1) seed=(--record "$NAME=A:$STALE") ;;
 	strays)
 		seed=(--record "$NAME=A:$PUBLIC_HOST,proxied" --record "$NAME=A:$EXTRA_A"
@@ -64,7 +66,7 @@ extras() {
 	esac
 	start inet cloudflare "Cloudflare API on" "$LAB/cloudflare.py" --api "$API:80" \
 		--dns "$DNS:53" --zone "$ZONE" --token "$TOKEN" --log "$WORK/cloudflare.log" "${seed[@]}"
-	[ "$1" = public ] || [ "$1" = strays ] || return 0
+	[ "$scenario" = public ] || [ "$scenario" = strays ] || return 0
 	ns inet ip link add "$P-sw" type bridge
 	ns inet ip link set "$P-sw" up
 	ns inet ip addr del "$INET_GW/24" dev "$P-i0"

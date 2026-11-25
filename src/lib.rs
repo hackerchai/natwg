@@ -2,6 +2,7 @@ pub mod client;
 pub mod config;
 pub mod detect;
 pub mod doctor;
+pub mod export;
 pub mod keys;
 pub mod nat;
 pub mod netcfg;
