@@ -15,7 +15,7 @@ use crate::netcfg;
 use crate::server::peer_status;
 use crate::status::{self, ClientRole, ClientStatus, PeerStatus};
 use crate::tunnel::{self, PeerStats};
-use crate::wire::transport::{BoundInterface, Initiation};
+use crate::wire::transport::{BoundInterface, HandshakeFlight};
 use ipnetwork::Ipv4Network;
 use resolve::Lookup;
 use schedule::{Handshake, Keepalive, Lookups};
@@ -50,8 +50,8 @@ pub trait Device {
     /// What the device knows about the server.
     fn server(&self) -> impl Future<Output = Option<PeerStats>>;
 
-    /// Locally attempted handshakes for failure-driven TXT discovery.
-    fn initiations(&self) -> Option<watch::Receiver<Option<Initiation>>> {
+    /// Locally observed handshake attempts and authenticated completions on this binding.
+    fn flights(&self) -> Option<watch::Receiver<HandshakeFlight>> {
         None
     }
     /// Whether an inner IP packet crossed the TUN since the last sample.
@@ -68,6 +68,25 @@ pub trait Device {
 
     /// Send the server's traffic to `endpoint` with a fresh handshake.
     fn point(&self, endpoint: SocketAddrV4) -> impl Future<Output = Result<()>>;
+
+    /// Reconcile a failed, roamed session with an unchanged TXT answer.
+    fn restore(
+        &self,
+        endpoint: SocketAddrV4,
+        _since: Instant,
+    ) -> impl Future<Output = Result<bool>> {
+        async move {
+            if self
+                .server()
+                .await
+                .is_some_and(|peer| peer.endpoint != Some(endpoint.into()))
+            {
+                self.point(endpoint).await?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
 
     /// Bind the UDP socket again and start a fresh handshake.
     fn rebind(&self) -> impl Future<Output = Result<()>>;
@@ -88,8 +107,8 @@ impl Device for tunnel::Client {
         tunnel::Client::server(self).await
     }
 
-    fn initiations(&self) -> Option<watch::Receiver<Option<Initiation>>> {
-        self.initiations()
+    fn flights(&self) -> Option<watch::Receiver<HandshakeFlight>> {
+        self.flights()
     }
 
     fn take_traffic(&self) -> bool {
@@ -102,6 +121,10 @@ impl Device for tunnel::Client {
 
     async fn point(&self, endpoint: SocketAddrV4) -> Result<()> {
         tunnel::Client::point(self, endpoint).await
+    }
+
+    async fn restore(&self, endpoint: SocketAddrV4, since: Instant) -> Result<bool> {
+        self.apply_endpoint(endpoint, Some(since)).await
     }
 
     async fn rebind(&self) -> Result<()> {
@@ -328,7 +351,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         let mut dns = Lookups::new(matches!(lookup, Some(Lookup::Txt(_))), self.options);
         let resolvers = resolve::resolvers(self.client, self.options.dns_port);
         let mut query = None;
-        let mut initiations = device.initiations();
+        let mut flights = device.flights();
         let mut handshake = Handshake::new(building);
         let mut check_at = Instant::now();
         let mut server = None;
@@ -351,17 +374,27 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                 }
                 (lookup, answer) = async { query.as_mut().unwrap().await }, if query.is_some() => {
                     query = None;
-                    let had_endpoint = self.endpoint.is_some();
+                    let old = self.endpoint();
                     if let Some(endpoint) = self.accept_answer(lookup, answer) {
                         let now = Instant::now();
-                        if had_endpoint {
-                            handshake.moved(now);
+                        let applied = if old != Some(endpoint) {
+                            device.point(endpoint).await.map(|()| true)
+                        } else if let Some(since) = dns.failure {
+                            device.restore(endpoint, since).await
+                        } else {
+                            Ok(false)
+                        };
+                        match applied {
+                            Err(error) => return Exit::Died(error.to_string()),
+                            Ok(true) => {
+                                if old.is_some() {
+                                    handshake.moved(now);
+                                }
+                                dns.recovered(now);
+                                server = None;
+                            }
+                            Ok(false) => {}
                         }
-                        dns.recovered(now);
-                        if let Err(error) = device.point(endpoint).await {
-                            return Exit::Died(error.to_string());
-                        }
-                        server = None;
                     }
                     dns.looked_up(Instant::now(), self.endpoint.is_some(), self.lookup_error.is_none());
                 }
@@ -387,16 +420,14 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                     if let Err(error) = device.rebind().await {
                         return Exit::Died(error.to_string());
                     }
+                    flights = device.flights();
                     *uplink = now;
                     query = None;
                     dns = Lookups::new(matches!(lookup, Some(Lookup::Txt(_))), self.options);
                     server = None;
                 }
-                attempt = next_initiation(&mut initiations) => {
-                    if !attempt.retry {
-                        continue;
-                    }
-                    handshake.retried(attempt.at, &mut dns);
+                flight = next_flight(&mut flights) => {
+                    handshake.observed(flight, &mut dns);
                 }
                 () = tokio::time::sleep_until(check_at) => {
                     if let Some(gap) = clock.slept(Clock::now()) {
@@ -433,7 +464,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
         }
     }
 
-    /// Keep the last endpoint on a failed lookup, or return the new one.
+    /// Remember the last usable advertised endpoint across failed lookups.
     fn accept_answer(
         &mut self,
         lookup: Lookup<'_>,
@@ -457,7 +488,7 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
                     tracing::info!("the {kind} lookup works again");
                 }
                 if self.endpoint() == Some(addr) {
-                    return None;
+                    return Some(addr);
                 }
                 let old = self
                     .endpoint()
@@ -521,12 +552,11 @@ impl<F: Fn(Option<&str>) -> Result<Uplink>> Supervisor<'_, F> {
     }
 }
 
-async fn next_initiation(events: &mut Option<watch::Receiver<Option<Initiation>>>) -> Initiation {
+async fn next_flight(events: &mut Option<watch::Receiver<HandshakeFlight>>) -> HandshakeFlight {
     if let Some(rx) = events
         && rx.changed().await.is_ok()
-        && let Some(event) = *rx.borrow_and_update()
     {
-        return event;
+        return *rx.borrow_and_update();
     }
     std::future::pending().await
 }

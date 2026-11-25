@@ -216,3 +216,42 @@ cellular radio energy require measurements on the tethered hardware.
 `--pause` also checks that a one-minute idle policy disables keepalives and
 restores them after traffic. `--routes` checks a fixed endpoint, duplicate
 route events, switching the default interface and changing its IPv4 address.
+
+### Client session regressions
+
+The same VM fixture exercises real daemon timers and kernel WireGuard peers.
+Each command prints JSON and removes its keys, child processes and namespaces
+on exit. The late DNS and healthy roam cases each take about ten minutes.
+
+```sh
+python3 tests/netlab/client_recovery.py "$BINARY" 25 --late-dns
+python3 tests/netlab/client_recovery.py "$BINARY" 0 --late-dns
+python3 tests/netlab/client_recovery.py "$BINARY" 25 --retry
+python3 tests/netlab/client_recovery.py "$BINARY" 0 --queued
+python3 tests/netlab/client_recovery.py "$BINARY" 25 --pause-inbound
+python3 tests/netlab/client_recovery.py "$BINARY" 25 --roam
+```
+
+- **Late DNS.** Authoritative DNS returns NXDOMAIN for 541 seconds. With
+  keepalive enabled, the kernel server must complete a handshake and ping the
+  client before any client application sends. With keepalive disabled, nft
+  counters must stay at zero for another 15 seconds until one client echo
+  request establishes a session and receives its reply.
+- **Successful retry.** The server starts listening two seconds after the
+  first observed initiation. The test checks the status CLI and counts TXT
+  queries for 45 seconds after recovery. Two consecutive uplink address
+  changes leave an initiation outstanding on the older socket. A genuine
+  retry on the latest socket must trigger DNS, continue reporting failure
+  after an unrelated UDP datagram, and recover for another 45 seconds.
+- **Queued traffic.** After 187 idle seconds and a server move, the client
+  sends exactly one ping. The test also changes the TXT answer during the
+  *first* unanswered initiation after rebinding. Each ping must get its reply.
+- **Paused receiver.** Ordinary UDP and authenticated WireGuard keepalives
+  leave the configured interval paused. A single inbound application datagram
+  restores it. A UDP listener consumes the datagram without sending a reply.
+- **Roaming.** A kernel peer retains its session and switches from UDP 51830
+  to 51831. Its authenticated traffic moves the client. The fixture waits for
+  the real ten-minute TXT refresh and checks that traffic still uses 51831.
+  Recreating the same-key peer on 51830 leaves TXT unchanged. A fresh
+  handshake, an echo to the WireGuard router and an echo to a separate routed
+  LAN host must all succeed.
