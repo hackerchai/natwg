@@ -13,11 +13,13 @@ natwg network lab, standard library only. It runs in the internet namespace:
 - DNS over UDP: answers A and TXT queries for the records the API holds,
   with the authoritative flag and each record's TTL. A name it holds no
   record of is NXDOMAIN.
-- --record NAME=TYPE:CONTENT holds a record from the start, as one made
-  before natwg ran.
+- --record NAME=TYPE:CONTENT[,proxied] holds a record from the start, as
+  one made before natwg ran: not proxied with a TTL of 60, or proxied with
+  the automatic TTL (1), as the dashboard makes an A record.
 
-The log gets one line per write, "POST TYPE NAME CONTENT" or "PUT TYPE NAME
-CONTENT", one per refused call, "DENIED METHOD PATH", and one per DNS
+The log gets one line per write, "POST TYPE NAME CONTENT", "PUT TYPE NAME
+CONTENT" or "DELETE RECORD_ID", one per refused call, "DENIED METHOD
+PATH", and one per DNS
 answer, "DNS TYPE NAME CONTENT" or "DNS TYPE NAME NXDOMAIN". The API stores
 a TXT content as Cloudflare does, quoted, and DNS answers it unquoted.
 """
@@ -46,7 +48,10 @@ class Zone:
         for preset in args.record:
             name, kind_content = preset.split("=", 1)
             kind, content = kind_content.split(":", 1)
-            self.add({"type": kind, "name": name, "content": content, "ttl": 60})
+            proxied = content.endswith(",proxied")
+            content = content.removesuffix(",proxied")
+            ttl = 1 if proxied else 60
+            self.add({"type": kind, "name": name, "content": content, "ttl": ttl, "proxied": proxied})
 
     def log(self, line):
         with open(self.args.log, "a") as log:
@@ -161,6 +166,18 @@ def serve_api(zone, address):
                 zone.records[parts[3]] = stored
                 zone.log("PUT %s %s %s" % (stored["type"], stored["name"], stored["content"]))
             self.reply(200, stored)
+
+        def do_DELETE(self):
+            if not self.allowed():
+                return
+            parts, _, _ = self.route()
+            if len(parts or []) != 4 or parts[:3] != ["zones", ZONE_ID, "dns_records"]:
+                return self.fail(404, 7003, "No route for that URI")
+            with zone.lock:
+                if zone.records.pop(parts[3], None) is None:
+                    return self.fail(404, 81044, "Record does not exist")
+                zone.log("DELETE %s" % parts[3])
+            self.reply(200, {"id": parts[3]})
 
         def log_message(self, *_):
             pass
