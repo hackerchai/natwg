@@ -28,7 +28,7 @@ fn delete(instance: &Instance) -> String {
 }
 
 // Each line reads as `nft list table` prints it, so `foreign` compares lines.
-fn table(rule: &Rule) -> String {
+pub(crate) fn table(rule: &Rule) -> String {
     let Rule {
         instance,
         iface,

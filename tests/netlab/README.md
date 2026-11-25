@@ -118,6 +118,29 @@ tests/netlab/e2e.sh list
 table of the results. A run takes a few minutes, most of it waiting for the
 client's lookup, which comes every 60 s.
 
+## Configuration exports
+
+Run the two export scenarios on Linux with a debug build, wireguard-tools,
+kernel WireGuard, nftables and the tools used by `e2e.sh`.
+
+```sh
+sudo NATWG=target/debug/natwg tests/netlab/export.sh
+sudo NATWG=target/debug/natwg MIHOMO=/path/to/mihomo tests/netlab/export.sh
+```
+
+In `public`, native wg-quick runs both exported configs, resolves the public
+hostname through lab DNS, handshakes and pings the tunnel and a separate LAN
+host. The lab checks normal teardown and conflicting nftables rules before
+setup and after setup. In `nat1`, a natwg server publishes to lab DNS.
+A native wg-quick client dials a TXT snapshot, then re-exports with the same
+keys after the router changes the mapped port and passes traffic again.
+
+Each scenario issues separate Surge and mihomo peers. Set `MIHOMO` to run
+the actual core with `-t` inside the peer namespace. Set `SURGE_FIXTURES` to a
+new directory to keep only the two synthetic Surge profiles for offline
+`surge-cli --check FILE` on macOS. The runner removes its namespaces and
+temporary keys on exit.
+
 ## Reuse it
 
 `run.sh up SCENARIO` builds one scenario and leaves it running, with its

@@ -32,7 +32,7 @@ pub fn down(instance: &Instance) -> Vec<Step> {
 }
 
 // One line per LAN, each as pfctl prints a rule on a line of its own.
-fn text(rule: &Rule) -> String {
+pub(crate) fn text(rule: &Rule) -> String {
     let Rule {
         iface,
         tunnel,
