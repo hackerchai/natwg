@@ -73,8 +73,11 @@ enum Action {
     /// uplink, --upnp auto has the UPnP gateway forward the test port for
     /// the test, as it would for the server, and deletes the lease after.
     ///
-    /// Exit status: 0 supported (public or NAT1), 2 likely (one test could
-    /// not run), 1 unsupported or an error. Needs no root.
+    /// Exit status: 0 supported (public or NAT1), 1 unsupported, 2 likely
+    /// (a test could not run, or its answers disagree) or inconclusive (no
+    /// STUN server outside the NAT answered), 3 an error such as a missing
+    /// uplink or a signal. With --json, an error prints
+    /// {"schema": 1, "error": {"code", "message"}}. Needs no root.
     Detect {
         /// The uplink (default: role.server.iface of --config when natwg can
         /// read it, else the physical interface of the default route).
@@ -528,19 +531,36 @@ fn run(cli: Cli) -> Result<()> {
                     .unwrap_or(detect::DEFAULT_DNS),
                 timeout,
             };
-            let detection = runtime(tokio::runtime::Builder::new_current_thread())?
-                .block_on(detect::run(&request))?;
-            if json {
-                say!(
-                    "{}",
-                    serde_json::to_string_pretty(&detection)
-                        .expect("a detection always serializes")
-                );
-            } else {
-                say!("{}", detection.render().trim_end());
-            }
+            let detected = runtime(tokio::runtime::Builder::new_current_thread())
+                .and_then(|runtime| runtime.block_on(detect::run(&request)));
+            let code = match (&detected, json) {
+                (Ok(detection), true) => {
+                    say!(
+                        "{}",
+                        serde_json::to_string_pretty(detection)
+                            .expect("a detection always serializes")
+                    );
+                    detection.exit_code()
+                }
+                (Ok(detection), false) => {
+                    say!("{}", detection.render().trim_end());
+                    detection.exit_code()
+                }
+                (Err(error), true) => {
+                    let error = serde_json::json!({
+                        "schema": detect::SCHEMA,
+                        "error": {"code": error.code, "message": error.message},
+                    });
+                    say!("{error:#}");
+                    detect::ERROR_EXIT
+                }
+                (Err(error), false) => {
+                    warn!("{error}");
+                    detect::ERROR_EXIT
+                }
+            };
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            std::process::exit(detection.exit_code());
+            std::process::exit(code);
         }
         Action::Server { foreground: _ } => daemon(&cli.config, Some(Want::Server))?,
         Action::Client { foreground: _ } => daemon(&cli.config, Some(Want::Client))?,

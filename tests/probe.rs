@@ -165,3 +165,30 @@ fn detect_with_one_plain_server_is_likely_and_exits_2() {
     assert_eq!(json["mapping"]["endpoint"], "45.77.0.9:7007");
     assert_eq!(json["filtering"]["behaviour"], "unknown");
 }
+
+#[test]
+fn detect_errors_exit_3_and_print_an_error_object_with_json() {
+    let detect = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_natwg"))
+            .args(["detect", "--config", "/nonexistent/natwg.json"])
+            .args(["--iface", "natwg-none0", "--upnp", "off"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let output = detect(&["--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["error"]["code"], "IFACE_NOT_FOUND");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("natwg-none0")
+    );
+    let output = detect(&[]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.starts_with(b"IFACE_NOT_FOUND"));
+}

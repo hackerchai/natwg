@@ -19,8 +19,8 @@
 pub mod classify;
 
 pub use classify::{
-    Answer, Assessment, ChangeTest, Filtering, Kind, Mapping, Observations, Probe, SelfTest,
-    Verdict, classify, is_public,
+    Answer, Assessment, ChangeTest, Filtering, Kind, Mapping, Observations, Probe, PublicBy,
+    SelfTest, Verdict, classify, is_public,
 };
 
 use crate::client::uplink;
@@ -32,12 +32,23 @@ use crate::{Error, Result};
 use serde::Serialize;
 use std::{
     fmt::Write as _,
+    future::Future,
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     time::Duration,
 };
-use tokio::{net::UdpSocket, task::JoinSet, time::Instant};
+use tokio::{
+    net::UdpSocket,
+    signal::unix::{Signal, SignalKind, signal},
+    task::JoinSet,
+    time::Instant,
+};
 
+/// The version of the JSON that `natwg detect --json` prints. It changes
+/// only when a field changes meaning or goes away.
+pub const SCHEMA: u32 = 1;
+/// The exit status of `natwg detect` when it fails before a verdict.
+pub const ERROR_EXIT: i32 = 3;
 /// The port natwg tests when neither `--port` nor a config names one.
 pub const DEFAULT_PORT: u16 = 51830;
 /// The DNS server asked for STUN hosts when neither `--dns` nor a config
@@ -50,6 +61,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 pub const LEASE_SECS: u32 = 120;
 /// The description of the test lease on the gateway.
 pub const LEASE_DESCRIPTION: &str = "natwg detect";
+/// How long the cleanup of a lease during a panic waits for the gateway.
+const PANIC_CLEANUP: Duration = Duration::from_secs(2);
 
 const SSDP_WAIT: Duration = Duration::from_secs(2);
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -114,12 +127,21 @@ impl Default for Request {
 /// Everything `natwg detect` found, as `--json` prints it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Detection {
+    /// [`SCHEMA`].
+    pub schema: u32,
+    /// `supported`, `likely`, `inconclusive` or `unsupported`.
     pub verdict: Verdict,
     /// For a supported network: `public` or `nat1`.
     pub kind: Option<Kind>,
+    /// For a supported public network, how natwg knows: `address` (the
+    /// uplink holds it), `upnp` (the gateway forwards the port and owns the
+    /// address) or `port_kept` (only STUN says so; a full-cone NAT that
+    /// keeps the port looks the same). `natwg init` offers WireGuard mode
+    /// only for `address` and `upnp`.
+    pub public_by: Option<PublicBy>,
     /// The verdict in words, such as `supported (NAT1)`.
     pub summary: String,
-    /// Why the network is unsupported or only likely.
+    /// Why the network is not supported, or only likely.
     pub reason: Option<String>,
     /// What would fix an unsupported network, or settle a likely one.
     pub fix: Option<String>,
@@ -174,8 +196,8 @@ pub enum UpnpState {
     NotNeeded,
     /// natwg leased the tested port for the test and deleted the lease.
     Leased,
-    /// natwg leased the tested port, but deleting the lease failed; it ends
-    /// on its own after [`LEASE_SECS`].
+    /// natwg leased the tested port for [`LEASE_SECS`], but deleting the
+    /// lease failed; a gateway that honours lease durations drops it then.
     LeaseLeft,
     /// The gateway forwards the tested port to this host already, and the
     /// mapping stays.
@@ -183,6 +205,9 @@ pub enum UpnpState {
     /// The gateway forwards the tested port to another host, so natwg left
     /// it alone.
     Conflict,
+    /// The gateway takes only permanent leases, which natwg does not take
+    /// for a test.
+    PermanentOnly,
     /// No gateway, or the gateway refused.
     Failed,
 }
@@ -246,7 +271,15 @@ impl Detection {
                 SelfTest::Skipped => "skipped",
             },
         );
-        line("verdict", &self.summary);
+        let by = match self.public_by {
+            Some(PublicBy::Address) => ", by the uplink's own address",
+            Some(PublicBy::Upnp) => ", by the UPnP gateway's forward",
+            Some(PublicBy::PortKept) => {
+                ", by STUN alone: a full-cone NAT that keeps the port looks the same"
+            }
+            None => "",
+        };
+        line("verdict", &format!("{}{by}", self.summary));
         for remark in [&self.reason, &self.fix].into_iter().flatten() {
             let _ = writeln!(text, "{remark}");
         }
@@ -285,6 +318,9 @@ impl UpnpReport {
             }
             UpnpState::Existing => format!("udp/{port} is forwarded to this host already{at}"),
             UpnpState::Conflict => format!("udp/{port}{at} is forwarded elsewhere: {error}"),
+            UpnpState::PermanentOnly => {
+                format!("the gateway{at} only takes permanent leases; not used for the test")
+            }
             UpnpState::Failed => format!("failed: {error}"),
         }
     }
@@ -351,9 +387,25 @@ impl FilteringReport {
 }
 
 /// Run every test and judge the network. Errors are only for a missing
-/// uplink or a socket natwg cannot bind; a network that blocks everything
-/// is an unsupported verdict.
+/// uplink, a socket natwg cannot bind, or a signal: a network that blocks
+/// everything is an unsupported verdict.
+///
+/// SIGINT, SIGTERM and SIGHUP stop the tests, from before natwg asks the
+/// gateway for a lease on: the lease goes before the error returns. A panic
+/// deletes it too, with a blocking request of at most two seconds a step.
+///
+/// tokio keeps a signal handler for the life of the process, so these
+/// signals lose their default action from here on. A caller that goes on
+/// afterwards, such as an interactive `natwg init`, can pass its own stop
+/// to [`run_until`] instead.
 pub async fn run(request: &Request) -> Result<Detection> {
+    let mut stop = Stop::listen()?;
+    run_until(request, async move { stop.requested().await.to_owned() }).await
+}
+
+/// [`run`] that stops when `stop` resolves, with the error `INTERRUPTED`
+/// and the reason `stop` gives, instead of on a signal.
+pub async fn run_until(request: &Request, stop: impl Future<Output = String>) -> Result<Detection> {
     let uplink = uplink::find(request.iface.as_deref())?;
     let address = uplink.address.ok_or_else(|| {
         Error::new(
@@ -367,21 +419,29 @@ pub async fn run(request: &Request) -> Result<Detection> {
     let (socket, port, held) = bind(&iface, wanted)?;
     let mut notes = Vec::new();
     let mut upnp = UpnpReport::new(request.upnp, UpnpState::Off);
-    let mut lease = None;
-    if request.upnp == UpnpMode::Auto {
-        if public {
-            upnp.state = UpnpState::NotNeeded;
-        } else {
-            lease = take_lease(&iface, address, port, &mut upnp).await;
-        }
-    }
+    let mut lease: Option<LeaseGuard> = None;
     let local = SocketAddrV4::new(address, port);
-    let tested = tokio::select! {
-        tested = test(&iface, socket, local, request, &mut notes) => tested,
-        _ = tokio::signal::ctrl_c() => Err(Error::new("INTERRUPTED", "natwg detect was interrupted")),
+    let tested = {
+        let work = async {
+            if request.upnp == UpnpMode::Auto {
+                if public {
+                    upnp.state = UpnpState::NotNeeded;
+                } else {
+                    take_lease(&iface, address, port, &mut upnp, &mut lease).await;
+                }
+            }
+            test(&iface, socket, local, request, &mut notes).await
+        };
+        tokio::select! {
+            tested = work => tested,
+            reason = stop => Err(Error::new(
+                "INTERRUPTED",
+                format!("natwg detect stopped on {reason}"),
+            )),
+        }
     };
-    if let Some(igd) = lease
-        && let Err(error) = igd.delete(port).await
+    if let Some(guard) = lease.take()
+        && let Err(error) = guard.release().await
     {
         upnp.state = UpnpState::LeaseLeft;
         upnp.error = Some(error.to_string());
@@ -398,6 +458,10 @@ pub async fn run(request: &Request) -> Result<Detection> {
         change_tests,
         self_test,
         gateway_ip: upnp.external_ip,
+        upnp_forwarded: matches!(
+            upnp.state,
+            UpnpState::Leased | UpnpState::LeaseLeft | UpnpState::Existing
+        ),
     };
     Ok(report(
         &seen,
@@ -416,6 +480,65 @@ pub async fn run(request: &Request) -> Result<Detection> {
     ))
 }
 
+/// The signals that stop `natwg detect`. Listening replaces their default
+/// action, which would end the process with the lease still held.
+struct Stop {
+    interrupt: Signal,
+    terminate: Signal,
+    hangup: Signal,
+}
+
+impl Stop {
+    fn listen() -> Result<Self> {
+        let listen =
+            |kind| signal(kind).map_err(|e| Error::new("SIGNAL_UNAVAILABLE", e.to_string()));
+        Ok(Self {
+            interrupt: listen(SignalKind::interrupt())?,
+            terminate: listen(SignalKind::terminate())?,
+            hangup: listen(SignalKind::hangup())?,
+        })
+    }
+
+    async fn requested(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.hangup.recv() => "SIGHUP",
+        }
+    }
+}
+
+/// A lease natwg asked the gateway for. It exists from just before the
+/// request goes out, since a signal may cut the answer off. Dropped without
+/// [`LeaseGuard::release`], as when a panic unwinds, it deletes the lease
+/// with a blocking request.
+struct LeaseGuard {
+    igd: Option<Igd>,
+    port: u16,
+}
+
+impl LeaseGuard {
+    async fn release(mut self) -> Result<()> {
+        match self.igd.take() {
+            Some(igd) => igd.delete(self.port).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Forget a lease that the gateway refused: there is nothing to delete.
+    fn disarm(mut self) {
+        self.igd = None;
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if let Some(igd) = self.igd.take() {
+            let _ = igd.delete_blocking(self.port, PANIC_CLEANUP);
+        }
+    }
+}
+
 /// The [`Detection`] for what the tests saw.
 pub fn report(
     seen: &Observations,
@@ -429,13 +552,17 @@ pub fn report(
         (Verdict::Supported, Some(Kind::Public)) => "supported (public)",
         (Verdict::Supported, _) => "supported (NAT1)",
         (Verdict::Likely, _) => "likely",
+        (Verdict::Inconclusive, _) => "inconclusive",
         (Verdict::Unsupported, _) => "unsupported",
     };
     let filtered = matches!(
         assessment.filtering,
         Filtering::AddressDependent | Filtering::AddressAndPortDependent
     );
-    let lease_missing = matches!(upnp.state, UpnpState::Failed | UpnpState::Conflict);
+    let lease_missing = matches!(
+        upnp.state,
+        UpnpState::Failed | UpnpState::Conflict | UpnpState::PermanentOnly
+    );
     if filtered && lease_missing {
         notes.push(format!(
             "the UPnP gateway did not forward udp/{} for the test, so a filtering home router may be what dropped the answers; check UPnP, or forward the port by hand and run natwg detect --upnp off",
@@ -457,8 +584,10 @@ pub fn report(
     };
     let (mapping, filtering) = (assessment.mapping, assessment.filtering);
     Detection {
+        schema: SCHEMA,
         verdict: assessment.verdict,
         kind: assessment.kind,
+        public_by: assessment.public_by,
         summary: summary.to_owned(),
         reason: assessment.reason,
         fix: assessment.fix,
@@ -496,35 +625,35 @@ fn bind(iface: &BoundInterface, port: u16) -> Result<(UdpSocket, u16, bool)> {
 }
 
 /// Ask the gateway of the LAN to forward `port` to this host for the test.
-/// The returned client deletes the lease afterwards; none when natwg leased
-/// nothing.
+/// `lease` holds the lease from just before the request goes out until the
+/// gateway refuses it; none when natwg leased nothing.
 async fn take_lease(
     iface: &BoundInterface,
     address: Ipv4Addr,
     port: u16,
     report: &mut UpnpReport,
-) -> Option<Igd> {
+    lease: &mut Option<LeaseGuard>,
+) {
     report.state = UpnpState::Failed;
     let failed = |report: &mut UpnpReport, error: Error| {
         report.error = Some(error.to_string());
-        None
     };
     let gateway = match upnp::discover(iface, address, SSDP_WAIT).await {
         Ok(gateway) => gateway,
         Err(error) => return failed(report, error),
     };
     report.gateway = Some(gateway.clone());
-    let igd = match Igd::new(&iface.to_string(), gateway) {
+    let igd = match Igd::new(iface, gateway) {
         Ok(igd) => igd,
         Err(error) => return failed(report, error),
     };
     report.external_ip = igd.external_ip().await.ok();
     match igd.mapping(port).await {
+        // natwg cannot tell what the gateway holds, so it changes nothing.
         Err(error) => failed(report, error),
         Ok(Some(existing)) if existing.client == address && existing.internal_port == port => {
             report.state = UpnpState::Existing;
             report.existing = Some(existing);
-            None
         }
         Ok(Some(existing)) => {
             report.error = Some(format!(
@@ -533,15 +662,26 @@ async fn take_lease(
             ));
             report.state = UpnpState::Conflict;
             report.existing = Some(existing);
-            None
         }
-        Ok(None) => match igd.add(port, address, LEASE_DESCRIPTION, LEASE_SECS).await {
-            Ok(_) => {
-                report.state = UpnpState::Leased;
-                Some(igd)
+        Ok(None) => {
+            let guard = lease.insert(LeaseGuard {
+                igd: Some(igd),
+                port,
+            });
+            let igd = guard.igd.as_ref().expect("the guard holds the client");
+            match igd.add(port, address, LEASE_DESCRIPTION, LEASE_SECS).await {
+                Ok(()) => report.state = UpnpState::Leased,
+                Err(error) => {
+                    if error.code == "UPNP_PERMANENT_ONLY" {
+                        report.state = UpnpState::PermanentOnly;
+                    }
+                    failed(report, error);
+                    if let Some(guard) = lease.take() {
+                        guard.disarm();
+                    }
+                }
             }
-            Err(error) => failed(report, error),
-        },
+        }
     }
 }
 
@@ -625,9 +765,12 @@ async fn test(
             None => {}
         }
     }
-    let self_test = match classify::mapping(local, &answers) {
-        Mapping::EndpointIndependent | Mapping::Unknown if !answers.is_empty() => {
-            prober.self_test(iface, answers[0].mapped).await
+    // A mapping only a server inside the NAT saw is this host's own
+    // address, which tells nothing.
+    let outside = answers.iter().find(|answer| is_public(*answer.mapped.ip()));
+    let self_test = match (classify::mapping(local, &answers), outside) {
+        (Mapping::EndpointIndependent | Mapping::Unknown, Some(answer)) => {
+            prober.self_test(iface, answer.mapped).await
         }
         _ => SelfTest::Skipped,
     };

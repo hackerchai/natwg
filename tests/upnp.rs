@@ -2,10 +2,12 @@
 //! and description parsers against what a TP-Link TL-7DR7290 sends, and the
 //! SOAP client against a fake gateway on loopback.
 
+use natwg::netcfg::gateway_in;
 use natwg::server::upnp::{
-    self, Gateway, Igd, PortMapping, search_request, soap_body, ssdp_location, upnp_error,
-    wan_service,
+    self, BODY_LIMIT, Gateway, Igd, Lan, PortMapping, no_such_entry, same_host, search_request,
+    soap_body, ssdp_location, trusted_location, upnp_error, wan_service,
 };
+use natwg::wire::transport::BoundInterface;
 use std::sync::{Arc, Mutex};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -147,6 +149,18 @@ type Calls = Arc<Mutex<Vec<(String, String)>>>;
 
 /// A gateway on loopback that answers each call with `reply(action, body)`.
 async fn fake_gateway(reply: fn(&str, &str) -> String) -> (Igd, Calls) {
+    fake_http(move |action, body| {
+        let answer = reply(action, body);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+            answer.len()
+        )
+    })
+    .await
+}
+
+/// A gateway on loopback whose whole HTTP response is `respond(action, body)`.
+async fn fake_http(respond: impl Fn(&str, &str) -> String + Send + 'static) -> (Igd, Calls) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let calls: Calls = Arc::default();
@@ -188,13 +202,9 @@ async fn fake_gateway(reply: fn(&str, &str) -> String) -> (Igd, Calls) {
                 .next()
                 .unwrap_or_default()
                 .to_owned();
-            let answer = reply(&action, &body);
+            let response = respond(&action, &body);
             seen.lock().unwrap().push((action, body));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
-                answer.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
+            let _ = stream.write_all(response.as_bytes()).await;
         }
     });
     let gateway = Gateway {
@@ -202,7 +212,8 @@ async fn fake_gateway(reply: fn(&str, &str) -> String) -> (Igd, Calls) {
         control_url: format!("http://{address}/ipc"),
         service: WAN_IP_1.to_owned(),
     };
-    (Igd::new(LOOPBACK, gateway).unwrap(), calls)
+    let iface = BoundInterface::lookup(LOOPBACK).unwrap();
+    (Igd::new(&iface, gateway).unwrap(), calls)
 }
 
 fn ok(action: &str, fields: &str) -> String {
@@ -219,14 +230,19 @@ fn fault(code: u16, description: &str) -> String {
 
 #[tokio::test]
 async fn a_missing_mapping_is_none_and_another_fault_an_error() {
-    let (igd, calls) = fake_gateway(|_, body| match body.contains(">51899<") {
-        true => TP_LINK_NO_ENTRY.to_owned(),
-        false if body.contains(">51898<") => fault(714, "NoSuchEntryInArray"),
-        false => fault(606, "Action not authorized"),
+    let (igd, calls) = fake_gateway(|_, body| match body {
+        _ if body.contains(">51899<") => TP_LINK_NO_ENTRY.to_owned(),
+        _ if body.contains(">51898<") => fault(714, "NoSuchEntryInArray"),
+        _ if body.contains(">51896<") => fault(501, "Action Failed"),
+        _ => fault(606, "Action not authorized"),
     })
     .await;
     assert_eq!(igd.mapping(51899).await.unwrap(), None);
     assert_eq!(igd.mapping(51898).await.unwrap(), None);
+    // 501 alone is the generic "Action Failed", not "no such mapping".
+    let error = igd.mapping(51896).await.unwrap_err();
+    assert_eq!(error.code, "UPNP_REFUSED");
+    assert!(error.message.contains("501"), "{error}");
     let error = igd.mapping(51897).await.unwrap_err();
     assert_eq!(error.code, "UPNP_REFUSED");
     assert!(error.message.contains("606"), "{error}");
@@ -260,33 +276,32 @@ async fn an_existing_mapping_is_read() {
 }
 
 #[tokio::test]
-async fn a_gateway_that_takes_only_permanent_leases_gets_one() {
+async fn a_gateway_that_takes_only_permanent_leases_gets_none() {
     let (igd, calls) = fake_gateway(|action, body| match body.contains("<NewLeaseDuration>0<") {
         true => ok(action, ""),
         false => fault(725, "OnlyPermanentLeasesSupported"),
     })
     .await;
-    let lease = igd
+    let error = igd
         .add(51899, "10.24.0.4".parse().unwrap(), "natwg detect", 120)
         .await
-        .unwrap();
-    assert_eq!(lease, 0);
+        .unwrap_err();
+    assert_eq!(error.code, "UPNP_PERMANENT_ONLY");
+    // natwg never asks for a permanent lease instead.
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 1);
+    let body = &calls[0].1;
     assert!(
-        calls[0]
-            .1
-            .contains("<NewLeaseDuration>120</NewLeaseDuration>")
+        body.contains("<NewLeaseDuration>120</NewLeaseDuration>"),
+        "{body}"
     );
     assert!(
-        calls[0]
-            .1
-            .contains("<NewInternalClient>10.24.0.4</NewInternalClient>")
+        body.contains("<NewInternalClient>10.24.0.4</NewInternalClient>"),
+        "{body}"
     );
     assert!(
-        calls[0]
-            .1
-            .contains("<NewPortMappingDescription>natwg detect</NewPortMappingDescription>")
+        body.contains("<NewPortMappingDescription>natwg detect</NewPortMappingDescription>"),
+        "{body}"
     );
 }
 
@@ -305,11 +320,9 @@ async fn add_delete_and_the_external_address_round_trip() {
         igd.external_ip().await.unwrap(),
         "100.87.135.127".parse::<std::net::Ipv4Addr>().unwrap()
     );
-    let lease = igd
-        .add(51899, "10.24.0.4".parse().unwrap(), "natwg detect", 120)
+    igd.add(51899, "10.24.0.4".parse().unwrap(), "natwg detect", 120)
         .await
         .unwrap();
-    assert_eq!(lease, 120);
     igd.delete(51899).await.unwrap();
     let actions: Vec<String> = calls
         .lock()
@@ -333,4 +346,127 @@ async fn a_refused_delete_is_an_error() {
     let error = igd.delete(51899).await.unwrap_err();
     assert_eq!(error.code, "UPNP_REFUSED");
     assert!(error.message.contains("DeletePortMapping"), "{error}");
+}
+
+#[test]
+fn only_714_or_a_501_that_says_so_means_no_such_entry() {
+    assert!(no_such_entry(714, ""));
+    assert!(no_such_entry(501, "Entry not found !"));
+    assert!(no_such_entry(501, "NO SUCH ENTRY"));
+    assert!(!no_such_entry(501, "Action Failed"));
+    assert!(!no_such_entry(501, ""));
+    assert!(!no_such_entry(606, "not found"));
+}
+
+fn lan(network: &str, gateway: Option<&str>) -> Lan {
+    Lan {
+        network: network.parse().unwrap(),
+        gateway: gateway.map(|gateway| gateway.parse().unwrap()),
+    }
+}
+
+fn ssdp(location: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nLOCATION: {location}\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n"
+    )
+}
+
+#[test]
+fn only_a_location_on_the_lan_host_that_answered_is_trusted() {
+    let home = lan("10.24.0.4/24", Some("10.24.0.1"));
+    let router = "10.24.0.1".parse().unwrap();
+    let url = trusted_location(&ssdp("http://10.24.0.1:1900/igd.xml"), router, &home).unwrap();
+    assert_eq!(url.as_str(), "http://10.24.0.1:1900/igd.xml");
+    // Any LAN host can answer, but only for itself.
+    let other: std::net::Ipv4Addr = "10.24.0.66".parse().unwrap();
+    assert!(trusted_location(&ssdp("http://10.24.0.66:5000/igd.xml"), other, &home).is_ok());
+    for (location, source) in [
+        // A rogue answer that points at a host on the internet.
+        ("http://45.78.0.3:5000/igd.xml", "10.24.0.1"),
+        // At another LAN host than the one that answered.
+        ("http://10.24.0.66:5000/igd.xml", "10.24.0.1"),
+        // From outside the subnet.
+        ("http://192.168.1.1:5000/igd.xml", "192.168.1.1"),
+        // At this host itself.
+        ("http://10.24.0.4:5000/igd.xml", "10.24.0.4"),
+        // Not http, or no IPv4 literal.
+        ("https://10.24.0.1:5000/igd.xml", "10.24.0.1"),
+        ("http://router.lan:5000/igd.xml", "10.24.0.1"),
+        ("not a url", "10.24.0.1"),
+    ] {
+        let source = source.parse().unwrap();
+        assert!(
+            trusted_location(&ssdp(location), source, &home).is_err(),
+            "{location} from {source}"
+        );
+    }
+}
+
+#[test]
+fn a_control_url_must_stay_on_the_described_host() {
+    let location = url::Url::parse("http://10.24.0.1:1900/igd.xml").unwrap();
+    assert!(same_host("http://10.24.0.1:1900/ipc", &location));
+    assert!(same_host("http://10.24.0.1:5000/ctl", &location));
+    assert!(!same_host("http://45.78.0.3:5000/ctl", &location));
+    assert!(!same_host("https://10.24.0.1:1900/ipc", &location));
+    assert!(!same_host("http://router.lan/ipc", &location));
+}
+
+#[test]
+fn the_default_gateway_is_read_from_route_and_ip() {
+    let macos = "   route to: default\ndestination: default\n       mask: default\n    gateway: 10.24.0.1\n  interface: en6\n";
+    assert_eq!(gateway_in(macos), Some("10.24.0.1".parse().unwrap()));
+    let linux = "default via 192.168.139.1 proto dhcp src 192.168.139.19 metric 100\n";
+    assert_eq!(gateway_in(linux), Some("192.168.139.1".parse().unwrap()));
+    assert_eq!(gateway_in("default dev wg0 scope link\n"), None);
+    assert_eq!(gateway_in(""), None);
+}
+
+#[tokio::test]
+async fn a_redirect_is_not_followed() {
+    let (igd, calls) = fake_http(|_, _| {
+        "HTTP/1.1 302 Found\r\nLocation: http://45.78.0.3:5000/ctl\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+    })
+    .await;
+    let error = igd.delete(51899).await.unwrap_err();
+    assert_eq!(error.code, "UPNP_REFUSED", "{error}");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_reply_over_the_limit_is_refused() {
+    let (igd, _) = fake_http(|_, _| {
+        let body = "x".repeat(BODY_LIMIT + 1);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    })
+    .await;
+    assert_eq!(igd.external_ip().await.unwrap_err().code, "UPNP_TOO_LONG");
+    // Without a length up front, natwg stops reading at the limit.
+    let (igd, _) = fake_http(|_, _| {
+        let body = "x".repeat(BODY_LIMIT + 1);
+        format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}")
+    })
+    .await;
+    assert_eq!(igd.external_ip().await.unwrap_err().code, "UPNP_TOO_LONG");
+}
+
+#[tokio::test]
+async fn the_panic_cleanup_deletes_without_a_runtime() {
+    let (igd, calls) = fake_gateway(|action, _| ok(action, "")).await;
+    let deleted = tokio::task::spawn_blocking(move || {
+        igd.delete_blocking(51899, std::time::Duration::from_secs(2))
+    })
+    .await
+    .unwrap();
+    deleted.unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].0, "DeletePortMapping");
+    assert!(
+        calls[0]
+            .1
+            .contains("<NewExternalPort>51899</NewExternalPort>")
+    );
 }
