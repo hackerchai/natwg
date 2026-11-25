@@ -166,6 +166,11 @@ fn remove_service(instance: &Instance, files: Option<Files>) -> Result<String> {
             }
             if manager::installed()?.is_empty() && remove(Path::new(BINARY))? {
                 removed.push(BINARY.into());
+                // The binary that the last natwg update replaced.
+                let previous = crate::update::backup_path(Path::new(BINARY));
+                if remove(&previous)? {
+                    removed.push(previous);
+                }
             }
         }
     }
@@ -194,19 +199,84 @@ pub fn restart(config: &Path) -> Result<String> {
     require_root()?;
     let (service, status) = load(config)?;
     let name = manager::name(&service.instance);
-    let before = match manager::state(&name)? {
-        State::Missing => {
+    if manager::state(&name)? == State::Missing {
+        return Err(Error::new(
+            "SERVICE_NOT_INSTALLED",
+            format!("{name} is not loaded; run natwg service install"),
+        ));
+    }
+    let job = Job {
+        name,
+        service,
+        status,
+    };
+    let pid = restart_job(&job)?;
+    Ok(format!("{job} running, pid {pid} (restarted)"))
+}
+
+/// A natwg service as its definition names it, which `natwg update`
+/// restarts.
+pub struct Job {
+    name: String,
+    service: Service,
+    status: PathBuf,
+}
+
+impl std::fmt::Display for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+/// Every natwg service that runs a process now, with the config that its
+/// definition names. Needs root, because only root reads the configs. A
+/// config that no longer loads, or now names another service, fails.
+pub fn running() -> Result<Vec<Job>> {
+    let mut jobs = Vec::new();
+    for name in manager::installed()? {
+        if !matches!(manager::state(&name)?, State::Running { .. }) {
+            continue;
+        }
+        let definition = manager::definition_of(&name);
+        let text = fs::read_to_string(&definition).map_err(|e| storage(&definition, e))?;
+        let config = manager::config_of(&text).ok_or_else(|| {
+            Error::new(
+                "SERVICE_DEFINITION",
+                format!(
+                    "{} names no --config; run natwg service install again",
+                    definition.display()
+                ),
+            )
+        })?;
+        let (service, status) = load(&config)?;
+        let named = manager::name(&service.instance);
+        if named != name {
             return Err(Error::new(
-                "SERVICE_NOT_INSTALLED",
-                format!("{name} is not loaded; run natwg service install"),
+                "SERVICE_DEFINITION",
+                format!(
+                    "{name} runs {}, which now belongs to {named}; run natwg service install with that config",
+                    config.display()
+                ),
             ));
         }
+        jobs.push(Job {
+            name,
+            service,
+            status,
+        });
+    }
+    Ok(jobs)
+}
+
+/// Restart `job` and wait until a process other than the one that ran
+/// before brings its tunnel up. Returns its process ID.
+pub fn restart_job(job: &Job) -> Result<u32> {
+    let before = match manager::state(&job.name)? {
         State::Running { pid, .. } => Some(pid),
-        State::Stopped(_) => None,
+        _ => None,
     };
-    manager::restart(&name)?;
-    let pid = wait_serving(&service, &status, before)?;
-    Ok(format!("{name} running, pid {pid} (restarted)"))
+    manager::restart(&job.name)?;
+    wait_serving(&job.service, &job.status, before)
 }
 
 /// Every natwg service on this host, by its launchd label or systemd unit,

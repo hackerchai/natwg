@@ -19,7 +19,22 @@ pub fn name(instance: &Instance) -> String {
 }
 
 pub fn definition_path(instance: &Instance) -> PathBuf {
-    Path::new(UNITS).join(name(instance))
+    definition_of(&name(instance))
+}
+
+/// The unit file of the unit `name`.
+pub fn definition_of(name: &str) -> PathBuf {
+    Path::new(UNITS).join(name)
+}
+
+/// The config that a unit of [`definition`] passes to `natwg daemon`.
+pub fn config_of(unit: &str) -> Option<PathBuf> {
+    let command = unit
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))?;
+    let words = unquote(command)?;
+    let at = words.iter().position(|word| word == "--config")?;
+    words.get(at + 1).map(PathBuf::from)
 }
 
 /// None, because the journal keeps the logs.
@@ -73,6 +88,36 @@ fn quote(word: &str) -> String {
         .replace('%', "%%")
         .replace('$', "$$");
     format!("\"{escaped}\"")
+}
+
+/// The words of a command line that [`quote`] wrote.
+fn unquote(command: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut chars = command.trim().chars().peekable();
+    while let Some(first) = chars.next() {
+        if first == ' ' {
+            continue;
+        }
+        if first != '"' {
+            return None;
+        }
+        let mut word = String::new();
+        loop {
+            match chars.next()? {
+                '"' => break,
+                '\\' => word.push(chars.next()?),
+                c @ ('%' | '$') => {
+                    if chars.next()? != c {
+                        return None;
+                    }
+                    word.push(c);
+                }
+                c => word.push(c),
+            }
+        }
+        words.push(word);
+    }
+    Some(words)
 }
 
 pub fn state(name: &str) -> Result<State> {

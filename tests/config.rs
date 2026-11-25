@@ -443,6 +443,59 @@ fn load_refuses_a_config_that_is_not_valid_and_names_the_file_and_the_field() {
 }
 
 #[test]
+fn the_update_settings_are_optional_and_survive_a_save() {
+    let config = load_value(&server_json()).unwrap();
+    assert_eq!(config.update, None);
+    assert!(
+        !config.exposed().contains("update"),
+        "no update object is written"
+    );
+    for value in [server_json(), client_json()] {
+        let mut value = value;
+        value["update"] = json!({
+            "url": "https://mirror.example.org",
+            "repository": "me/natwg",
+            "check": "6h"
+        });
+        let config = load_value(&value).unwrap();
+        let update = config.update.clone().unwrap();
+        assert_eq!(update.url.as_deref(), Some("https://mirror.example.org"));
+        assert_eq!(update.repository.as_deref(), Some("me/natwg"));
+        assert_eq!(update.check.as_deref(), Some("6h"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+    let mut off = client_json();
+    off["update"] = json!({ "check": "off" });
+    assert_eq!(
+        load_value(&off).unwrap().update.unwrap().check.as_deref(),
+        Some("off")
+    );
+}
+
+#[test]
+fn bad_update_settings_are_refused_by_name() {
+    for (update, field) in [
+        (json!({ "url": "http://mirror.example.org" }), "update.url"),
+        (
+            json!({ "url": "https://mirror.example.org/natwg" }),
+            "update.url",
+        ),
+        (json!({ "repository": "natwg" }), "update.repository"),
+        (json!({ "check": "30m" }), "update.check"),
+        (json!({ "check": "daily" }), "update.check"),
+    ] {
+        refused(field, |value| value["update"] = update.clone());
+        client_refused(field, |value| value["update"] = update);
+    }
+    let mut unknown = server_json();
+    unknown["update"] = json!({ "channel": "beta" });
+    assert_eq!(load_value(&unknown).unwrap_err().code, "CONFIG_INVALID");
+}
+
+#[test]
 fn unknown_fields_are_rejected_at_any_depth() {
     let mut top = server_json();
     top["extra"] = json!(1);

@@ -43,6 +43,30 @@ pub struct Config {
     pub interface: Interface,
     pub peers: Vec<PeerConfig>,
     pub role: Role,
+    /// Where `natwg update` and the automatic check look for releases, and
+    /// how often the server or the client checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateConfig>,
+}
+
+/// How natwg looks for new releases. Each field is optional, and
+/// NATWG_UPDATE_URL, NATWG_UPDATE_REPOSITORY and NATWG_UPDATE_CHECK win over
+/// it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// The download site, an exact https:// origin (default:
+    /// `update::SITE`), tried before GitHub Releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// An owner/repository whose GitHub Releases natwg uses alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// How often a running server or client looks for a newer release:
+    /// `off`, or an interval of at least an hour such as `6h` or `2d`
+    /// (default: `1d`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 /// The only config format version, written as `1`.
@@ -308,6 +332,9 @@ impl Config {
     /// its own, and name the field at fault. [`Config::load`] runs this, so
     /// the rest of natwg trusts a loaded config.
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if let Some(update) = &self.update {
+            crate::update::validate(update)?;
+        }
         let Interface { address, mtu } = self.interface;
         if address.prefix() < SHORTEST_PREFIX {
             return Err(format!(

@@ -43,6 +43,7 @@ pub fn import(path: &Path, record: Option<String>, resolvers: Vec<Ipv4Addr>) -> 
             iface: None,
             status_file: None,
         }),
+        update: None,
     };
     config.validate().map_err(invalid)?;
     Ok(config)
