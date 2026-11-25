@@ -183,6 +183,115 @@ async fn a_lookup_that_finds_no_endpoint_names_each_resolver_and_what_it_said() 
     }
 }
 
+/// A DNS response to `query` with one A answer per address.
+fn a_answer(query: &[u8], addresses: &[Ipv4Addr]) -> Vec<u8> {
+    let mut message = query[..2].to_vec();
+    message.extend([0x81, 0x80, 0, 1]);
+    message.extend((addresses.len() as u16).to_be_bytes());
+    message.extend([0, 0, 0, 0]);
+    message.extend(&query[12..]);
+    for address in addresses {
+        message.extend([0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        message.extend(address.octets());
+    }
+    message
+}
+
+type Addresses = Arc<std::sync::Mutex<Vec<Ipv4Addr>>>;
+
+/// A DNS server on loopback that answers every A query with the addresses
+/// `answer` holds at the time, and that counts the queries.
+async fn a_dns_server(answer: Addresses) -> (SocketAddrV4, Arc<AtomicU32>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let SocketAddr::V4(address) = socket.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let queries = Arc::new(AtomicU32::new(0));
+    let counted = queries.clone();
+    tokio::spawn(async move {
+        let mut query = [0; 512];
+        while let Ok((len, from)) = socket.recv_from(&mut query).await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let addresses = answer.lock().unwrap().clone();
+            let _ = socket
+                .send_to(&a_answer(&query[..len], &addresses), from)
+                .await;
+        }
+    });
+    (address, queries)
+}
+
+fn holding(addresses: &[&str]) -> Addresses {
+    Arc::new(std::sync::Mutex::new(
+        addresses
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect(),
+    ))
+}
+
+const HOME: &str = "home.example.com";
+
+#[test]
+fn only_a_public_address_of_an_a_answer_can_be_the_server() {
+    for private in [
+        "127.0.0.1",
+        "10.0.0.5",
+        "172.16.0.1",
+        "192.168.1.1",
+        "100.64.1.1",
+        "169.254.0.1",
+        "198.18.0.5",
+        "198.19.255.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "255.255.255.255",
+    ] {
+        let records = [Record::A(private.parse().unwrap())];
+        assert_eq!(resolve::first_address(&records), None, "{private}");
+    }
+    let records = [
+        Record::A("198.18.0.5".parse().unwrap()),
+        Record::Txt("45.77.0.9".into()),
+        Record::A("45.77.0.10".parse().unwrap()),
+    ];
+    assert_eq!(
+        resolve::first_address(&records),
+        Some("45.77.0.10".parse().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn the_first_resolver_with_a_public_a_record_gives_the_ip_at_the_servers_port() {
+    let (silent, _held) = silent_server().await;
+    let (private, _) = a_dns_server(holding(&["127.0.0.1", "10.0.0.5", "100.64.1.1"])).await;
+    let (good, good_queries) = a_dns_server(holding(&["198.18.0.5", "45.77.0.10"])).await;
+    let (other, other_queries) = a_dns_server(holding(&["45.77.0.12"])).await;
+    let server = format!("{HOME}:51830").parse().unwrap();
+    let resolvers = [silent, private, good, other];
+    let found = resolve::lookup_a(&loopback(), &resolvers, &server, DNS_TIMEOUT).await;
+    assert_eq!(found.unwrap(), (addr("45.77.0.10:51830"), good));
+    assert_eq!(good_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(other_queries.load(Ordering::SeqCst), 0);
+
+    let (fake_ip, _) = a_dns_server(holding(&["198.18.0.5"])).await;
+    let error = resolve::lookup_a(&loopback(), &[silent, fake_ip], &server, DNS_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "A_NO_ADDRESS");
+    for part in [
+        format!("no DNS server gave a public A record for {HOME}: "),
+        format!("DNS_TIMEOUT: no answer from {silent}"),
+        format!("{HOME} answered 198.18.0.5 at {fake_ip}, not a public address (a fake-IP DNS?)"),
+    ] {
+        assert!(
+            error.message.contains(&part),
+            "{part:?} in {}",
+            error.message
+        );
+    }
+}
+
 #[test]
 fn macos_lists_the_interfaces_of_its_default_routes_in_service_order() {
     let nwi = "Network information\n\nIPv4 network interface information\n   utun8 : flags      : 0x5 (IPv4,DNS)\n     en6 : flags      : 0x5 (IPv4,DNS)\n\n   REACH : flags 0x00000003 (Reachable,Transient Connection)\n\nNetwork interfaces: utun8 en6 en0\n";
@@ -333,7 +442,7 @@ fn a_wg_quick_endpoint_stands_in_for_a_record() {
     assert!(
         error
             .message
-            .contains("role.client.record or peers[0].endpoint"),
+            .contains("role.client.record, role.client.server or peers[0].endpoint"),
         "{}",
         error.message
     );
@@ -720,6 +829,105 @@ async fn the_client_follows_the_txt_record_when_the_server_moves() {
         assert_eq!(status.lookup_error, None);
         assert_eq!(status.rebuilds, 0);
         assert!(status.server.unwrap().last_handshake.is_some());
+        stop_tx.send(()).unwrap();
+    };
+    let (ran, ()) = tokio::join!(running, check);
+    ran.unwrap();
+}
+
+/// The client status once `done` accepts it, polled for up to 10 s.
+async fn client_status_until(path: &Path, done: impl Fn(&ClientStatus) -> bool) -> ClientStatus {
+    for _ in 0..200 {
+        if let Ok(Report::Client(status)) = Report::read(path)
+            && done(&status)
+        {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no client status matched; the last is {:?}",
+        Report::read(path)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_client_follows_the_a_record_to_public_addresses_only_and_keeps_the_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let status_file = dir.path().join("client.status.json");
+    let (_, mut client_config) = pair(&status_file);
+    let Role::Client(role) = &mut client_config.role else {
+        unreachable!()
+    };
+    role.record = None;
+    role.server = Some(format!("{HOME}:51830").parse().unwrap());
+    client_config.validate().unwrap();
+    let answer = holding(&[]);
+    let (dns, _) = a_dns_server(answer.clone()).await;
+    let options = options(dns);
+    let server_key = client_config.peers[0].public_key;
+    let build = async |config: &Config, uplink: &Uplink, endpoint| {
+        let device = Detached::client(config, uplink.iface.clone(), endpoint).await?;
+        Ok(Shared {
+            device: Arc::new(Mutex::new(device)),
+            server: server_key,
+        })
+    };
+    let (stop_tx, stop) = tokio::sync::oneshot::channel::<()>();
+    let stop = async move {
+        let _ = stop.await;
+    };
+    let running = client::run(
+        &client_config,
+        &options,
+        |_| Ok(loopback_uplink(Ipv4Addr::LOCALHOST)),
+        build,
+        stop,
+    );
+    let check = async {
+        let status = client_status_until(&status_file, |s| s.lookup_error.is_some()).await;
+        assert_eq!(status.record.as_deref(), Some(HOME));
+        assert_eq!(status.record_type, Some(natwg::config::PublishMode::A));
+        assert_eq!(status.endpoint, None, "no A record yet");
+
+        *answer.lock().unwrap() = vec!["198.18.0.5".parse().unwrap()];
+        let status = client_status_until(&status_file, |s| {
+            s.lookup_error
+                .as_deref()
+                .is_some_and(|e| e.contains("198.18.0.5"))
+        })
+        .await;
+        let error = status.lookup_error.unwrap();
+        assert!(
+            error.contains(&format!(
+                "{HOME} answered 198.18.0.5 at {dns}, not a public address (a fake-IP DNS?)"
+            )),
+            "{error}"
+        );
+        assert_eq!(
+            status.endpoint, None,
+            "a fake-IP answer is never the server"
+        );
+
+        *answer.lock().unwrap() = vec!["45.77.0.10".parse().unwrap()];
+        let at = addr("45.77.0.10:51830");
+        let status = client_status_until(&status_file, |s| s.endpoint == Some(at)).await;
+        assert_eq!(status.lookup_error, None);
+
+        *answer.lock().unwrap() = vec![Ipv4Addr::LOCALHOST];
+        let status = client_status_until(&status_file, |s| s.lookup_error.is_some()).await;
+        assert!(
+            status
+                .lookup_error
+                .unwrap()
+                .contains("not a public address"),
+            "a loopback answer is refused"
+        );
+        assert_eq!(
+            status.endpoint,
+            Some(at),
+            "a refused answer keeps the endpoint"
+        );
         stop_tx.send(()).unwrap();
     };
     let (ran, ()) = tokio::join!(running, check);

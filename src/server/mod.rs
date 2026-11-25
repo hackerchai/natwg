@@ -1,9 +1,10 @@
 //! The long-running server. It builds the tunnel and runs the STUN keepalive,
-//! the TXT publisher, the UPnP lease, the NAT re-check and the status file
-//! beside it. A tunnel that dies is torn down and built again.
+//! the publisher of the TXT or A record, the UPnP lease, the NAT re-check and
+//! the status file beside it. A tunnel that dies is torn down and built again.
 
 pub mod cloudflare;
 pub mod keepalive;
+pub mod public;
 pub mod upnp;
 
 use crate::Result;
@@ -11,8 +12,9 @@ use crate::config::{Config, ServerConfig};
 use crate::status::{self, PeerStatus, Status};
 use crate::tunnel::{PeerStats, Tunnel};
 use crate::wire::transport::{BoundInterface, StunPort};
-use cloudflare::{Publish, Publisher};
+use cloudflare::{Content, Publish, Publisher};
 use keepalive::{Health, Mapping};
+use public::Public;
 use std::{
     convert::Infallible,
     future::Future,
@@ -20,7 +22,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::{
-    sync::watch,
+    sync::{Notify, watch},
     time::{Instant, MissedTickBehavior},
 };
 use upnp::{Lease, Upnp};
@@ -91,8 +93,20 @@ pub async fn run<D: Device>(
     let (mapping, mapping_rx) = watch::channel(None);
     let (publish_tx, publish) = watch::channel(Publish::Idle);
     let (lease_tx, lease) = watch::channel(None);
-    let publisher = Publisher::new(&server.cloudflare, cloudflare_api)?;
+    let (wanted_tx, wanted) = watch::channel(None::<Content>);
+    let (public_tx, public) = watch::channel(Public::default());
+    let publisher = Publisher::new(&server.cloudflare, server.publish, cloudflare_api)?;
+    let strays = publisher.strays();
     let upnp = Upnp::new(server)?;
+    let recheck = Notify::new();
+    let track = public::run(
+        server,
+        mapping_rx,
+        lease.clone(),
+        wanted_tx,
+        public_tx,
+        &recheck,
+    );
     let supervisor = Supervisor {
         config,
         server,
@@ -100,18 +114,25 @@ pub async fn run<D: Device>(
         health: watch::Sender::new(Health::default()),
         publish,
         lease,
+        public,
+        strays,
         rebuilds: 0,
     };
     tokio::select! {
         served = supervisor.run(build, stop) => served,
-        never = publisher.run(mapping_rx, publish_tx) => match never {},
-        never = renew(upnp, lease_tx) => match never {},
+        never = publisher.run(wanted, publish_tx) => match never {},
+        never = renew(upnp, lease_tx, &recheck) => match never {},
+        never = track => match never {},
     }
 }
 
-async fn renew(upnp: Option<Upnp>, lease: watch::Sender<Option<Lease>>) -> Infallible {
+async fn renew(
+    upnp: Option<Upnp>,
+    lease: watch::Sender<Option<Lease>>,
+    recheck: &Notify,
+) -> Infallible {
     match upnp {
-        Some(upnp) => upnp.run(lease).await,
+        Some(upnp) => upnp.run(lease, recheck).await,
         None => std::future::pending().await,
     }
 }
@@ -123,6 +144,9 @@ struct Supervisor<'a> {
     health: watch::Sender<Health>,
     publish: watch::Receiver<Publish>,
     lease: watch::Receiver<Option<Lease>>,
+    public: watch::Receiver<Public>,
+    /// With publish `a`, the other records of the name that clients may dial.
+    strays: watch::Receiver<Option<String>>,
     rebuilds: u32,
 }
 
@@ -189,14 +213,24 @@ impl Supervisor<'_> {
         self.health.send_modify(|health| health.misses = 0);
         let mut health = self.health.subscribe();
         let server = self.server;
-        let keepalive = keepalive::run(
-            stun,
-            &server.iface,
-            &server.stun,
-            &self.mapping,
-            &self.health,
-        );
+        let keepalive = async {
+            match &server.stun {
+                Some(config) => {
+                    keepalive::run(stun, &server.iface, config, &self.mapping, &self.health).await
+                }
+                None => {
+                    // The port stays open for gotatun, and nothing asks STUN.
+                    let _unused = stun;
+                    std::future::pending().await
+                }
+            }
+        };
         let mut keepalive = pin!(keepalive);
+        // Without STUN, no run of misses tells that the uplink went away, so
+        // the status tick looks for it instead: a socket bound to an
+        // interface that is gone, or came back with another index, carries
+        // nothing.
+        let uplink = BoundInterface::lookup(&server.iface).ok();
         let mut status_tick = tokio::time::interval(STATUS_EVERY);
         // The first status already says whether NAT works.
         let mut nat_ok = self.check_nat(device, None);
@@ -208,6 +242,7 @@ impl Supervisor<'_> {
         // once instead of at the next tick.
         let mut mapping = self.mapping.subscribe();
         let (mut publish, mut lease) = (self.publish.clone(), self.lease.clone());
+        let (mut public, mut strays) = (self.public.clone(), self.strays.clone());
         let tun = device.tun().unwrap_or("no TUN").to_owned();
         tracing::info!("tunnel up on {tun}, udp/{}", server.listen_port);
         loop {
@@ -224,11 +259,18 @@ impl Supervisor<'_> {
                 Ok(()) = mapping.changed() => status_tick.reset_immediately(),
                 Ok(()) = publish.changed() => status_tick.reset_immediately(),
                 Ok(()) = lease.changed() => status_tick.reset_immediately(),
+                Ok(()) = public.changed() => status_tick.reset_immediately(),
+                Ok(()) = strays.changed() => status_tick.reset_immediately(),
                 _ = status_tick.tick() => {
                     if let Some(tun) = device.tun()
                         && BoundInterface::lookup(tun).is_err()
                     {
                         return Exit::Died(format!("the TUN {tun} is gone"));
+                    }
+                    if server.stun.is_none()
+                        && BoundInterface::lookup(&server.iface).ok() != uplink
+                    {
+                        return Exit::Died(format!("the uplink {} is gone or came back as another interface", server.iface));
                     }
                     self.write_status(device.tun(), device.peers().await, nat_ok);
                 }
@@ -264,8 +306,14 @@ impl Supervisor<'_> {
         let mapping = *self.mapping.borrow();
         let health = *self.health.borrow();
         let lease = *self.lease.borrow();
+        let public = self.public.borrow().clone();
         let publish = self.publish.borrow();
         let record = publish.record();
+        let (published, published_ip) = match record.map(|record| record.value) {
+            Some(Content::Txt(endpoint)) => (Some(endpoint), None),
+            Some(Content::A(ip)) => (None, Some(ip)),
+            None => (None, None),
+        };
         let status = Status {
             updated: status::unix(now),
             pid: std::process::id(),
@@ -276,11 +324,19 @@ impl Supervisor<'_> {
             tun: tun.map(str::to_owned),
             mapping: mapping.map(|mapping| mapping.addr),
             mapping_since: mapping.map(|mapping| status::unix(mapping.since)),
+            stun: self.server.stun.is_some(),
             last_stun_ok: health.last_ok.map(status::unix),
             stun_misses: health.misses,
-            published: record.map(|record| record.value),
+            publish: self.server.publish,
+            record: Some(self.server.cloudflare.record.clone()),
+            published,
+            published_ip,
             published_at: record.map(|record| status::unix(record.at)),
             publish_error: publish.error().map(str::to_owned),
+            public_ip: public.ip(),
+            public_by: public.by(),
+            public_error: public.error().map(str::to_owned),
+            record_problem: self.strays.borrow().clone(),
             upnp_ok: lease.map(|lease| lease.ok),
             upnp_at: lease.map(|lease| status::unix(lease.at)),
             nat_ok,
