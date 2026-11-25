@@ -21,7 +21,22 @@ fn commands(plan: &[Step]) -> Vec<String> {
 }
 
 fn rule(instance_name: &str, iface: &str, tunnel: &str, lan: &str) -> Rule {
-    Rule::new(&instance(instance_name), iface, net(tunnel), net(lan))
+    lans_rule(instance_name, iface, tunnel, &[lan]).expect("a rule for one LAN")
+}
+
+fn lans_rule(instance_name: &str, iface: &str, tunnel: &str, lans: &[&str]) -> Option<Rule> {
+    let lans: Vec<Ipv4Network> = lans.iter().map(|lan| net(lan)).collect();
+    Rule::new(&instance(instance_name), iface, net(tunnel), &lans)
+}
+
+fn mac_lans_rule() -> Rule {
+    let lans = ["10.24.0.0/24", "192.168.50.0/24", "172.20.0.0/16"];
+    lans_rule("natwg_next", "en6", "10.66.67.0/24", &lans).unwrap()
+}
+
+fn linux_lans_rule() -> Rule {
+    let lans = ["192.168.139.0/24", "10.30.0.0/16"];
+    lans_rule("natwg_next", "eth0", "10.66.67.0/24", &lans).unwrap()
 }
 
 fn mac_rule() -> Rule {
@@ -560,4 +575,114 @@ fn a_client_leaves_out_the_lan_it_sits_on() {
         at("natwg-client", "10.66.66.2"),
     ];
     assert!(netcfg::local_networks(&routes, &old_tunnels).is_empty());
+}
+
+#[test]
+fn a_server_without_a_lan_has_no_nat_rule() {
+    assert_eq!(lans_rule("natwg_next", "en6", "10.66.67.0/24", &[]), None);
+}
+
+// One rule per LAN, in the order of role.server.lan, as pfctl lists them.
+const MAC_LANS: &str = "nat on en6 inet from 10.66.67.0/24 to 10.24.0.0/24 -> (en6)
+nat on en6 inet from 10.66.67.0/24 to 192.168.50.0/24 -> (en6)
+nat on en6 inet from 10.66.67.0/24 to 172.20.0.0/16 -> (en6)
+";
+
+#[test]
+fn pf_loads_one_nat_rule_per_lan_into_the_instance_anchor() {
+    assert_eq!(
+        pf::up(&mac_lans_rule()),
+        [
+            Step::new(&["pfctl", "-a", "com.apple/natwg_next", "-f", "-"]).stdin(MAC_LANS),
+            Step::new(&["sysctl", "-w", "net.inet.ip.forwarding=1"])
+                .done_when(&["sysctl", "-n", "net.inet.ip.forwarding"], "1"),
+        ]
+    );
+    assert_eq!(
+        pf::down(&instance("natwg_next")),
+        [Step::new(&[
+            "pfctl",
+            "-a",
+            "com.apple/natwg_next",
+            "-F",
+            "all"
+        ])],
+        "stop still flushes the whole anchor"
+    );
+}
+
+#[test]
+fn an_anchor_holds_the_rules_of_several_lans_only_when_pfctl_prints_each() {
+    let own = mac_lans_rule();
+    let printed = MAC_LANS.replace(" -> (en6)\n", " -> (en6) round-robin\n");
+    assert!(pf::holds(&printed, &own));
+    let reordered: String = printed
+        .lines()
+        .rev()
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(pf::holds(&reordered, &own), "the order does not matter");
+    assert_eq!(pf::foreign(&printed, &own), None);
+    assert_eq!(pf::foreign("", &own), None);
+
+    let partial: String = printed
+        .lines()
+        .take(2)
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert!(
+        !pf::holds(&partial, &own),
+        "a missing LAN rule is not in effect"
+    );
+    assert_eq!(
+        pf::foreign(&partial, &own),
+        None,
+        "a partial load is still natwg's own"
+    );
+
+    let dropped = "nat on en6 inet from 10.66.67.0/24 to 10.99.0.0/24 -> (en6) round-robin";
+    let stale = format!("{printed}{dropped}\n");
+    assert_eq!(
+        pf::foreign(&stale, &own),
+        Some(dropped),
+        "a rule for a LAN the config no longer lists is someone else's"
+    );
+}
+
+const LINUX_LANS: &str = "table inet natwg_next {
+\tchain postrouting {
+\t\ttype nat hook postrouting priority srcnat; policy accept;
+\t\toifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 192.168.139.0/24 masquerade
+\t\toifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 10.30.0.0/16 masquerade
+\t}
+}
+";
+
+#[test]
+fn nft_loads_one_masquerade_rule_per_lan_into_the_instance_table() {
+    let load = format!("table inet natwg_next\ndelete table inet natwg_next\n{LINUX_LANS}");
+    assert_eq!(
+        nft::up(&linux_lans_rule()),
+        [
+            Step::new(&["nft", "-f", "-"]).stdin(load),
+            Step::new(&["sysctl", "-w", "net.ipv4.ip_forward=1"])
+                .done_when(&["sysctl", "-n", "net.ipv4.ip_forward"], "1"),
+        ]
+    );
+}
+
+#[test]
+fn a_table_holds_the_rules_of_several_lans_only_when_nft_prints_each() {
+    let own = linux_lans_rule();
+    assert!(nft::holds(LINUX_LANS, &own));
+    assert_eq!(nft::foreign(LINUX_LANS, &own), None);
+    let second = "\t\toifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 10.30.0.0/16 masquerade\n";
+    let partial = LINUX_LANS.replace(second, "");
+    assert!(!nft::holds(&partial, &own));
+    assert_eq!(nft::foreign(&partial, &own), None);
+    assert_eq!(
+        nft::foreign(LINUX_LANS, &linux_rule()),
+        Some("oifname \"eth0\" ip saddr 10.66.67.0/24 ip daddr 10.30.0.0/16 masquerade"),
+        "the rule of a LAN the config dropped is someone else's"
+    );
 }

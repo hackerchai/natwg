@@ -109,6 +109,36 @@ fn the_client_config_reaches_the_tunnel_and_the_lan_through_the_record() {
 }
 
 #[test]
+fn the_client_config_routes_the_tunnel_subnet_and_every_lan() {
+    let routed = |lan: Value| {
+        let mut value = server_json();
+        value["role"]["server"]["lan"] = lan;
+        let client = peer::add(&mut config(value), "tablet").unwrap();
+        client.validate().unwrap();
+        let routed: Vec<String> = client.peers[0]
+            .allowed_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        routed
+    };
+    assert_eq!(
+        routed(json!(["10.24.0.0/24", "192.168.50.0/24", "172.20.0.0/16"])),
+        [
+            "10.66.67.0/24",
+            "10.24.0.0/24",
+            "192.168.50.0/24",
+            "172.20.0.0/16"
+        ]
+    );
+    assert_eq!(
+        routed(json!([])),
+        ["10.66.67.0/24"],
+        "a server without a LAN gives its clients the tunnel only"
+    );
+}
+
+#[test]
 fn a_peer_name_is_unique_and_plain() {
     let mut server = config(server_json());
     assert_eq!(

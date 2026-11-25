@@ -5,7 +5,7 @@ mod channel;
 
 use crate::config::{Config, DoctorConfig, PeerConfig, ServerConfig};
 use crate::keys::{Key, PublicKey};
-use crate::nat::{Nat, Rule};
+use crate::nat::{self, Nat, Rule};
 use crate::netcfg;
 use crate::wire::transport::{BoundInterface, BoundUdp, StunPort};
 use crate::{Error, Result};
@@ -27,12 +27,12 @@ use tokio::sync::mpsc;
 const PACKET_QUEUE: usize = 64;
 
 /// The server's WireGuard device on a kernel TUN, with the address, the route
-/// and the NAT rules that let its peers reach the LAN.
+/// and the NAT rules that let its peers reach the LANs.
 pub struct Tunnel {
     // Fields drop in this order, so a panic removes the NAT rules before it
     // reaches the device.
-    nat: Nat,
-    rule: Rule,
+    /// The loaded NAT rules and the rule they load, none without a LAN.
+    nat: Option<(Nat, Rule)>,
     device: Device<(BoundUdp, TunDevice, TunDevice)>,
     tun_name: String,
     handshakes: Handshakes,
@@ -60,8 +60,13 @@ impl Tunnel {
         #[cfg(target_os = "macos")]
         netcfg::macos::require_free_routes(&allowed_ips(config, server))?;
         let subnet = subnet(config.interface.address);
-        let rule = Rule::new(&server.instance, &server.iface, subnet, server.lan);
-        let nat = rule.clone().check()?;
+        let rule = Rule::new(&server.instance, &server.iface, subnet, &server.lan);
+        let nat = rule.clone().map(Rule::check).transpose()?;
+        if rule.is_none() {
+            // A server killed while it served a LAN leaves its rule behind,
+            // and a server without a LAN would never remove it.
+            nat::require_empty(&server.instance)?;
+        }
         // macOS needs no such check. The route step of its plan fails with
         // COMMAND_NO_EFFECT for a subnet that has a route.
         #[cfg(not(target_os = "macos"))]
@@ -85,12 +90,16 @@ impl Tunnel {
             config.interface.mtu,
             &[subnet],
         );
-        let nat = netcfg::apply(&plan).and_then(|()| nat.load());
+        let nat = netcfg::apply(&plan).and_then(|()| match nat {
+            Some(nat) => nat.load().map(Some),
+            // Peers reach each other through the TUN, which takes IP
+            // forwarding just as a LAN does.
+            None => nat::forward().map(|()| None),
+        });
         match nat {
             Ok(nat) => {
                 let tunnel = Self {
-                    nat,
-                    rule,
+                    nat: nat.zip(rule),
                     device,
                     tun_name,
                     handshakes: Handshakes::default(),
@@ -120,15 +129,16 @@ impl Tunnel {
     }
 
     /// Load the NAT rule again if it no longer takes effect. Returns whether
-    /// it had to.
-    pub fn ensure_nat(&mut self) -> Result<bool> {
-        self.nat.ensure(&self.rule)
+    /// it had to, or none for a server without a LAN, which has no NAT rule.
+    pub fn ensure_nat(&mut self) -> Option<Result<bool>> {
+        let (nat, rule) = self.nat.as_mut()?;
+        Some(nat.ensure(rule))
     }
 
     /// Remove the NAT rules and stop the device. The TUN closes with the
     /// device, and the kernel then removes its address and its routes.
     pub async fn stop(self) -> Result<()> {
-        let nat = self.nat.stop();
+        let nat = self.nat.map_or(Ok(()), |(nat, _)| nat.stop());
         self.device.stop().await;
         nat
     }
@@ -266,7 +276,7 @@ impl Detached {
 
     /// A client with the doctor's identity, on a free port of `iface` or of
     /// the server's interface. Its only peer is the server at `endpoint`, and
-    /// it sends the tunnel subnet and the LAN to that peer.
+    /// it sends the tunnel subnet and every LAN to that peer.
     pub async fn doctor(
         config: &Config,
         doctor: &DoctorConfig,
@@ -275,7 +285,7 @@ impl Detached {
     ) -> Result<Self> {
         let server = config.server()?;
         let iface = BoundInterface::lookup(iface.unwrap_or(&server.iface))?;
-        let routed = [subnet(config.interface.address), server.lan];
+        let routed = std::iter::once(subnet(config.interface.address)).chain(server.lan.clone());
         let peer = Peer::new(public(config.private_key.public_key()))
             .with_endpoint(endpoint.into())
             .with_allowed_ips(routed.map(IpNetwork::V4));

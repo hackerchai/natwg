@@ -47,7 +47,7 @@ pub trait Device {
     fn tun(&self) -> Option<&str>;
 
     /// Load the NAT rule again if it stopped taking effect, and say whether
-    /// it had to. None for a device without NAT.
+    /// it had to. None for a device without NAT, as a server without a LAN.
     fn ensure_nat(&mut self) -> Option<Result<bool>>;
 
     fn stop(self) -> impl Future<Output = Result<()>>;
@@ -67,7 +67,7 @@ impl Device for Tunnel {
     }
 
     fn ensure_nat(&mut self) -> Option<Result<bool>> {
-        Some(Tunnel::ensure_nat(self))
+        Tunnel::ensure_nat(self)
     }
 
     async fn stop(self) -> Result<()> {

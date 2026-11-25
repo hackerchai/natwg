@@ -1,6 +1,8 @@
 //! The natwg configuration is one JSON file, readable only by its owner, that holds
 //! the keys, the peers, and either the server or the client role.
 
+pub mod set;
+
 use crate::keys::{self, Key, PublicKey, Secret};
 use crate::wire::dns::{self, RecordKind};
 use crate::{Error, Result};
@@ -75,6 +77,15 @@ pub struct Interface {
     pub mtu: u16,
 }
 
+impl Interface {
+    /// The tunnel subnet: the network that `address` names, as
+    /// 10.66.66.0/24 for 10.66.66.1/24.
+    pub fn subnet(&self) -> Ipv4Network {
+        Ipv4Network::new(self.address.network(), self.address.prefix())
+            .expect("the prefix of a network is a valid prefix")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
@@ -107,7 +118,12 @@ pub struct ServerConfig {
     pub instance: Instance,
     pub iface: String,
     pub listen_port: u16,
-    pub lan: Ipv4Network,
+    /// The networks behind `iface` that clients reach through the tunnel.
+    /// natwg NATs the tunnel subnet into each of them. With none, the server
+    /// serves the tunnel only. A file may hold one network as a string, the
+    /// form natwg 0.2 wrote.
+    #[serde(default, deserialize_with = "lans")]
+    pub lan: Vec<Ipv4Network>,
     pub stun: StunConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upnp: Option<UpnpConfig>,
@@ -315,11 +331,26 @@ impl Config {
                 server.iface
             ));
         }
-        if address.overlaps(server.lan) {
-            return Err(format!(
-                "interface.address {address} and role.server.lan {} overlap, so the tunnel and the LAN would claim the same addresses",
-                server.lan
-            ));
+        for (index, &lan) in server.lan.iter().enumerate() {
+            if lan.prefix() == 0 {
+                return Err(format!(
+                    "role.server.lan[{index}] {lan} is a default route; name the LAN networks the clients reach"
+                ));
+            }
+            if address.overlaps(lan) {
+                return Err(format!(
+                    "interface.address {address} and role.server.lan[{index}] {lan} overlap, so the tunnel and the LAN would claim the same addresses"
+                ));
+            }
+            if let Some((earlier, other)) = server.lan[..index]
+                .iter()
+                .enumerate()
+                .find(|(_, other)| other.overlaps(lan))
+            {
+                return Err(format!(
+                    "role.server.lan[{index}] {lan} overlaps role.server.lan[{earlier}] {other}; list each LAN network once"
+                ));
+            }
         }
         let Some(doctor) = server.doctor.as_ref().map(|doctor| doctor.address) else {
             return Ok(());
@@ -647,6 +678,39 @@ mod acl {
 
 fn default_mtu() -> u16 {
     DEFAULT_MTU
+}
+
+/// `role.server.lan` as a list of networks, or as the one network that
+/// natwg 0.2 wrote as a string.
+fn lans<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<Ipv4Network>, D::Error> {
+    struct Lans;
+
+    impl<'de> serde::de::Visitor<'de> for Lans {
+        type Value = Vec<Ipv4Network>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of IPv4 networks such as [\"10.24.0.0/24\"]")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, lan: &str) -> std::result::Result<Self::Value, E> {
+            lan.parse().map(|lan| vec![lan]).map_err(E::custom)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut lans = Vec::new();
+            while let Some(lan) = seq.next_element()? {
+                lans.push(lan);
+            }
+            Ok(lans)
+        }
+    }
+
+    deserializer.deserialize_any(Lans)
 }
 
 fn default_stun_interval() -> NonZeroU64 {
