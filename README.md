@@ -25,6 +25,29 @@ wg-quick. natwg supports macOS and Linux.
 
 ## Install
 
+Each release has a binary archive for macOS (Apple silicon and Intel) and for
+Linux (arm64 and x86_64, static musl builds) on the download site
+`https://natwg-dl.hackerchai.com`:
+
+```sh
+site=https://natwg-dl.hackerchai.com
+version=$(curl -fsSL "$site/latest/natwg-update.json" | sed -n 's/.*"version": "\([^"]*\)".*/\1/p')
+target=aarch64-apple-darwin   # x86_64-apple-darwin, aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
+curl -fLO "$site/v$version/natwg-$version-$target.tar.gz"
+curl -fLO "$site/v$version/natwg-$version-$target.tar.gz.sha256"
+shasum -a 256 -c "natwg-$version-$target.tar.gz.sha256"   # sha256sum -c on Linux
+tar -xzf "natwg-$version-$target.tar.gz"
+sudo "./natwg-$version-$target/install.sh"
+```
+
+`latest/natwg-update.json` names the newest version and the SHA-256 of each
+of its archives, and the files under `v<version>/` never change. `install.sh`
+checks the files of the archive against its `SHA256SUMS` and copies `natwg`
+to `/usr/local/bin`; `NATWG_INSTALL_DIR` picks another directory. The GitHub
+Releases of `hackerchai/natwg` carry the same archives.
+
+With Rust 1.99 or newer, cargo builds natwg from crates.io instead:
+
 ```sh
 cargo install natwg --locked
 ```
@@ -198,6 +221,77 @@ The import takes one `[Peer]`, reads wg-quick's `Endpoint = 0.0.0.0:0`
 placeholder as no endpoint, and refuses keys natwg does not run, such as `DNS`
 or `PostUp`. Once `natwg status` shows a recent handshake, remove the TXT
 updater job and the wg-quick config.
+
+## Update
+
+```sh
+natwg update --check   # the installed and the latest version; needs no root
+sudo natwg update      # install the latest release and restart the services
+```
+
+`natwg update` downloads the archive of this platform from the download site,
+and from the GitHub Releases of `hackerchai/natwg` when the site fails. It
+checks the archive against the SHA-256 that the release's manifest names and
+runs the new binary's `--version` before it replaces anything. Then it:
+
+- replaces the service binary `/usr/local/libexec/natwg/natwg` and the natwg
+  you ran, such as `/usr/local/bin/natwg` or `~/.cargo/bin/natwg`, each in one
+  step with its owner and mode, so a `sudo natwg update` of a cargo install
+  leaves it yours. The file it replaced stays beside it as `.natwg.previous`;
+- restarts each natwg service that runs, server instances and the client, one
+  at a time, and waits until each brings its tunnel up again. When one does
+  not, natwg puts every previous binary back, restarts the services again and
+  fails. A stopped service stays stopped and runs the new binary when it
+  starts.
+
+natwg never downgrades a binary. When the natwg you ran is up to date but the
+service binary is older, as after a `cargo install` without a
+`natwg service install`, `sudo natwg update` brings the service binary to the
+latest release and restarts the services. A natwg that Homebrew or Nix owns is
+upgraded with that package manager instead. Two updates never run at once.
+
+The GitHub repository is private, so the fallback needs a token with
+Contents: read: natwg takes `GH_TOKEN` or `GITHUB_TOKEN`, else asks
+`gh auth token`. sudo drops the environment, so pass it on:
+`sudo GH_TOKEN="$(gh auth token)" natwg update`.
+
+`--download-url ORIGIN` (or `NATWG_UPDATE_URL`) picks another download site
+with the same layout, an exact `https://` origin. `--repository OWNER/REPO`
+(or `NATWG_UPDATE_REPOSITORY`) uses the GitHub Releases of that repository
+alone. The `update` object of the config sets them as well; see below.
+
+### Automatic update check
+
+A running server or client looks for a newer release a minute after it
+starts, then at most once a day. The check runs in the background with a
+20-second limit, so it never holds up or fails the tunnel, and every natwg
+service on the host shares its answer
+(`/usr/local/var/natwg/update-check.json` on macOS,
+`/var/lib/natwg/update-check.json` on Linux). It never installs anything:
+the service writes the newest version into its status file, and
+`natwg status` then prints
+
+```text
+Update available: 0.2.0 → 0.3.0. Run sudo natwg update.
+```
+
+The optional `update` object of the config sets the interval, or turns the
+check off, and the sources:
+
+```json
+"update": {
+  "check": "6h",
+  "url": "https://natwg-dl.hackerchai.com",
+  "repository": "hackerchai/natwg"
+}
+```
+
+- `check` is `off`, or an interval of at least an hour such as `6h` or `2d`
+  (default `1d`). `NATWG_UPDATE_CHECK` overrides it.
+- `url` and `repository` work as `--download-url` and `--repository` do, for
+  the check and for `natwg update`.
+
+Restart the service to load a change: `sudo natwg service restart`.
 
 ## License
 

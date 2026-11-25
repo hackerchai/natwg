@@ -24,6 +24,12 @@ pub struct Status {
     pub updated: u64,
     /// The process ID of the server that wrote the status.
     pub pid: u32,
+    /// The natwg version of that server.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The newest release that its automatic update check found, if any.
+    #[serde(default)]
+    pub latest_version: Option<String>,
     pub iface: String,
     pub listen_port: u16,
     /// The TUN of the running tunnel, or none while natwg rebuilds it.
@@ -271,6 +277,12 @@ pub struct ClientStatus {
     pub updated: u64,
     /// The process ID of the client that wrote the status.
     pub pid: u32,
+    /// The natwg version of that client.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The newest release that its automatic update check found, if any.
+    #[serde(default)]
+    pub latest_version: Option<String>,
     /// The interface the WireGuard and DNS traffic leaves through.
     pub uplink: Option<String>,
     pub uplink_address: Option<Ipv4Addr>,
@@ -437,6 +449,16 @@ impl Report {
             Self::Server(status) => status.render(now),
             Self::Client(status) => status.render(now),
         }
+    }
+
+    /// "Update available: …" when the automatic check of the process that
+    /// wrote the status found a release newer than that process.
+    pub fn update_notice(&self) -> Option<String> {
+        let (version, latest) = match self {
+            Self::Server(status) => (&status.version, &status.latest_version),
+            Self::Client(status) => (&status.version, &status.latest_version),
+        };
+        crate::update::notice(version.as_deref(), latest.as_deref()?)
     }
 
     /// The error code of a status that shows a problem.

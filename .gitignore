@@ -8,3 +8,6 @@
 
 # A real natwg config holds private keys
 config.json
+
+# Python bytecode of the release scripts
+__pycache__/

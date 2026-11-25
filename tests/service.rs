@@ -185,6 +185,47 @@ fn a_config_path_with_special_characters_reaches_the_server_unchanged() {
 }
 
 #[test]
+fn natwg_update_reads_the_config_back_from_each_definition() {
+    for path in [
+        "/etc/natwg/config.json",
+        r#"/srv/a b&<c>"d'\e%f$g/config.json"#,
+        "/srv/&amp;/--config",
+    ] {
+        let service = service("natwg", path);
+        let plist = launchd::definition(&service).unwrap();
+        assert_eq!(
+            launchd::config_of(&plist),
+            Some(PathBuf::from(path)),
+            "{plist}"
+        );
+        let unit = systemd::definition(&service).unwrap();
+        assert_eq!(
+            systemd::config_of(&unit),
+            Some(PathBuf::from(path)),
+            "{unit}"
+        );
+    }
+    assert_eq!(launchd::config_of("<plist></plist>"), None);
+    assert_eq!(
+        systemd::config_of("[Service]\nExecStart=natwg daemon\n"),
+        None
+    );
+    assert_eq!(
+        systemd::config_of("[Service]\nExecStart=\"natwg\" \"--config\" \"/a%b\"\n"),
+        None,
+        "a lone % is not what natwg writes"
+    );
+    assert_eq!(
+        launchd::definition_of("com.hackerchai.natwg.client"),
+        launchd::definition_path(&Instance::client())
+    );
+    assert_eq!(
+        systemd::definition_of("natwg-client.service"),
+        systemd::definition_path(&Instance::client())
+    );
+}
+
+#[test]
 fn a_config_path_with_a_control_character_is_refused() {
     for definition in [launchd::definition, systemd::definition] {
         let error = definition(&service("natwg", "/etc/natwg\n/config.json")).unwrap_err();
@@ -267,6 +308,30 @@ fn service_commands_that_change_the_host_need_root() {
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.starts_with("NOT_ROOT: "), "{action:?}: {stderr}");
     }
+}
+
+#[test]
+fn natwg_update_needs_root_unless_it_only_checks() {
+    if is_root() {
+        return;
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_natwg"))
+        .args(["--config", "/nonexistent/config.json", "update"])
+        .env_remove("NATWG_CONFIG")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("NOT_ROOT: "), "{stderr}");
+    // A bad download site fails before anything goes on the network.
+    let output = Command::new(env!("CARGO_BIN_EXE_natwg"))
+        .args(["--config", "/nonexistent/config.json", "update", "--check"])
+        .args(["--download-url", "http://natwg-dl.example.org"])
+        .env_remove("NATWG_CONFIG")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with("UPDATE_SOURCE: "), "{stderr}");
 }
 
 fn natwg_service(args: &[&str]) -> std::process::Output {
