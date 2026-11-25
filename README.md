@@ -25,9 +25,31 @@ wg-quick. natwg supports macOS and Linux.
 
 ## Install
 
+```sh
+curl -fsSL https://natwg-dl.hackerchai.com/install.sh | bash
+```
+
+The installer reads the newest release from the download site, downloads the
+archive for this OS and CPU, checks it against the SHA-256 in the release
+manifest, checks that the binary runs and reports that version, and puts it
+at `/usr/local/bin/natwg`, through sudo when that directory is not writable.
+It is [`scripts/install-latest.sh`](scripts/install-latest.sh); read it first
+if you like (`curl -fsSL https://natwg-dl.hackerchai.com/install.sh | less`).
+Three variables change what it does:
+
+```sh
+curl -fsSL https://natwg-dl.hackerchai.com/install.sh | NATWG_VERSION=0.3.0 bash     # this version
+curl -fsSL https://natwg-dl.hackerchai.com/install.sh | NATWG_INSTALL_DIR=$HOME/.local/bin bash
+curl -fsSL https://natwg-dl.hackerchai.com/install.sh | NATWG_DOWNLOAD_URL=https://mirror.example bash
+```
+
+Running it again installs the newest release over the old one. For a natwg
+that runs as a service, `sudo natwg update` (see [Update](#update)) also
+updates the service's own copy and restarts it.
+
 Each release has a binary archive for macOS (Apple silicon and Intel) and for
 Linux (arm64 and x86_64, static musl builds) on the download site
-`https://natwg-dl.hackerchai.com`:
+`https://natwg-dl.hackerchai.com`. To install one by hand:
 
 ```sh
 site=https://natwg-dl.hackerchai.com
@@ -41,8 +63,8 @@ sudo "./natwg-$version-$target/install.sh"
 ```
 
 `latest/natwg-update.json` names the newest version and the SHA-256 of each
-of its archives, and the files under `v<version>/` never change. `install.sh`
-checks the files of the archive against its `SHA256SUMS` and copies `natwg`
+of its archives, and the files under `v<version>/` never change. The
+archive's own `install.sh` checks the files of the archive against its `SHA256SUMS` and copies `natwg`
 to `/usr/local/bin`; `NATWG_INSTALL_DIR` picks another directory. The GitHub
 Releases of `hackerchai/natwg` carry the same archives.
 

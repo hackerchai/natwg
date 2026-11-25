@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Offline checks of the download site upload: the plan, the SigV4 signature
-and the requests, against a stub S3 endpoint on this host."""
+"""Offline checks of the download site: the upload plan, the SigV4 signature
+and the requests against a stub S3 endpoint on this host, and the installer
+against a download site on this host."""
 import datetime
+import functools
 import hashlib
 import http.server
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
+import platform
+import subprocess
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -48,13 +55,17 @@ class PlanTests(Release):
         plan = site.plan(self.directory)
         keys = [key for key, _, _ in plan]
         self.assertEqual(keys[-1], 'latest/natwg-update.json')
-        self.assertEqual(keys[-2], 'v1.2.3/natwg-update.json')
-        self.assertEqual(len(keys), 10)
+        self.assertEqual(keys[-2], 'install.sh')
+        self.assertEqual(keys[-3], 'v1.2.3/natwg-update.json')
+        self.assertEqual(keys[-4], 'v1.2.3/install.sh')
+        self.assertEqual(len(keys), 12)
         self.assertFalse(any('source' in key for key in keys))
-        for key, _, cache in plan[:-1]:
+        for key, _, cache in plan[:-2]:
             self.assertTrue(key.startswith('v1.2.3/'), key)
             self.assertEqual(cache, 'public, max-age=31536000, immutable')
-        self.assertEqual(plan[-1][2], 'public, max-age=300')
+        for _, path, cache in plan[-2:]:
+            self.assertEqual(cache, 'public, max-age=300')
+        self.assertEqual(plan[-2][1], site.INSTALLER)
 
     def test_a_checksum_mismatch_stops_the_upload(self):
         name = f'natwg-1.2.3-{site.TARGETS[0]}.tar.gz'
@@ -147,7 +158,14 @@ class UploadTests(Release):
             self.assertNotIn('secret-that-never-travels', str(headers))
         types = {path.rsplit('.', 1)[-1]: headers['Content-Type'] for path, headers, _ in puts}
         self.assertEqual(types, {'gz': 'application/gzip', 'sha256': 'text/plain; charset=utf-8',
-                                 'json': 'application/json'})
+                                 'sh': 'text/plain; charset=utf-8', 'json': 'application/json'})
+
+    def test_the_installer_alone_goes_up_with_short_caching(self):
+        site.installer(self.endpoint, self.credentials)
+        [(path, headers, body)] = self.server.puts
+        self.assertEqual(path, '/natwg-dl/install.sh')
+        self.assertEqual(body, site.INSTALLER.read_bytes())
+        self.assertEqual(headers['Cache-Control'], 'public, max-age=300')
 
     def test_the_check_writes_only_its_marker_uncached(self):
         site.check(self.endpoint, self.credentials)
@@ -165,6 +183,125 @@ class UploadTests(Release):
         with self.assertRaises(SystemExit):
             site.check(self.endpoint, self.credentials)
         self.assertEqual(len(self.server.puts), 1)
+
+
+
+def host_target():
+    """The release target that the installer picks on this host."""
+    return {
+        ('Darwin', 'arm64'): 'aarch64-apple-darwin',
+        ('Darwin', 'x86_64'): 'x86_64-apple-darwin',
+        ('Linux', 'aarch64'): 'aarch64-unknown-linux-musl',
+        ('Linux', 'arm64'): 'aarch64-unknown-linux-musl',
+        ('Linux', 'x86_64'): 'x86_64-unknown-linux-musl',
+    }[(platform.system(), platform.machine())]
+
+
+class Quiet(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+class InstallerTests(unittest.TestCase):
+    """scripts/install-latest.sh against a download site on this host. Each
+    natwg in it is a shell script that prints a version."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name) / 'site'
+        self.bin = Path(temp.name) / 'bin'
+        self.target = host_target()
+        server = http.server.HTTPServer(
+            ('127.0.0.1', 0), functools.partial(Quiet, directory=str(self.root)))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f'http://127.0.0.1:{server.server_address[1]}'
+        self.release('1.2.2')
+        self.release('1.2.3', latest=True)
+
+    def release(self, version, latest=False, reports=None):
+        """Put natwg `version` on the site, a natwg that reports `reports`."""
+        directory = self.root / f'v{version}'
+        directory.mkdir(parents=True, exist_ok=True)
+        artifacts = []
+        for target in site.TARGETS:
+            prefix = f'natwg-{version}-{target}'
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode='w:gz') as archive:
+                for name, body, mode in [
+                    (f'{prefix}/bin/natwg', f'#!/bin/sh\necho "natwg {reports or version}"\n', 0o755),
+                    (f'{prefix}/TARGET', f'{target}\n', 0o644),
+                ]:
+                    member = tarfile.TarInfo(name)
+                    member.size, member.mode = len(body), mode
+                    archive.addfile(member, io.BytesIO(body.encode()))
+            (directory / f'{prefix}.tar.gz').write_bytes(data.getvalue())
+            artifacts.append({'target': target, 'asset': f'{prefix}.tar.gz',
+                              'sha256': hashlib.sha256(data.getvalue()).hexdigest()})
+        manifest = json.dumps({'schema': 1, 'version': version, 'artifacts': artifacts}, indent=2)
+        (directory / site.MANIFEST).write_text(manifest)
+        if latest:
+            (self.root / 'latest').mkdir(exist_ok=True)
+            (self.root / 'latest' / site.MANIFEST).write_text(manifest)
+
+    def install(self, piped=False, **env):
+        environment = {'PATH': os.environ['PATH'], 'HOME': os.environ.get('HOME', '/'),
+                       'NATWG_DOWNLOAD_URL': self.url, 'NATWG_INSTALL_DIR': str(self.bin), **env}
+        script = site.INSTALLER.read_text()
+        # `curl … | bash` hands bash the script on stdin.
+        command, stdin = (['bash'], script) if piped else (['bash', str(site.INSTALLER)], '')
+        return subprocess.run(command, input=stdin, env=environment, capture_output=True,
+                              text=True, timeout=60)
+
+    def installed(self):
+        natwg = self.bin / 'natwg'
+        if not natwg.exists():
+            return None
+        return subprocess.run([str(natwg), '--version'], capture_output=True, text=True).stdout.strip()
+
+    def test_the_newest_release_is_installed_from_a_pipe(self):
+        run = self.install(piped=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.installed(), 'natwg 1.2.3')
+        self.assertIn(f'Downloading natwg 1.2.3 for {self.target}', run.stdout)
+        self.assertIn(f'Installed {self.bin}/natwg (natwg 1.2.3)', run.stdout)
+        self.assertEqual([p.name for p in self.bin.iterdir()], ['natwg'])
+
+    def test_a_pinned_version_is_installed_and_replaces_another(self):
+        self.assertEqual(self.install().returncode, 0)
+        run = self.install(NATWG_VERSION='1.2.2')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.installed(), 'natwg 1.2.2')
+
+    def test_an_archive_that_does_not_match_the_manifest_installs_nothing(self):
+        archive = self.root / 'v1.2.3' / f'natwg-1.2.3-{self.target}.tar.gz'
+        archive.write_bytes(archive.read_bytes() + b'tampered')
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('does not match the SHA-256 in the manifest', run.stderr)
+        self.assertIsNone(self.installed())
+
+    def test_a_binary_that_reports_another_version_installs_nothing(self):
+        self.release('1.2.3', latest=True, reports='9.9.9')
+        run = self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("reports 'natwg 9.9.9'", run.stderr)
+        self.assertIsNone(self.installed())
+
+    def test_a_missing_version_and_a_plain_http_site_are_refused(self):
+        run = self.install(NATWG_VERSION='1.0.0')
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('could not read', run.stderr)
+        for url in ('http://example.com', 'https://example.com/path', 'ftp://127.0.0.1'):
+            run = self.install(NATWG_DOWNLOAD_URL=url)
+            self.assertNotEqual(run.returncode, 0, url)
+            self.assertIn('must be an https:// origin', run.stderr)
+        run = self.install(NATWG_VERSION='latest')
+        self.assertIn('NATWG_VERSION must look like 0.3.0', run.stderr)
+        run = self.install(NATWG_INSTALL_DIR='relative/bin')
+        self.assertIn('must be an absolute path', run.stderr)
+        self.assertIsNone(self.installed())
 
 
 if __name__ == '__main__':

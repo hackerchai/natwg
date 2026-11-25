@@ -3,7 +3,7 @@
 # from a source you trust, before you run this.
 set -eu
 umask 022
-package_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+package_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 install_dir=${NATWG_INSTALL_DIR:-/usr/local/bin}
 case "$install_dir" in /*) ;; *) echo 'NATWG_INSTALL_DIR must be an absolute path' >&2; exit 1 ;; esac
 case "$(uname -s):$(uname -m):$(cat "$package_dir/TARGET")" in
