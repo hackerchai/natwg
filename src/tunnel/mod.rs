@@ -5,7 +5,7 @@ mod channel;
 
 use crate::config::{Config, DoctorConfig, PeerConfig, ServerConfig};
 use crate::keys::{Key, PublicKey};
-use crate::nat::{Nat, Rule};
+use crate::nat::{self, Nat, Rule};
 use crate::netcfg;
 use crate::wire::transport::{BoundInterface, BoundUdp, StunPort};
 use crate::{Error, Result};
@@ -62,6 +62,11 @@ impl Tunnel {
         let subnet = subnet(config.interface.address);
         let rule = Rule::new(&server.instance, &server.iface, subnet, &server.lan);
         let nat = rule.clone().map(Rule::check).transpose()?;
+        if rule.is_none() {
+            // A server killed while it served a LAN leaves its rule behind,
+            // and a server without a LAN would never remove it.
+            nat::require_empty(&server.instance)?;
+        }
         // macOS needs no such check. The route step of its plan fails with
         // COMMAND_NO_EFFECT for a subnet that has a route.
         #[cfg(not(target_os = "macos"))]
@@ -85,7 +90,12 @@ impl Tunnel {
             config.interface.mtu,
             &[subnet],
         );
-        let nat = netcfg::apply(&plan).and_then(|()| nat.map(|nat| nat.load()).transpose());
+        let nat = netcfg::apply(&plan).and_then(|()| match nat {
+            Some(nat) => nat.load().map(Some),
+            // Peers reach each other through the TUN, which takes IP
+            // forwarding just as a LAN does.
+            None => nat::forward().map(|()| None),
+        });
         match nat {
             Ok(nat) => {
                 let tunnel = Self {
