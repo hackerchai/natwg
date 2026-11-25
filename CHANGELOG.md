@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.4.0](https://github.com/hackerchai/natwg/compare/v0.3.0...v0.4.0) (2026-11-25)
+
+
+### Features
+
+* add natwg detect to tell whether the network can host natwg ([bfa57a8](https://github.com/hackerchai/natwg/commit/bfa57a8c52cd689134730f79c15da5ece15c1193))
+* export WireGuard, Surge and mihomo configurations ([bf97181](https://github.com/hackerchai/natwg/commit/bf97181135cb56275835e1597f76fabbae26e3ea))
+* export WireGuard, Surge and mihomo configurations ([3ca7d54](https://github.com/hackerchai/natwg/commit/3ca7d544e8bd7189759c24b52b49390cf90fbe58))
+* follow uplink events and recover TXT endpoints on handshake failure ([b7a87ac](https://github.com/hackerchai/natwg/commit/b7a87ac2d1eaadc4f577164f6887d0cb850df49d))
+* follow uplink events and recover TXT endpoints on handshake failure ([2cd4f8f](https://github.com/hackerchai/natwg/commit/2cd4f8f14e645ad8efdd30fc1337c88082221fe9))
+* initialize WireGuard servers from network detection ([d14deeb](https://github.com/hackerchai/natwg/commit/d14deeb98128122546df8e818dd52137c70f190f))
+* initialize WireGuard servers from network detection ([87c54dc](https://github.com/hackerchai/natwg/commit/87c54dcaa1da7ec96d9a1d0135f4098eef6c34c5))
+* natwg detect tells whether the network can host natwg ([cd39d14](https://github.com/hackerchai/natwg/commit/cd39d145a406b10abb1c2b546717b97abe5d72cf))
+* publish the public IP as an A record in public mode ([347e42d](https://github.com/hackerchai/natwg/commit/347e42d6dcf25dd79a60258531c6451098101a82))
+* publish the public IP as an A record in public mode ([0811400](https://github.com/hackerchai/natwg/commit/08114008284ca9371d1915de7db32734be94cfa8))
+
+
+### Bug Fixes
+
+* **client:** recover TXT peers across retries and roaming ([3f9cb5c](https://github.com/hackerchai/natwg/commit/3f9cb5c4d318436b6ee8d004c653da57d35f44c0))
+* **client:** start handshake grace at first TXT discovery ([24fbb2d](https://github.com/hackerchai/natwg/commit/24fbb2d0bfa9a41aaddbac396fdd7e2024486327))
+* ignore unrouted traffic when pausing client keepalives ([e82bccf](https://github.com/hackerchai/natwg/commit/e82bccfd0f6a29a7643b6e328a098b4981af1c3a))
+* make natwg detect claim only what it saw, and keep UPnP safe ([f989382](https://github.com/hackerchai/natwg/commit/f98938255aa49138b60356afbb02608761a3a779))
+* preserve peer keys and recover native endpoint snapshots ([ee29c31](https://github.com/hackerchai/natwg/commit/ee29c31408e8bbf417ee7d7066f838cee7b341cd))
+* prove the review fixes of public mode in the network lab ([2c9de26](https://github.com/hackerchai/natwg/commit/2c9de26240162f4dd2bf2d2dccf3d2cb7d9bb0ac))
+* prove the review's cases in the network lab ([a6f3e8d](https://github.com/hackerchai/natwg/commit/a6f3e8d0e8f6358f70af44ff8dfde315f49884d4))
+* verify first-peer endpoints and reload the initialized server ([b3df7da](https://github.com/hackerchai/natwg/commit/b3df7da01a193c14c65e61724aa5353596028362))
+* write only an exact A record of an IP confirmed now ([b35065d](https://github.com/hackerchai/natwg/commit/b35065d3f7ccab3e73ffeccbf9760a1648880704))
+
 ## [0.3.0](https://github.com/hackerchai/natwg/compare/v0.2.0...v0.3.0) (2026-11-25)
 
 
