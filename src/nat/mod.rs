@@ -87,6 +87,26 @@ impl Rule {
     }
 }
 
+/// Refuse the anchor or the table of `instance` when it holds any rule, for
+/// a server that loads none. A server killed while it served a LAN leaves
+/// its rule behind, and a server without a LAN would never remove it. The
+/// check only reads.
+pub fn require_empty(instance: &Instance) -> Result<()> {
+    let none = Rule {
+        instance: instance.clone(),
+        iface: String::new(),
+        tunnel: Ipv4Network::from(std::net::Ipv4Addr::UNSPECIFIED),
+        lans: Vec::new(),
+    };
+    none.listing().map(drop)
+}
+
+/// Turn IP forwarding on, for a server that loads no NAT rule. Loading a
+/// rule turns it on too.
+pub fn forward() -> Result<()> {
+    apply(&[forwarding()])
+}
+
 /// A rule whose anchor or table held nothing of anyone else when
 /// [`Rule::check`] read it.
 #[derive(Debug)]

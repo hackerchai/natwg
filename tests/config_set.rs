@@ -177,6 +177,106 @@ fn growing_the_subnet_in_place_moves_nobody() {
 }
 
 #[test]
+fn a_subnet_that_holds_the_old_one_keeps_everyone_where_they_are() {
+    let mut server = config(server_json());
+    let change = set::apply(&mut server, &address("10.66.66.1/16")).unwrap();
+    assert_eq!(
+        change.changed,
+        ["interface.address 10.66.66.1/24 -> 10.66.66.1/16"]
+    );
+    assert_eq!(
+        allowed_of(&server, "laptop"),
+        nets(&["10.66.66.2/32", "192.168.9.0/24"])
+    );
+    assert_eq!(allowed_of(&server, "phone"), nets(&["10.66.66.4/31"]));
+    assert_eq!(doctor_of(&server), "10.66.66.254");
+    let notes = change.notes.join("\n");
+    assert!(
+        notes.contains("route 10.66.0.0/16 instead of 10.66.66.0/24"),
+        "{notes}"
+    );
+    assert!(!notes.contains("new address"), "{notes}");
+}
+
+#[test]
+fn a_subnet_inside_the_old_one_keeps_those_inside_and_refuses_the_rest() {
+    let mut value = server_json();
+    value["peers"][0]["allowed_ips"] = json!(["10.66.66.130/32"]);
+    value["peers"][1]["allowed_ips"] = json!(["10.66.66.132/31"]);
+    value["role"]["server"]["doctor"]["address"] = json!("10.66.66.200");
+    let mut server = config(value.clone());
+    let change = set::apply(&mut server, &address("10.66.66.129/25")).unwrap();
+    assert_eq!(
+        change.changed,
+        ["interface.address 10.66.66.1/24 -> 10.66.66.129/25"]
+    );
+    assert_eq!(allowed_of(&server, "laptop"), nets(&["10.66.66.130/32"]));
+    assert_eq!(allowed_of(&server, "phone"), nets(&["10.66.66.132/31"]));
+    assert_eq!(doctor_of(&server), "10.66.66.200");
+
+    refused(
+        server_json(),
+        address("10.66.66.129/25"),
+        "RENUMBER_NO_ROOM",
+        "peer \"laptop\" at 10.66.66.2/32 is no host of 10.66.66.128/25",
+    );
+    value["role"]["server"]["doctor"]["address"] = json!("10.66.66.255");
+    refused(
+        value,
+        address("10.66.66.129/25"),
+        "RENUMBER_NO_ROOM",
+        "role.server.doctor.address 10.66.66.255 is no host",
+    );
+}
+
+#[test]
+fn a_new_subnet_may_not_take_a_network_that_a_peer_routes() {
+    let mut value = server_json();
+    value["peers"][1]["allowed_ips"] = json!(["10.66.66.4/31", "10.66.70.0/29"]);
+    refused(
+        value.clone(),
+        address("10.66.70.9/24"),
+        "ADDRESS_TAKEN",
+        "peer \"phone\" routes 10.66.70.0/29",
+    );
+    refused(
+        value,
+        address("10.66.66.1/16"),
+        "ADDRESS_TAKEN",
+        "overlaps the new tunnel subnet 10.66.0.0/16",
+    );
+}
+
+#[test]
+fn a_server_address_may_not_be_the_network_or_the_broadcast_address() {
+    for edge in ["10.77.0.0/24", "10.77.0.255/24"] {
+        refused(
+            server_json(),
+            address(edge),
+            "CONFIG_INVALID",
+            "network or broadcast address of 10.77.0.0/24",
+        );
+    }
+}
+
+#[test]
+fn lans_and_routes_are_written_at_their_network_address() {
+    let mut server = config(server_json());
+    set::apply(&mut server, &Setting::Lan(nets(&["10.24.0.5/24"]))).unwrap();
+    assert_eq!(lans_of(&server), nets(&["10.24.0.0/24"]));
+    let mut client = config(client_json());
+    set::apply(
+        &mut client,
+        &Setting::AllowedIps(nets(&["10.66.66.9/24", "10.24.0.1/24"])),
+    )
+    .unwrap();
+    assert_eq!(
+        client.peers[0].allowed_ips,
+        nets(&["10.66.66.0/24", "10.24.0.0/24"])
+    );
+}
+
+#[test]
 fn a_new_server_address_in_the_same_subnet_moves_nobody() {
     let mut server = config(server_json());
     let change = set::apply(&mut server, &address("10.66.66.100/24")).unwrap();

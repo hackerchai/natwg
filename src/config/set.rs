@@ -47,8 +47,8 @@ pub fn apply(config: &mut Config, setting: &Setting) -> Result<Change> {
     let mut next = config.clone();
     let change = match setting {
         Setting::Address(address) => set_address(&mut next, *address)?,
-        Setting::Lan(lans) => set_lan(&mut next, lans)?,
-        Setting::AllowedIps(networks) => set_allowed_ips(&mut next, networks)?,
+        Setting::Lan(lans) => set_lan(&mut next, &networks(lans))?,
+        Setting::AllowedIps(nets) => set_allowed_ips(&mut next, &networks(nets))?,
     };
     next.validate()
         .map_err(|e| Error::new("CONFIG_INVALID", e))?;
@@ -65,6 +65,19 @@ fn set_address(config: &mut Config, address: Ipv4Network) -> Result<Change> {
     let from = config.interface.subnet();
     config.interface.address = address;
     let to = config.interface.subnet();
+    if let Role::Server(_) = config.role
+        && to.prefix() <= 30
+        && (address.ip() == to.network() || address.ip() == to.broadcast())
+    {
+        let first = Ipv4Addr::from(u32::from(to.network()) + 1);
+        return Err(Error::new(
+            "CONFIG_INVALID",
+            format!(
+                "interface.address {address} is the network or broadcast address of {to}; give the server a host address such as {first}/{}",
+                to.prefix()
+            ),
+        ));
+    }
     change
         .changed
         .push(format!("interface.address {old} -> {address}"));
@@ -98,22 +111,44 @@ fn set_address(config: &mut Config, address: Ipv4Network) -> Result<Change> {
     Ok(change)
 }
 
-/// Move every peer network inside `from` and the doctor to the same host
-/// offset in `to`, and say so in `change`.
+/// Place every peer network inside `from` and the doctor in `to`, and say
+/// so in `change`. A subnet that holds the other, as when the tunnel grows
+/// or shrinks around its base, keeps every address where it is. A subnet
+/// apart from the old one takes each address at the same host offset.
 fn renumber(
     config: &mut Config,
     from: Ipv4Network,
     to: Ipv4Network,
     change: &mut Change,
 ) -> Result<()> {
+    let in_place = from.overlaps(to);
+    let place = |net| {
+        if in_place {
+            kept(net, to)
+        } else {
+            moved(net, from, to)
+        }
+    };
+    let no_room = |what: String, net: Ipv4Network| no_room(what, net, from, to, in_place);
     let mut moved_peers = false;
     for peer in &mut config.peers {
         for net in &mut peer.allowed_ips {
-            if net.prefix() < from.prefix() || !from.contains(net.network()) {
+            if !inside(*net, from) {
+                // A network a peer routes beyond the tunnel must stay out of
+                // the new tunnel subnet, or the tunnel would claim it.
+                if net.overlaps(to) {
+                    return Err(Error::new(
+                        "ADDRESS_TAKEN",
+                        format!(
+                            "peer {:?} routes {net}, which overlaps the new tunnel subnet {to}; pick another subnet or remove that network from the peer first",
+                            peer.name
+                        ),
+                    ));
+                }
                 continue;
             }
-            let moved = moved(*net, from, to)
-                .ok_or_else(|| no_room(format!("peer {:?} at {net}", peer.name), *net, from, to))?;
+            let moved = place(*net)
+                .ok_or_else(|| no_room(format!("peer {:?} at {net}", peer.name), *net))?;
             if moved != *net {
                 change
                     .changed
@@ -127,14 +162,8 @@ fn renumber(
         && let Some(doctor) = &mut server.doctor
     {
         let at = Ipv4Network::from(doctor.address);
-        let moved = moved(at, from, to).ok_or_else(|| {
-            no_room(
-                format!("role.server.doctor.address {}", doctor.address),
-                at,
-                from,
-                to,
-            )
-        })?;
+        let moved = place(at)
+            .ok_or_else(|| no_room(format!("role.server.doctor.address {}", doctor.address), at))?;
         if moved.ip() != doctor.address {
             change.changed.push(format!(
                 "role.server.doctor.address {} -> {}",
@@ -160,6 +189,11 @@ fn renumber(
     Ok(())
 }
 
+/// Whether all of `net` lies in `subnet`.
+fn inside(net: Ipv4Network, subnet: Ipv4Network) -> bool {
+    net.prefix() >= subnet.prefix() && subnet.contains(net.network())
+}
+
 /// `net`, a network inside `from`, at the same offset in `to`. None when it
 /// does not fit in `to`, or when a single address would land on the network
 /// or the broadcast address of `to`.
@@ -169,21 +203,39 @@ fn moved(net: Ipv4Network, from: Ipv4Network, to: Ipv4Network) -> Option<Ipv4Net
     if u64::from(offset) + u64::from(net.size()) > u64::from(to.size()) {
         return None;
     }
-    let last = to.size() - 1;
-    if net.prefix() == 32 && to.prefix() <= 30 && (offset == 0 || offset == last) {
-        return None;
-    }
     let ip = Ipv4Addr::from(u32::from(to.network()) + (u32::from(net.ip()) - base));
-    Ipv4Network::new(ip, net.prefix()).ok()
+    Ipv4Network::new(ip, net.prefix())
+        .ok()
+        .and_then(|net| kept(net, to))
 }
 
-fn no_room(what: String, net: Ipv4Network, from: Ipv4Network, to: Ipv4Network) -> Error {
-    let offset = u32::from(net.network()) - u32::from(from.network());
+/// `net` where it is, when it lies in `to` and, as a single address, is
+/// neither the network nor the broadcast address of `to`.
+fn kept(net: Ipv4Network, to: Ipv4Network) -> Option<Ipv4Network> {
+    let edge = net.prefix() == 32
+        && to.prefix() <= 30
+        && (net.ip() == to.network() || net.ip() == to.broadcast());
+    (inside(net, to) && !edge).then_some(net)
+}
+
+fn no_room(
+    what: String,
+    net: Ipv4Network,
+    from: Ipv4Network,
+    to: Ipv4Network,
+    in_place: bool,
+) -> Error {
+    let why = if in_place {
+        format!(
+            "is no host of {to}, and a subnet that overlaps the old one keeps every address where it is"
+        )
+    } else {
+        let offset = u32::from(net.network()) - u32::from(from.network());
+        format!("sits at offset {offset} of the tunnel subnet {from}, which is no host of {to}")
+    };
     Error::new(
         "RENUMBER_NO_ROOM",
-        format!(
-            "{what} sits at offset {offset} of the tunnel subnet {from}, which is no host of {to}; pick a larger subnet or move it first"
-        ),
+        format!("{what} {why}; pick a larger subnet or move it first"),
     )
 }
 
@@ -265,6 +317,17 @@ fn role_mismatch(key: &str, needs: &str, has: &str) -> Error {
             "natwg config set {key} changes a {needs} config, and this config has the {has} role"
         ),
     )
+}
+
+/// Each network at its network address, as pfctl and nft print it, so
+/// 10.24.0.5/24 is written as 10.24.0.0/24.
+fn networks(nets: &[Ipv4Network]) -> Vec<Ipv4Network> {
+    nets.iter()
+        .map(|net| {
+            Ipv4Network::new(net.network(), net.prefix())
+                .expect("the prefix of a network is a valid prefix")
+        })
+        .collect()
 }
 
 fn listed(nets: &[Ipv4Network]) -> String {
