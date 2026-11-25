@@ -124,7 +124,9 @@ main() {
     fail "$asset does not hold $prefix/bin/natwg"
   [ "$(cat "$work/$prefix/TARGET")" = "$target" ] || fail "$asset is not built for $target"
   local binary="$work/$prefix/bin/natwg"
-  [ -f "$binary" ] && [ ! -L "$binary" ] || fail "$prefix/bin/natwg is not a regular file"
+  if [ ! -f "$binary" ] || [ -L "$binary" ]; then
+    fail "$prefix/bin/natwg is not a regular file"
+  fi
   chmod 755 "$binary"
   local reported
   reported=$("$binary" --version 2>/dev/null || true)
