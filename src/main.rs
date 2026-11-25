@@ -41,6 +41,8 @@ macro_rules! warn {
     }};
 }
 
+mod init;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -56,6 +58,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Detect the network and configure a new WireGuard server.
+    Init(Box<init::Args>),
     /// Generate WireGuard keys.
     Keys {
         #[command(subcommand)]
@@ -474,6 +478,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Action::Init(args) => init::run(*args, &cli.config)?,
         Action::Keys {
             action: KeysAction::Gen,
         } => {

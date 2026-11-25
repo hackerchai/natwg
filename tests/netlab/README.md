@@ -162,3 +162,20 @@ further checks to `checks` in `run.sh`. A test of the server
 or the client can put a natwg server in `nwl-host` and a client in
 `nwl-peer`, which reaches the host only through the router's NAT, the way a
 laptop on the internet does.
+
+## First-time setup
+
+Run `sudo NATWG=/absolute/path/to/debug/natwg tests/netlab/init.sh` in the
+disposable Linux VM with wireguard-tools installed. An optional list of
+scenario names selects individual cases. The runner uses synthetic API
+credentials and the lab's DNS server. It masks the service binary directory,
+unit directory, runtime sockets and systemctl in private mount namespaces.
+
+The daemon cases connect the first issued peer to the server and a LAN host
+on public, UPnP, NAT1, port-preserving and likely networks. The native cases
+use the generated wg-quick files with an independently configured A record
+and UDP forward. The service case exercises the installer with a systemctl
+stand-in that starts the installed server binary. The CLI case drives the
+wizard on a PTY, including its hidden token prompt and interruption. Negative
+cases check unsupported and inconclusive verdicts, a busy port, missing
+inputs, file collisions and key recovery after an initial TXT lookup fails.

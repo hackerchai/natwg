@@ -446,37 +446,7 @@ impl Config {
     /// Read a config file. The file must belong to the effective user and grant
     /// no group or other permissions, so a root daemon only trusts a root file.
     pub fn load(path: &Path) -> Result<Self> {
-        let unreadable =
-            |e: std::io::Error| Error::new("CONFIG_UNREADABLE", format!("{}: {e}", path.display()));
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .map_err(unreadable)?;
-        let meta = file.metadata().map_err(unreadable)?;
-        let euid = unsafe { libc::geteuid() };
-        if !meta.is_file() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
-            return Err(Error::new(
-                "CONFIG_UNSAFE",
-                format!(
-                    "{}: owner uid {} and mode {:04o}; natwg reads only a regular file owned by uid {euid} with no group or other permissions",
-                    path.display(),
-                    meta.uid(),
-                    meta.mode() & 0o7777,
-                ),
-            ));
-        }
-        if acl::present(&file).map_err(unreadable)? {
-            return Err(Error::new(
-                "CONFIG_UNSAFE",
-                format!(
-                    "{}: the file carries an ACL, which can grant access that its mode does not show; remove it with chmod -N",
-                    path.display()
-                ),
-            ));
-        }
-        let mut text = String::new();
-        file.read_to_string(&mut text).map_err(unreadable)?;
+        let text = read_private(path, None)?;
         let invalid = |e: String| Error::new("CONFIG_INVALID", format!("{}: {e}", path.display()));
         let config: Self = serde_json::from_str(&text).map_err(|e| invalid(e.to_string()))?;
         config.validate().map_err(invalid)?;
@@ -741,6 +711,50 @@ impl Config {
     }
 }
 
+pub use acl::present as has_extended_acl;
+
+/// Read an owner-only regular file with the same ownership and ACL checks
+/// used for the server configuration. An explicitly supplied credential file
+/// may also belong to the operator who invoked sudo.
+pub fn read_private(path: &Path, additional_owner: Option<u32>) -> Result<String> {
+    let unreadable =
+        |e: std::io::Error| Error::new("CONFIG_UNREADABLE", format!("{}: {e}", path.display()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
+    let euid = unsafe { libc::geteuid() };
+    let owner_ok = meta.uid() == euid || Some(meta.uid()) == additional_owner;
+    if !meta.is_file() || !owner_ok || meta.mode() & 0o077 != 0 {
+        let owners = additional_owner
+            .filter(|id| *id != euid)
+            .map_or_else(|| euid.to_string(), |id| format!("{euid} or {id}"));
+        return Err(Error::new(
+            "CONFIG_UNSAFE",
+            format!(
+                "{}: owner uid {} and mode {:04o}; natwg reads only a regular file owned by uid {owners} with no group or other permissions",
+                path.display(),
+                meta.uid(),
+                meta.mode() & 0o7777,
+            ),
+        ));
+    }
+    if acl::present(&file).map_err(unreadable)? {
+        return Err(Error::new(
+            "CONFIG_UNSAFE",
+            format!(
+                "{}: the file carries an ACL, which can grant access that its mode does not show; remove it with chmod -N",
+                path.display()
+            ),
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(unreadable)?;
+    Ok(text)
+}
+
 /// Atomically publish secret text after the owner-only file is fully written.
 pub fn write_private(path: &Path, text: &str, replace: bool) -> Result<()> {
     let stage = stage_private(path, text)?;
@@ -800,7 +814,7 @@ pub fn publish_private(
 }
 
 /// A name of labels from A-Z, a-z, 0-9, '-' and '_' that fits a DNS query.
-fn is_dns_name(name: &str) -> bool {
+pub fn is_dns_name(name: &str) -> bool {
     let plain = name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
