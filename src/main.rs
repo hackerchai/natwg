@@ -3,7 +3,7 @@
 // `say!` or `warn!`, which drop a line that cannot be written.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ipnetwork::Ipv4Network;
 use natwg::client::{self, uplink};
 use natwg::config::set::{self, Setting};
@@ -14,7 +14,7 @@ use natwg::tunnel::{self, Tunnel};
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun;
 use natwg::wire::transport::{BoundInterface, StunPort};
-use natwg::{Error, Result, doctor, keys::Key, peer, service, update};
+use natwg::{Error, Result, detect, doctor, keys::Key, peer, service, update};
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::NonZeroU16,
@@ -61,6 +61,53 @@ enum Action {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Tell whether this network can host a natwg server.
+    ///
+    /// A client whose address is unknown in advance must reach the server's
+    /// UDP port: natwg needs a public IPv4 address that keeps the listen
+    /// port, or a full-cone NAT (NAT1). natwg tests the uplink with STUN
+    /// through one socket: the filtering with an RFC 5780 server's
+    /// CHANGE-REQUEST, the mapping across servers with different IPs, and a
+    /// datagram from a second socket through the mapping. On a private
+    /// uplink, --upnp auto has the UPnP gateway forward the test port for
+    /// the test, as it would for the server, and deletes the lease after.
+    ///
+    /// Exit status: 0 supported (public or NAT1), 1 unsupported, 2 likely
+    /// (a test could not run, or its answers disagree) or inconclusive (no
+    /// STUN server outside the NAT answered), 3 an error such as a missing
+    /// uplink or a signal. With --json, an error prints
+    /// {"schema": 1, "error": {"code", "message"}}. Needs no root.
+    Detect {
+        /// The uplink (default: role.server.iface of --config when natwg can
+        /// read it, else the physical interface of the default route).
+        #[arg(long)]
+        iface: Option<String>,
+        /// The UDP port to test (default: role.server.listen_port of
+        /// --config, else 51830). A port in use, as by a running natwg,
+        /// gives way to a free one.
+        #[arg(long)]
+        port: Option<u16>,
+        /// A STUN server, asked in order; repeat it for more. An RFC 5780
+        /// server runs the filtering test, and every server reports the
+        /// mapping. With none, natwg uses its built-in lists.
+        #[arg(long = "server", value_name = "HOST:PORT", value_parser = stun::host_port)]
+        servers: Vec<(String, u16)>,
+        /// Lease the test port on the UPnP gateway while the uplink's
+        /// address is private.
+        #[arg(long, value_enum, default_value_t = UpnpArg::Auto)]
+        upnp: UpnpArg,
+        /// The DNS server for STUN host names, asked through the uplink
+        /// (default: stun.dns_server of --config, else 223.5.5.5).
+        #[arg(long)]
+        dns: Option<Ipv4Addr>,
+        /// How long each STUN request waits before it is sent again, in
+        /// milliseconds.
+        #[arg(long = "timeout-ms", value_name = "MS", default_value = "1000", value_parser = millis)]
+        timeout: Duration,
+        /// Print the whole result as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Ask STUN and DNS servers through one interface, without the daemon.
     Probe {
@@ -155,6 +202,12 @@ enum Action {
     /// `server --foreground` and `client --foreground` do.
     #[command(hide = true)]
     Daemon,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum UpnpArg {
+    Auto,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -453,6 +506,62 @@ fn run(cli: Cli) -> Result<()> {
             action: ConfigAction::Set { setting, dry_run },
         } => config_set(&cli.config, setting, dry_run)?,
         Action::Probe { action } => probe(action)?,
+        Action::Detect {
+            iface,
+            port,
+            servers,
+            upnp,
+            dns,
+            timeout,
+            json,
+        } => {
+            // Root reads a root config; without root, natwg goes without.
+            let config = Config::load(&cli.config).ok();
+            let server = config.as_ref().and_then(|config| config.server().ok());
+            let request = detect::Request {
+                iface: iface.or_else(|| server.map(|server| server.iface.clone())),
+                port: port.or(server.map(|server| server.listen_port)),
+                servers,
+                upnp: match upnp {
+                    UpnpArg::Auto => detect::UpnpMode::Auto,
+                    UpnpArg::Off => detect::UpnpMode::Off,
+                },
+                dns: dns
+                    .or(server.map(|server| server.stun.dns_server))
+                    .unwrap_or(detect::DEFAULT_DNS),
+                timeout,
+            };
+            let detected = runtime(tokio::runtime::Builder::new_current_thread())
+                .and_then(|runtime| runtime.block_on(detect::run(&request)));
+            let code = match (&detected, json) {
+                (Ok(detection), true) => {
+                    say!(
+                        "{}",
+                        serde_json::to_string_pretty(detection)
+                            .expect("a detection always serializes")
+                    );
+                    detection.exit_code()
+                }
+                (Ok(detection), false) => {
+                    say!("{}", detection.render().trim_end());
+                    detection.exit_code()
+                }
+                (Err(error), true) => {
+                    let error = serde_json::json!({
+                        "schema": detect::SCHEMA,
+                        "error": {"code": error.code, "message": error.message},
+                    });
+                    say!("{error:#}");
+                    detect::ERROR_EXIT
+                }
+                (Err(error), false) => {
+                    warn!("{error}");
+                    detect::ERROR_EXIT
+                }
+            };
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            std::process::exit(code);
+        }
         Action::Server { foreground: _ } => daemon(&cli.config, Some(Want::Server))?,
         Action::Client { foreground: _ } => daemon(&cli.config, Some(Want::Client))?,
         Action::Daemon => daemon(&cli.config, None)?,

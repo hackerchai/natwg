@@ -2,7 +2,8 @@ use gotatun::packet::PacketBufPool;
 use gotatun::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use natwg::wire::dns::{self, Record, RecordKind};
 use natwg::wire::stun::{
-    TransactionId, binding_request, is_stun_binding_success, parse_binding_success,
+    BindingResponse, Change, TransactionId, binding_request, change_request,
+    is_stun_binding_success, parse_binding_response, parse_binding_success,
 };
 use natwg::wire::transport::{BoundInterface, BoundUdp, StunPort};
 use std::{
@@ -164,6 +165,97 @@ fn a_response_without_an_ipv4_mapping_yields_nothing() {
     let response = stun_response([6; 12], &[(XOR_MAPPED_ADDRESS, ipv6)]);
     assert!(is_stun_binding_success(&response));
     assert_eq!(parse_binding_success(&response), None);
+}
+
+// Binding responses captured through en6 on 2026-11-25 for the transaction
+// id "natwg-detect", with the mapping rewritten to 203.0.113.9 (port 7046 and
+// 7047). stun.miwifi.com sends the RFC 5780 attributes; stun.voipbuster.com
+// sends only the RFC 3489 ones.
+const BINDING_MIWIFI: &str = "010100302112a4426e617477672d6465746563740001000800011b86cb007109802b000800010d966fceae03802c000800010d976fceae020020000800013a94ea12d54b";
+const BINDING_VOIPBUSTER: &str = "010100242112a4426e617477672d6465746563740001000800011b87cb0071090004000800010d964d48a9d50005000800010d974d48a9d4";
+const OTHER_ADDRESS: u16 = 0x802C;
+const RESPONSE_ORIGIN: u16 = 0x802B;
+const CHANGED_ADDRESS: u16 = 0x0005;
+const SOURCE_ADDRESS: u16 = 0x0004;
+
+#[test]
+fn an_rfc_5780_response_yields_its_other_address_and_origin() {
+    assert_eq!(
+        parse_binding_response(&hex(BINDING_MIWIFI)),
+        Some(BindingResponse {
+            id: TransactionId(*b"natwg-detect"),
+            mapped: addr("203.0.113.9:7046"),
+            other: Some(addr("111.206.174.2:3479")),
+            origin: Some(addr("111.206.174.3:3478")),
+        })
+    );
+}
+
+#[test]
+fn an_rfc_3489_response_yields_changed_and_source_address() {
+    assert_eq!(
+        parse_binding_response(&hex(BINDING_VOIPBUSTER)),
+        Some(BindingResponse {
+            id: TransactionId(*b"natwg-detect"),
+            mapped: addr("203.0.113.9:7047"),
+            other: Some(addr("77.72.169.212:3479")),
+            origin: Some(addr("77.72.169.213:3478")),
+        })
+    );
+}
+
+#[test]
+fn other_address_wins_over_changed_address_and_origin_over_source() {
+    let response = stun_response(
+        [8; 12],
+        &[
+            (XOR_MAPPED_ADDRESS, xor_mapped(addr("203.0.113.9:7007"))),
+            (CHANGED_ADDRESS, mapped(addr("198.51.100.3:3479"))),
+            (SOURCE_ADDRESS, mapped(addr("198.51.100.4:3478"))),
+            (OTHER_ADDRESS, mapped(addr("198.51.100.1:3479"))),
+            (RESPONSE_ORIGIN, mapped(addr("198.51.100.2:3478"))),
+        ],
+    );
+    let response = parse_binding_response(&response).unwrap();
+    assert_eq!(response.other, Some(addr("198.51.100.1:3479")));
+    assert_eq!(response.origin, Some(addr("198.51.100.2:3478")));
+}
+
+#[test]
+fn a_response_without_other_address_has_none() {
+    let response = stun_response(
+        [9; 12],
+        &[(XOR_MAPPED_ADDRESS, xor_mapped(addr("203.0.113.9:7007")))],
+    );
+    let response = parse_binding_response(&response).unwrap();
+    assert_eq!((response.other, response.origin), (None, None));
+}
+
+#[test]
+fn an_ipv6_other_address_is_skipped() {
+    let mut ipv6 = vec![0, 2, 0x0D, 0x97];
+    ipv6.extend([0; 16]);
+    let response = stun_response(
+        [10; 12],
+        &[
+            (XOR_MAPPED_ADDRESS, xor_mapped(addr("203.0.113.9:7007"))),
+            (OTHER_ADDRESS, ipv6),
+        ],
+    );
+    assert_eq!(parse_binding_response(&response).unwrap().other, None);
+}
+
+#[test]
+fn a_change_request_carries_the_flags_of_rfc_5780() {
+    let id = TransactionId(*b"natwg-txid-2");
+    for (change, flags) in [(Change::IpAndPort, 0x06u8), (Change::Port, 0x02)] {
+        let mut expected = vec![0x00, 0x01, 0x00, 0x08];
+        expected.extend(COOKIE);
+        expected.extend(b"natwg-txid-2");
+        expected.extend([0x00, 0x03, 0x00, 0x04, 0, 0, 0, flags]);
+        assert_eq!(change_request(id, change).to_vec(), expected, "{change:?}");
+        assert!(!is_stun_binding_success(&change_request(id, change)));
+    }
 }
 
 #[test]

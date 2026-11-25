@@ -106,3 +106,89 @@ fn probe_stun_without_servers_tries_the_built_in_list() {
     }
     assert!(!stderr.contains("STUN_NO_SERVER"), "{stderr}");
 }
+
+fn natwg_detect(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_natwg"))
+        .args([
+            "detect",
+            "--config",
+            "/nonexistent/natwg.json",
+            "--iface",
+            LOOPBACK,
+        ])
+        .args(["--upnp", "off", "--port", "0", "--timeout-ms", "150"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn detect_with_no_stun_answer_exits_1_and_says_why() {
+    let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server = silent.local_addr().unwrap().to_string();
+    let output = natwg_detect(&["--server", &server]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("verdict   : unsupported"), "{stdout}");
+    assert!(
+        stdout.contains("This network cannot host natwg: no STUN server answered"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn detect_with_one_plain_server_is_likely_and_exits_2() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let address = server.local_addr().unwrap().to_string();
+    let serve = std::thread::spawn(move || {
+        let mut request = [0; 64];
+        // Every Binding request gets the same mapping; the test ends when
+        // natwg stops asking.
+        while let Ok((_, client)) = server.recv_from(&mut request) {
+            let mapped = "45.77.0.9:7007".parse().unwrap();
+            server
+                .send_to(&answer(&request[8..20], mapped), client)
+                .unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+        }
+    });
+    let output = natwg_detect(&["--server", &address, "--json"]);
+    serve.join().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["verdict"], "likely");
+    assert_eq!(json["mapping"]["endpoint"], "45.77.0.9:7007");
+    assert_eq!(json["filtering"]["behaviour"], "unknown");
+}
+
+#[test]
+fn detect_errors_exit_3_and_print_an_error_object_with_json() {
+    let detect = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_natwg"))
+            .args(["detect", "--config", "/nonexistent/natwg.json"])
+            .args(["--iface", "natwg-none0", "--upnp", "off"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let output = detect(&["--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["error"]["code"], "IFACE_NOT_FOUND");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("natwg-none0")
+    );
+    let output = detect(&[]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.starts_with(b"IFACE_NOT_FOUND"));
+}
