@@ -31,7 +31,8 @@ for each platform with `scripts/package.sh`:
 | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` with `musl-tools` |
 
 Each archive `natwg-X.Y.Z-TARGET.tar.gz` holds `bin/natwg`, `install.sh`,
-`README.md`, `LICENSE`, `TARGET`, `BUILD-INFO.txt` (toolchain, build host
+`README.md`, `README.zh-CN.md`, the `docs/` guides, `LICENSE`, `TARGET`,
+`BUILD-INFO.txt` (toolchain, build host
 and commit), `SOURCE-MANIFEST.sha256` (the build inputs) and `SHA256SUMS`, and
 has a `.sha256` file beside it.
 
@@ -101,7 +102,8 @@ and its SHA-256:
 
 The GitHub Releases of `hackerchai/natwg` carry the same archives and
 manifest. `natwg update` falls back to them when the download site fails;
-the repository is private, so that needs a GitHub token.
+in natwg 0.4.0, that path requires a GitHub token even for a public repository.
+The download site requires no authentication.
 
 ## Secrets
 
