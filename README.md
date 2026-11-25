@@ -11,7 +11,7 @@ WireGuard peers reach. natwg then:
 - publishes it as a Cloudflare DNS TXT record (`"ip:port"`), which the client
   reads to find the server;
 - leases the port on the home router through UPnP;
-- routes the tunnel subnet and NATs it to the LAN (pf on macOS, nftables on
+- routes the tunnel subnet and NATs it to each LAN (pf on macOS, nftables on
   Linux);
 - writes a status file, and rebuilds the tunnel when STUN stops answering.
 
@@ -57,7 +57,37 @@ sudo natwg service restart                   # the running server loads the chan
 
 `peer add` writes the server config in one step and prints the new client's
 config, or writes it to `--out` readable only by its owner. That file holds the
-client's private key, so move it to the client privately.
+client's private key, so move it to the client privately. The new client routes
+the tunnel subnet and every LAN of the server.
+
+### Choose the tunnel subnet and the LANs
+
+The server's `interface.address` is its tunnel address, and the prefix sets the
+tunnel subnet: `10.66.66.1/24` serves 10.66.66.0/24. `role.server.lan` lists
+the networks behind `role.server.iface` that clients reach:
+
+```json
+"interface": { "address": "10.66.66.1/24", "mtu": 1380 },
+"role": { "server": {
+  "iface": "en6",
+  "lan": ["10.73.0.0/24", "192.168.50.0/24"],
+  ...
+}}
+```
+
+- natwg NATs the tunnel subnet into each LAN out of `role.server.iface`, so LAN
+  hosts answer clients without a route back to the tunnel.
+- A LAN may not overlap the tunnel subnet or another LAN, and `0.0.0.0/0` is
+  not a LAN.
+- An empty list (`"lan": []`) serves the tunnel only. natwg then loads no NAT
+  rule and leaves IP forwarding as it is, `natwg status` shows NAT as off, and
+  `doctor loopback` pings only the server's tunnel address. With LANs, the
+  doctor also pings the first host of the first LAN.
+- natwg 0.2 wrote one LAN as a string (`"lan": "10.73.0.0/24"`). That form
+  still loads, and natwg writes the list form from then on.
+
+A client routes only its own `allowed_ips`, so give each client the tunnel
+subnet and every LAN.
 
 ## Run the client
 

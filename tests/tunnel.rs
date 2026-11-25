@@ -203,6 +203,23 @@ async fn the_doctor_sends_the_lan_through_the_tunnel_and_nothing_else() {
 }
 
 #[tokio::test]
+async fn the_doctor_sends_every_lan_through_the_tunnel() {
+    let config = with_lans(json!(["10.73.0.0/24", "192.168.50.0/24"]));
+    let mut server = Detached::server(&config).await.unwrap().0;
+    let doctor = dial_as_doctor(&config, &server).await;
+
+    let outside = packet(DOCTOR, Ipv4Addr::new(192, 0, 2, 1), b"not routed");
+    let first = packet(DOCTOR, LAN_HOST, b"to the first LAN");
+    let second = packet(DOCTOR, Ipv4Addr::new(192, 168, 50, 7), b"to the second LAN");
+    for packet in [&outside, &first, &second] {
+        doctor.send(packet).await.unwrap();
+    }
+    assert_eq!(next(&mut server).await, first);
+    assert_eq!(next(&mut server).await, second);
+    nothing_more(&mut server).await;
+}
+
+#[tokio::test]
 async fn the_server_accepts_only_the_doctors_own_address_from_the_doctor() {
     let config = with_doctor();
     let mut server = Detached::server(&config).await.unwrap().0;
@@ -498,7 +515,14 @@ async fn doctor_run(
     replies: impl Fn(Echo) -> Vec<Echo> + Send + 'static,
     attempts: u16,
 ) -> Vec<Probe> {
-    let config = with_doctor();
+    doctor_run_with(with_doctor(), replies, attempts).await
+}
+
+async fn doctor_run_with(
+    config: Config,
+    replies: impl Fn(Echo) -> Vec<Echo> + Send + 'static,
+    attempts: u16,
+) -> Vec<Probe> {
     let server = Detached::server(&config).await.unwrap().0;
     let endpoint = endpoint(&server).await;
     answering(server, replies);
@@ -517,6 +541,35 @@ async fn the_doctor_gets_replies_from_the_tunnel_address_and_the_first_lan_host(
         probes.iter().all(|probe| probe.reply.is_some()),
         "{probes:?}"
     );
+}
+
+fn with_lans(lans: Value) -> Config {
+    let mut config = with_doctor();
+    let Role::Server(server) = &mut config.role else {
+        unreachable!("with_doctor is a server config")
+    };
+    server.lan = serde_json::from_value(lans).unwrap();
+    config
+}
+
+#[tokio::test]
+async fn the_doctor_pings_the_first_host_of_the_first_lan_only() {
+    let config = with_lans(json!(["192.168.50.0/24", "10.73.0.0/24"]));
+    let probes = doctor_run_with(config, |request| vec![pong(request)], 3).await;
+    let targets: Vec<Ipv4Addr> = probes.iter().map(|probe| probe.target).collect();
+    assert_eq!(targets, [SERVER, Ipv4Addr::new(192, 168, 50, 1)]);
+    assert!(
+        probes.iter().all(|probe| probe.reply.is_some()),
+        "{probes:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_doctor_of_a_server_without_a_lan_pings_the_tunnel_address_only() {
+    let probes = doctor_run_with(with_lans(json!([])), |request| vec![pong(request)], 3).await;
+    let targets: Vec<Ipv4Addr> = probes.iter().map(|probe| probe.target).collect();
+    assert_eq!(targets, [SERVER]);
+    assert!(probes[0].reply.is_some(), "{probes:?}");
 }
 
 #[tokio::test]
