@@ -23,6 +23,18 @@ pub async fn render(
     name: &str,
     origin: Option<&ServerConfig>,
 ) -> Result<String> {
+    render_confirmed(config, format, name, origin, None).await
+}
+
+/// During first-time setup with a newly started daemon, require DNS to have
+/// caught up with its published mapping before handing out a TXT snapshot.
+pub async fn render_confirmed(
+    config: &Config,
+    format: Format,
+    name: &str,
+    origin: Option<&ServerConfig>,
+    expected: Option<SocketAddrV4>,
+) -> Result<String> {
     if let Role::Server(server) = &config.role {
         if format != Format::WgQuick || server.publish != PublishMode::A {
             return Err(Error::new(
@@ -48,6 +60,14 @@ pub async fn render(
         Some(resolve::Lookup::A(host)) => (host.host.clone(), host.port),
         Some(lookup @ resolve::Lookup::Txt(record)) => {
             let address = snapshot(lookup, client, origin).await?;
+            if let Some(wanted) = expected
+                && wanted != address
+            {
+                return Err(Error::new(
+                    "TXT_NOT_CURRENT",
+                    format!("{record} still answers {address}; waiting for {wanted}"),
+                ));
+            }
             let at = humantime::format_rfc3339_seconds(SystemTime::now());
             writeln!(
                 text,

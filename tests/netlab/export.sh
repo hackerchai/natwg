@@ -183,6 +183,11 @@ PY
 	stop_daemons
 }
 
+# init.sh reuses client_up and traffic on its generated native files.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+	return 0
+fi
+
 [[ $(id -u) = 0 ]] || die "run as root"
 command -v wg-quick >/dev/null || die "install wireguard-tools"
 umask 077
